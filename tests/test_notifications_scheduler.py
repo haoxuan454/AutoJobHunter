@@ -56,6 +56,16 @@ class NotificationsAndSchedulerTests(unittest.TestCase):
         self.repo.update_status("c2", "paused_manual", "manual")
         self.assertEqual(scheduler.run_once(lambda item: seen.append(item["id"]))["status"], "idle")
 
+    def test_scheduler_returns_busy_when_another_worker_holds_the_lease(self):
+        scheduler = SerialConversationScheduler(self.conn)
+        self.conn.execute(
+            "UPDATE conv_scheduler_state SET running_conversation_id = ?, lease_until = ? WHERE id = 1",
+            ("other-worker", "2999-01-01T00:00:00+00:00"),
+        )
+        self.conn.commit()
+        result = scheduler.run_once(lambda item: self.fail("busy scheduler must not invoke handler"))
+        self.assertEqual(result["status"], "busy")
+
     def test_email_settings_keep_password_out_of_public_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = save_email_settings(Path(tmp), {}, {
