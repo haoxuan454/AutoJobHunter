@@ -114,6 +114,7 @@
       "label": "监控设置",
       "icon": "Eye",
       "fields": [
+        {"key": "require_human_confirmation", "label": "HR 消息强制人工确认", "type": "switch", "default": true, "description": "安全门槛：开启时任何 HR 回复只生成草稿，不自动发送"},
         {"key": "interval", "label": "检查间隔 (分钟)", "type": "number", "min": 1, "max": 120, "default": 30},
         {"key": "initial_cooldown_minutes", "label": "全流程首次监测冷却 (分钟)", "type": "number", "min": 0, "max": 120, "default": 10, "description": "仅运行全流程发送结束后生效；单独监测立即执行首轮，停止任务可取消冷却"},
         {"key": "chat_url", "label": "聊天页 URL", "type": "text", "default": "https://www.zhipin.com/web/geek/chat"},
