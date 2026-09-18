@@ -32,6 +32,11 @@ _SHARED_MONITOR_TARGETS: set[str] = set()
 _browser_close_tab = close_tab
 
 
+def _requires_human_confirmation(config: dict) -> bool:
+    """Return the runtime delivery safety gate (enabled by default)."""
+    return bool(config.get("monitor", {}).get("require_human_confirmation", False))
+
+
 def close_tab(target_id: str) -> bool:
     """Keep the shared monitor tab alive while conversations are processed."""
     if target_id in _SHARED_MONITOR_TARGETS:
@@ -1537,10 +1542,15 @@ def _handle_conversation(job: dict, config: dict, conversation: dict | None = No
     from bosshunter.conversation_bridge import sync_extracted_messages
     bridge_db = get_db()
     try:
-        synced = sync_extracted_messages(
-            bridge_db, job=job, messages=messages, conversation=conversation,
-            base_dir=Path.cwd(), config=config,
-        )
+        try:
+            synced = sync_extracted_messages(
+                bridge_db, job=job, messages=messages, conversation=conversation,
+                base_dir=Path.cwd(), config=config,
+            )
+        except Exception as exc:
+            # Local persistence must never prevent cancellation or safety stops.
+            console.print(f"[yellow]    会话本地同步失败，保留旧流程继续：{exc}[/yellow]")
+            synced = {"conversation": {}, "inserted": [], "notification": None}
     finally:
         bridge_db.close()
     if synced["conversation"].get("status") == "paused_salary":
@@ -1635,7 +1645,7 @@ def _handle_conversation(job: dict, config: dict, conversation: dict | None = No
             auto_reply_enabled = config.get("monitor", {}).get(
                 "auto_reply_hr_questions",
                 False,
-            )
+            ) and not _requires_human_confirmation(config)
             if _check_if_portfolio_sent(messages, portfolio_url):
                 portfolio_status = "在线简历此前已发送"
                 console.print("[dim]    在线简历链接已发过，跳过[/dim]")
@@ -1720,7 +1730,10 @@ def _handle_conversation(job: dict, config: dict, conversation: dict | None = No
 
     console.print(f"[dim]    回复内容: {reply[:80]}...[/dim]")
 
-    if not config.get("monitor", {}).get("auto_reply_hr_questions", False):
+    if (
+        not config.get("monitor", {}).get("auto_reply_hr_questions", False)
+        or _requires_human_confirmation(config)
+    ):
         if stop_requested(config):
             close_tab(target_id)
             return "stopped"
@@ -1987,6 +2000,9 @@ def _check_follow_ups(config: dict, throttle, replied_job_ids: set | None = None
         return 0
     follow_up_cfg = config.get("follow_up", {})
     if not follow_up_cfg.get("enabled", False):
+        return 0
+    if _requires_human_confirmation(config):
+        console.print("[yellow]已启用人工确认门槛，跳过自动跟进消息[/yellow]")
         return 0
 
     # Skip weekends if configured

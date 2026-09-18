@@ -790,7 +790,7 @@ export default function ConfigPage() {
                 <label className="text-sm font-black text-foreground">检测到 HR 问题时自动回复</label>
                 <p className="mt-1 text-xs text-muted">默认关闭。关闭时只生成回复建议，需要你在“监测执行”中确认后发送。</p>
               </div>
-              <Switch checked={config.monitor?.auto_reply_hr_questions ?? false} onChange={v => updateConfig('monitor.auto_reply_hr_questions', v)} />
+              <Switch checked={false} disabled onChange={() => undefined} />
             </div>
           </div>
         </SectionCard>
