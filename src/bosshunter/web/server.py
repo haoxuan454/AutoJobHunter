@@ -6,6 +6,7 @@ Serves:
 """
 
 import json
+import smtplib
 from ipaddress import ip_address
 from urllib.parse import urlsplit
 import math
@@ -112,6 +113,7 @@ from bosshunter.web.tasks import (
 	wait_for_initial_monitor_cooldown,
 )
 from bosshunter.conversations import ConversationRepository, IncomingMessage
+from bosshunter.conversation_scheduler import SerialConversationScheduler, init_scheduler_tables
 from bosshunter.knowledge import (
 	 ingest_document,
 	 list_documents,
@@ -119,6 +121,14 @@ from bosshunter.knowledge import (
 	search_confirmed_facts,
 	safe_knowledge_filename,
 	update_fact_status,
+)
+from bosshunter.notifications import (
+	enqueue_alert,
+	init_notification_tables,
+	list_outbox,
+	load_email_settings,
+	save_email_settings,
+	send_outbox_item,
 )
 
 mimetypes.add_type("application/javascript", ".js", strict=True)
@@ -211,7 +221,10 @@ def _get_web_db():
 
 
 def _conversation_repo():
-	return ConversationRepository(_get_web_db())
+	conn = _get_web_db()
+	init_scheduler_tables(conn)
+	init_notification_tables(conn)
+	return ConversationRepository(conn)
 
 
 def _json_response(data, status_code=200):
@@ -2545,6 +2558,74 @@ def api_config_download():
 	abort(404, "config.yaml not found")
 
 
+# --- Notifications, scheduling and conversation analytics ---
+
+@app.route("/api/notifications/email")
+def api_notification_email_get():
+	settings = load_email_settings(BASE_DIR, load_config(CONFIG_PATH))
+	settings.pop("password", None)
+	return _json_response({"email": settings})
+
+
+@app.route("/api/notifications/email", method="POST")
+def api_notification_email_post():
+	body = request.json or {}
+	try:
+		value = body.get("email") if isinstance(body.get("email"), dict) else body
+		settings = save_email_settings(BASE_DIR, load_config(CONFIG_PATH), value)
+		settings.pop("password", None)
+		return _json_response({"success": True, "email": settings})
+	except (TypeError, ValueError, OSError) as exc:
+		return _json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/notifications/outbox")
+def api_notification_outbox():
+	return _json_response({"notifications": list_outbox(_get_web_db(), request.query.get("status"))})
+
+
+@app.route("/api/notifications/outbox/<item_id>/dispatch", method="POST")
+def api_notification_dispatch(item_id):
+	try:
+		settings = load_email_settings(BASE_DIR, load_config(CONFIG_PATH))
+		item = send_outbox_item(_get_web_db(), int(item_id), settings)
+		return _json_response({"success": True, "notification": item})
+	except (TypeError, ValueError, OSError, smtplib.SMTPException) as exc:
+		return _json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/conversations/analytics")
+def api_conversation_analytics():
+	conn = _get_web_db()
+	try:
+		# Analytics must also work on a brand-new local database.
+		ConversationRepository(conn)
+		rows = conn.execute("SELECT status, COUNT(*) AS count FROM conv_conversations GROUP BY status ORDER BY count DESC").fetchall()
+		message_rows = conn.execute("SELECT sender_type, COUNT(*) AS count FROM conv_messages GROUP BY sender_type ORDER BY count DESC").fetchall()
+		platform_rows = conn.execute("SELECT platform, COUNT(*) AS count FROM conv_conversations GROUP BY platform ORDER BY count DESC").fetchall()
+		return _json_response({
+			"conversations_total": conn.execute("SELECT COUNT(*) FROM conv_conversations").fetchone()[0],
+			"messages_total": conn.execute("SELECT COUNT(*) FROM conv_messages").fetchone()[0],
+			"confirmed_public_facts": conn.execute("SELECT COUNT(*) FROM know_facts WHERE fact_status = 'confirmed' AND public_allowed = 1").fetchone()[0] if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='know_facts'").fetchone() else 0,
+			"salary_paused": conn.execute("SELECT COUNT(*) FROM conv_conversations WHERE status = 'paused_salary'").fetchone()[0],
+			"by_status": [dict(row) for row in rows],
+			"messages_by_sender": [dict(row) for row in message_rows],
+			"by_platform": [dict(row) for row in platform_rows],
+		})
+	finally:
+		conn.close()
+
+
+@app.route("/api/conversations/scheduler/next")
+def api_conversation_scheduler_next():
+	conn = _get_web_db()
+	try:
+		candidate = SerialConversationScheduler(conn).next_candidate()
+		return _json_response({"mode": "serial", "candidate": candidate})
+	finally:
+		conn.close()
+
+
 # --- Personal knowledge and conversation foundation ---
 
 @app.route("/api/knowledge/documents")
@@ -2651,7 +2732,27 @@ def api_conversation_messages(conversation_id):
 		combined = " ".join(message.content for message in messages)
 		if any(token in combined for token in ("薪资", "工资", "薪酬", "月薪", "年薪", "几K", "几 k", "待遇")):
 			repo.update_status(conversation_id, "paused_salary", "检测到薪资或待遇话题，等待人工处理")
-		return _json_response({"success": True, "inserted": inserted, "conversation": repo.get_conversation(conversation_id)})
+			notification = None
+			settings = load_email_settings(BASE_DIR, load_config(CONFIG_PATH))
+			if settings.get("to_email"):
+				conversation = repo.get_conversation(conversation_id) or {}
+				subject = f"BossHunter 人工接管提醒：{conversation.get('hr_name') or 'HR'} 提到薪资"
+				body_text = (
+					f"HR：{conversation.get('hr_name') or ''}\n"
+					f"公司：{conversation.get('company_id') or ''}\n"
+					f"岗位链接：{conversation.get('hr_profile_url') or conversation.get('company_url') or ''}\n"
+					f"会话：{conversation_id}\n\n最新消息：\n{combined}\n\n"
+					"平台已暂停该会话的自动草稿流程，请人工确认后再恢复。"
+				)
+				notification = enqueue_alert(repo.conn, conversation_id=conversation_id, recipient=settings["to_email"], subject=subject, body=body_text)
+				if settings.get("enabled") and settings.get("auto_send") and notification.get("status") != "sent":
+					try:
+						notification = send_outbox_item(repo.conn, notification["id"], settings)
+					except Exception as exc:
+						notification = dict(notification)
+						notification["delivery_error"] = str(exc)
+			return _json_response({"success": True, "inserted": inserted, "notification": notification, "conversation": repo.get_conversation(conversation_id)})
+		return _json_response({"success": True, "inserted": inserted, "notification": None, "conversation": repo.get_conversation(conversation_id)})
 	except ValueError as exc:
 		return _json_response({"error": str(exc)}, 400)
 

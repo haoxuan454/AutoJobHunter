@@ -97,6 +97,27 @@ class ConversationWebFlowTests(unittest.TestCase):
         status, blocked = self.request("/api/conversations/c1/draft", "POST", {})
         self.assertTrue(status.startswith("409"), blocked)
 
+    def test_notification_settings_scheduler_and_analytics_http_flow(self):
+        status, saved = self.request(
+            "/api/notifications/email", "POST",
+            {"email": {"enabled": False, "auto_send": False, "smtp_host": "smtp.example.com", "to_email": "me@example.com", "password": "secret"}},
+        )
+        self.assertTrue(status.startswith("200"), saved)
+        self.assertTrue(saved["email"]["password_set"])
+        self.assertNotIn("password", saved["email"])
+        self.request("/api/conversations", "POST", {"id": "c2", "platform": "test", "hr_name": "HR"})
+        status, message = self.request(
+            "/api/conversations/c2/messages", "POST",
+            {"sender_type": "hr", "content": "我们想了解你的薪资期望", "platform_message_id": "salary-1"},
+        )
+        self.assertTrue(status.startswith("200"), message)
+        self.assertEqual(message["notification"]["status"], "pending")
+        self.assertEqual(len(self.request("/api/notifications/outbox")[1]["notifications"]), 1)
+        analytics = self.request("/api/conversations/analytics")[1]
+        self.assertEqual(analytics["conversations_total"], 1)
+        self.assertEqual(analytics["salary_paused"], 1)
+        self.assertEqual(self.request("/api/conversations/scheduler/next")[1]["candidate"], None)
+
 
 if __name__ == "__main__":
     unittest.main()

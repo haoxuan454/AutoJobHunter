@@ -171,3 +171,31 @@ CREATE TABLE conv_sync_cursors (
     CONSTRAINT fk_conv_cursor_conversation FOREIGN KEY (conversation_id) REFERENCES conv_conversations(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+CREATE TABLE notification_outbox (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    conversation_id CHAR(36) NOT NULL,
+    kind VARCHAR(32) NOT NULL,
+    recipient VARCHAR(320) NOT NULL,
+    subject VARCHAR(512) NOT NULL,
+    body MEDIUMTEXT NOT NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+    attempts INT UNSIGNED NOT NULL DEFAULT 0,
+    last_error TEXT NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    sent_at DATETIME(6) NULL,
+    UNIQUE KEY uq_notification_identity (conversation_id, kind, subject),
+    KEY idx_notification_status (status, created_at),
+    CONSTRAINT fk_notification_conversation FOREIGN KEY (conversation_id) REFERENCES conv_conversations(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE conv_scheduler_state (
+    id TINYINT UNSIGNED NOT NULL PRIMARY KEY,
+    running_conversation_id CHAR(36) NULL,
+    lease_until DATETIME(6) NULL,
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    CONSTRAINT fk_scheduler_conversation FOREIGN KEY (running_conversation_id) REFERENCES conv_conversations(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- SQLite remains the only runtime adapter in this repository. A MySQL adapter
+-- must preserve the unique message/outbox keys and use a transaction plus
+-- SELECT ... FOR UPDATE for scheduler claims before production migration.
