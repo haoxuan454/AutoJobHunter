@@ -1,106 +1,85 @@
 [CmdletBinding()]
-param(
-	[switch]$SkipChrome,
-	[string]$PythonPath
-)
+param()
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+$RuntimeDir = Join-Path $RepoRoot "data\runtime"
+$StateFile = Join-Path $RuntimeDir "bosshunter-processes.json"
+$OutputLog = Join-Path $RuntimeDir "web.out.log"
+$ErrorLog = Join-Path $RuntimeDir "web.err.log"
 $env:PYTHONUTF8 = "1"
 
-if ($PythonPath) {
-	if (-not (Test-Path -LiteralPath $PythonPath)) {
-		throw "Configured Python was not found: $PythonPath"
-	}
-	$Runner = (Resolve-Path -LiteralPath $PythonPath).Path
-	$RunnerPrefix = @("-m", "bosshunter.main")
-} else {
-	$LocalBosshunter = Join-Path $RepoRoot ".venv\Scripts\bosshunter.exe"
-	if (Test-Path -LiteralPath $LocalBosshunter) {
-		$Runner = $LocalBosshunter
-		$RunnerPrefix = @()
-	} else {
-		$Python = Get-Command "py" -ErrorAction SilentlyContinue
-		if (-not $Python) {
-			$Python = Get-Command "python" -ErrorAction SilentlyContinue
-		}
-		if (-not $Python) {
-			throw "Could not find the project virtual environment or Python."
-		}
-		$Runner = $Python.Source
-		$RunnerPrefix = @("-m", "bosshunter.main")
-	}
+New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
+
+function Get-LocalExecutable([string]$RelativePath) {
+    $path = Join-Path $RepoRoot $RelativePath
+    if (-not (Test-Path -LiteralPath $path)) { throw "Missing project file: $path" }
+    return (Resolve-Path -LiteralPath $path).Path
 }
 
-$ChromeCandidates = @()
-if ($env:ProgramFiles) {
-	$ChromeCandidates += Join-Path $env:ProgramFiles "Google\Chrome\Application\chrome.exe"
+function Test-WebReady {
+    try { $null = Invoke-WebRequest -Uri "http://127.0.0.1:8686/" -UseBasicParsing -TimeoutSec 2; return $true }
+    catch { return $false }
 }
-if (${env:ProgramFiles(x86)}) {
-	$ChromeCandidates += Join-Path ${env:ProgramFiles(x86)} "Google\Chrome\Application\chrome.exe"
-}
-if ($env:LOCALAPPDATA) {
-	$ChromeCandidates += Join-Path $env:LOCALAPPDATA "Google\Chrome\Application\chrome.exe"
-}
-$ChromeCandidates = $ChromeCandidates | Where-Object { Test-Path -LiteralPath $_ }
 
-if (-not $ChromeCandidates) {
-	throw "Could not find Google Chrome. Install Chrome or set up a compatible browser manually."
+function Test-ChromeReady {
+    try { $null = Invoke-RestMethod -Uri "http://127.0.0.1:9222/json/version" -TimeoutSec 2; return $true }
+    catch { return $false }
 }
+
+$Bosshunter = Get-LocalExecutable ".venv\Scripts\bosshunter.exe"
+$ChromeCandidates = @(
+    (Join-Path ${env:ProgramFiles} "Google\Chrome\Application\chrome.exe"),
+    (Join-Path ${env:ProgramFiles(x86)} "Google\Chrome\Application\chrome.exe"),
+    (Join-Path $env:LOCALAPPDATA "Google\Chrome\Application\chrome.exe")
+) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+if (-not $ChromeCandidates) { throw "Google Chrome was not found." }
 
 $Chrome = $ChromeCandidates | Select-Object -First 1
 $ChromeProfile = Join-Path $RepoRoot ".chrome-profile"
-$ChromeArguments = @(
-	"--remote-debugging-port=9222",
-	"--user-data-dir=$ChromeProfile",
-	"https://www.zhipin.com"
-)
+$ChromePid = $null
+$WebPid = $null
 
-if (-not $SkipChrome) {
-	Write-Host "Starting the BossHunter Chrome profile..."
-	Start-Process -FilePath $Chrome -ArgumentList $ChromeArguments
-	$ChromeReady = $false
-	for ($i = 0; $i -lt 20; $i++) {
-		Start-Sleep -Milliseconds 500
-		try {
-			$null = Invoke-RestMethod -Uri "http://127.0.0.1:9222/json/version" -TimeoutSec 2
-			$ChromeReady = $true
-			break
-		} catch {
-			# Chrome is still starting.
-		}
-	}
-	if (-not $ChromeReady) {
-		Write-Warning "Chrome remote debugging did not become ready within 10 seconds."
-	}
+if (-not (Test-ChromeReady)) {
+    Write-Host "Starting the project Chrome profile..."
+    $chromeProcess = Start-Process -FilePath $Chrome -ArgumentList @(
+        "--remote-debugging-port=9222",
+        "--user-data-dir=$ChromeProfile",
+        "https://www.zhipin.com/"
+    ) -PassThru
+    $ChromePid = $chromeProcess.Id
+    $ready = $false
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Milliseconds 500
+        if (Test-ChromeReady) { $ready = $true; break }
+    }
+    if (-not $ready) { throw "Chrome CDP port 9222 did not become ready." }
+} else {
+    Write-Host "Project Chrome is already running; reusing it."
 }
 
-Write-Host "Starting the Browser Runtime..."
-& $Runner @RunnerPrefix "connect"
-if ($LASTEXITCODE -ne 0) {
-	Write-Warning "Browser connection check returned exit code $LASTEXITCODE. The workbench will still be opened."
+if (Test-WebReady) {
+    Write-Host "BossHunter Web is already running."
+} else {
+    Write-Host "Starting BossHunter Web..."
+    $webProcess = Start-Process -FilePath $Bosshunter -ArgumentList @("web", "--no-open") -WorkingDirectory $RepoRoot -RedirectStandardOutput $OutputLog -RedirectStandardError $ErrorLog -PassThru
+    $WebPid = $webProcess.Id
+    $ready = $false
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Milliseconds 500
+        if (Test-WebReady) { $ready = $true; break }
+    }
+    if (-not $ready) { throw "Web did not start. Check $OutputLog and $ErrorLog" }
 }
 
-Write-Host "Starting the local workbench..."
-$WebArguments = @($RunnerPrefix) + @("web", "--no-open")
-Start-Process -FilePath $Runner -ArgumentList $WebArguments -WorkingDirectory $RepoRoot -WindowStyle Hidden
+Write-Host "Checking the local browser runtime..."
+& $Bosshunter connect
+if ($LASTEXITCODE -ne 0) { Write-Warning "Browser check failed, but Web is running." }
 
-for ($i = 0; $i -lt 20; $i++) {
-	Start-Sleep -Milliseconds 500
-	try {
-		$null = Invoke-WebRequest -Uri "http://127.0.0.1:8686/" -UseBasicParsing -TimeoutSec 2
-		break
-	} catch {
-		# The local server is still starting.
-	}
-}
+$state = [ordered]@{ repo_root = $RepoRoot; chrome_pid = $ChromePid; web_pid = $WebPid; chrome_profile = $ChromeProfile; started_at = (Get-Date).ToString("o") }
+$state | ConvertTo-Json | Set-Content -LiteralPath $StateFile -Encoding UTF8
 
-if (-not $SkipChrome) {
-	Start-Process -FilePath $Chrome -ArgumentList @(
-		"--remote-debugging-port=9222",
-		"--user-data-dir=$ChromeProfile",
-		"http://127.0.0.1:8686"
-	)
-}
-
-Write-Host "BossHunter is ready. Log in manually in the dedicated Chrome window if needed."
+Start-Process "http://127.0.0.1:8686/"
+Write-Host "BossHunter started: http://127.0.0.1:8686/" -ForegroundColor Green
+Write-Host "Logs: data\runtime\web.out.log and data\runtime\web.err.log"
+Write-Host "Log in manually in the project Chrome profile. Stop if a captcha appears."
