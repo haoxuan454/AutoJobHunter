@@ -88,6 +88,8 @@ class ConversationWebFlowTests(unittest.TestCase):
         status, draft = self.request("/api/conversations/c1/draft", "POST", {})
         self.assertTrue(status.startswith("200"), draft)
         self.assertFalse(draft["sent"])
+        detail = self.request("/api/conversations/c1")[1]
+        self.assertEqual(len(detail["drafts"]), 1)
 
         status, paused = self.request(
             "/api/conversations/c1/messages", "POST",

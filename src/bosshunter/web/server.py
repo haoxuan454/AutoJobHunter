@@ -2712,7 +2712,11 @@ def api_conversation_detail(conversation_id):
 	conversation = repo.get_conversation(conversation_id)
 	if not conversation:
 		return _json_response({"error": "会话不存在"}, 404)
-	return _json_response({"conversation": conversation, "messages": repo.list_messages(conversation_id)})
+	return _json_response({
+		"conversation": conversation,
+		"messages": repo.list_messages(conversation_id),
+		"drafts": repo.list_drafts(conversation_id),
+	})
 
 
 @app.route("/api/conversations/<conversation_id>/messages", method="POST")

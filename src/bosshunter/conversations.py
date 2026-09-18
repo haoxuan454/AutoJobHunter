@@ -304,6 +304,13 @@ class ConversationRepository:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_drafts(self, conversation_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM conv_drafts WHERE conversation_id = ? ORDER BY created_at DESC, id DESC",
+            (conversation_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def list_conversations(self, user_id: str = "default") -> list[dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM conv_conversations WHERE user_id = ? ORDER BY updated_at DESC, id DESC",
