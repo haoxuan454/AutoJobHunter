@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+.chrome-profile/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Config with secrets
+config.yaml
+.*.credentials.yaml
+
+# Personal resume
+resume.md
+
+# Data (contains personal info, resumes, DB)
+data/
+!src/bosshunter/data/
+!src/bosshunter/data/boss_cities.json
+*.db
+*.db-shm
+*.db-wal
+
+# Node
+node_modules/
+*.tsbuildinfo
+
+# Frontend build output (built on demand, not tracked in VCS)
+src/bosshunter/web/frontend/dist/
+
+# Local generated artifacts
+output/
+tmp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code / local agent notes
+.claude/
+.superpowers/
+docs/superpowers/
+AGENTS.md
+.cache/
