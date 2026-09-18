@@ -32,6 +32,14 @@ class ConversationBridgeTests(unittest.TestCase):
         self.assertEqual(result["conversation"]["status"], "paused_salary")
         self.assertIsNone(result["notification"])
 
+    def test_outgoing_snapshot_is_recorded_as_user_sent_message(self):
+        sync_extracted_messages(
+            self.conn, job=self.job, conversation=self.conversation,
+            messages=[{"sender": "me", "text": "好的，我来介绍一下", "message_id": "out-1"}],
+        )
+        row = self.conn.execute("SELECT sender_type, is_sent FROM conv_messages").fetchone()
+        self.assertEqual((row["sender_type"], row["is_sent"]), ("user", 1))
+
 
 if __name__ == "__main__":
     unittest.main()

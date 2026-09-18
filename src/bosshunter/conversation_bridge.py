@@ -68,7 +68,7 @@ def sync_extracted_messages(
             source_url=str(conversation.get("source_url") or job.get("url") or ""),
             raw_payload=item,
             is_ai_generated=False,
-            is_sent=False,
+            is_sent=sender == "me",
         ))
     inserted = repo.append_messages(conversation_id, incoming)
     cursor = hashlib.sha256("\x1e".join(f"{item.sender_type}:{item.content}" for item in incoming).encode("utf-8")).hexdigest()
