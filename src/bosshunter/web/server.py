@@ -116,6 +116,7 @@ from bosshunter.conversations import ConversationRepository, IncomingMessage
 from bosshunter.conversation_scheduler import SerialConversationScheduler, init_scheduler_tables
 from bosshunter.knowledge import (
 	 ingest_document,
+	delete_document,
 	 list_documents,
 	list_facts,
 	search_confirmed_facts,
@@ -2631,6 +2632,15 @@ def api_conversation_scheduler_next():
 @app.route("/api/knowledge/documents")
 def api_knowledge_documents():
 	return _json_response({"documents": list_documents(_get_web_db())})
+
+
+@app.route("/api/knowledge/documents/<document_id>", method="DELETE")
+def api_knowledge_document_delete(document_id):
+	try:
+		deleted = delete_document(_get_web_db(), int(document_id), storage_root=DATA_DIR / "knowledge")
+		return _json_response({"success": True, "document": deleted})
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 404)
 
 
 @app.route("/api/knowledge/facts")

@@ -176,6 +176,38 @@ def list_documents(conn: sqlite3.Connection, user_id: str = "default") -> list[d
     ).fetchall()]
 
 
+def delete_document(
+    conn: sqlite3.Connection,
+    document_id: int,
+    user_id: str = "default",
+    storage_root: Path | None = None,
+) -> dict[str, Any]:
+    """Delete one uploaded knowledge document, its extracted facts, and its local file."""
+    init_knowledge_tables(conn)
+    row = conn.execute(
+        "SELECT * FROM know_documents WHERE id = ? AND user_id = ?", (int(document_id), user_id)
+    ).fetchone()
+    if not row:
+        raise ValueError("knowledge document not found")
+
+    storage_path = Path(str(row["storage_path"] or ""))
+    with conn:
+        conn.execute("DELETE FROM know_facts WHERE document_id = ? AND user_id = ?", (int(document_id), user_id))
+        conn.execute("DELETE FROM know_documents WHERE id = ? AND user_id = ?", (int(document_id), user_id))
+
+    # Uploaded knowledge files are stored below data/knowledge. Do not unlink an
+    # arbitrary path if an old database row contains an unexpected location.
+    knowledge_root = storage_root or (Path.cwd() / "data" / "knowledge")
+    try:
+        if storage_path.exists() and storage_path.resolve().is_relative_to(knowledge_root.resolve()):
+            storage_path.unlink()
+    except OSError:
+        # The database record is already removed; a missing physical file should
+        # not make the UI deletion fail.
+        pass
+    return {"id": int(document_id), "original_name": row["original_name"]}
+
+
 def list_facts(conn: sqlite3.Connection, user_id: str = "default", *, include_unconfirmed: bool = True) -> list[dict[str, Any]]:
     init_knowledge_tables(conn)
     where = "user_id = ?" if include_unconfirmed else "user_id = ? AND fact_status = 'confirmed' AND public_allowed = 1"

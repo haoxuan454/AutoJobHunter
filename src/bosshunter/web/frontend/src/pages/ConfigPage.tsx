@@ -7,8 +7,9 @@ import { Slider } from '@/components/ui/slider'
 import { TagsInput } from '@/components/ui/tags-input'
 import { CityMultiSelect, type CityOption } from '@/components/config/CityMultiSelect'
 import { ResumeUploadSection } from '@/components/config/ResumeUploadSection'
+import { EmailNotificationCard } from '@/components/config/EmailNotificationCard'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
-import { Save, RotateCcw, ChevronDown, ChevronRight, Loader2 } from 'lucide-react'
+import { Save, RotateCcw, ChevronDown, ChevronRight, Loader2, UserRound, Search, BrainCircuit, ShieldAlert, Activity, Repeat2, Mail } from 'lucide-react'
 import { useState, useEffect, useRef } from 'react'
 import { PLATFORM_LABELS, PLATFORM_SHORT_LABELS } from '@/lib/platforms'
 
@@ -820,6 +821,10 @@ export default function ConfigPage() {
             </Field>
           </div>
         </SectionCard>
+
+        <SectionCard title="QQ 邮箱提醒" sectionKey="notifications" expanded={expandedSections} toggle={toggleSection}>
+          <EmailNotificationCard />
+        </SectionCard>
     </div>
   )
 }
@@ -829,14 +834,28 @@ function SectionCard({ title, sectionKey, expanded, toggle, children }: {
   title: string; sectionKey: string; expanded: Record<string, boolean>; toggle: (k: string) => void; children: React.ReactNode
 }) {
   const isExpanded = expanded[sectionKey] ?? false
+  const metadata: Record<string, { description: string; icon: typeof UserRound; tone: string }> = {
+    profile: { description: '简历、求职偏好与个人资料', icon: UserRound, tone: 'bg-orange-50 text-orange-600' },
+    search: { description: '关键词、城市与平台搜索条件', icon: Search, tone: 'bg-blue-50 text-blue-600' },
+    scoring: { description: '岗位匹配与筛选标准', icon: BrainCircuit, tone: 'bg-violet-50 text-violet-600' },
+    ai: { description: '模型、接口与回复生成规则', icon: BrainCircuit, tone: 'bg-indigo-50 text-indigo-600' },
+    collection: { description: '低频访问与平台安全边界', icon: ShieldAlert, tone: 'bg-amber-50 text-amber-700' },
+    monitor: { description: 'HR 会话监测与人工确认', icon: Activity, tone: 'bg-emerald-50 text-emerald-600' },
+    follow_up: { description: '后续跟进节奏与时间窗口', icon: Repeat2, tone: 'bg-cyan-50 text-cyan-600' },
+    dedup: { description: '历史岗位与投递记录去重', icon: Search, tone: 'bg-slate-100 text-slate-600' },
+    notifications: { description: 'QQ 邮箱人工接管提醒', icon: Mail, tone: 'bg-rose-50 text-rose-600' },
+  }
+  const details = metadata[sectionKey] || { description: '本地运行配置', icon: Activity, tone: 'bg-slate-100 text-slate-600' }
+  const Icon = details.icon
   return (
     <Card>
       <button
-        className="w-full flex items-center justify-between p-4 transition-colors hover:bg-[#FFFCFA]"
+        type="button"
+        className="flex w-full items-center justify-between gap-4 p-4 text-left transition-colors hover:bg-[#FFFCFA]"
         onClick={() => toggle(sectionKey)}
       >
-        <span className="text-sm font-black text-foreground">{title}</span>
-        {isExpanded ? <ChevronDown className="w-4 h-4 text-foreground" /> : <ChevronRight className="w-4 h-4 text-foreground" />}
+        <span className="flex min-w-0 items-center gap-3"><span className={`rounded-xl p-2 ${details.tone}`}><Icon className="h-4 w-4" /></span><span className="min-w-0"><span className="block text-sm font-black text-foreground">{title}</span><span className="mt-0.5 block truncate text-xs font-normal text-muted">{details.description}</span></span></span>
+        <span className="flex shrink-0 items-center gap-2 text-xs text-muted"><span className="hidden rounded-full bg-[#FFF7F0] px-2 py-1 md:inline">{isExpanded ? '收起' : '展开'}</span>{isExpanded ? <ChevronDown className="h-4 w-4 text-foreground" /> : <ChevronRight className="h-4 w-4 text-foreground" />}</span>
       </button>
       {isExpanded && <div className="px-4 pb-4">{children}</div>}
     </Card>

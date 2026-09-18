@@ -63,7 +63,7 @@ def load_email_settings(base_dir: Path, config: dict[str, Any] | None = None) ->
     result = {
         "enabled": bool(public.get("enabled", False)),
         "auto_send": bool(public.get("auto_send", False)),
-        "smtp_host": str(public.get("smtp_host") or ""),
+        "smtp_host": str(public.get("smtp_host") or "smtp.qq.com"),
         "smtp_port": int(public.get("smtp_port") or 465),
         "use_tls": bool(public.get("use_tls", True)),
         "username": str(public.get("username") or ""),
