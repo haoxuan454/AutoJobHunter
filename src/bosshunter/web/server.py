@@ -31,7 +31,7 @@ from bosshunter.agent_api import (
 	validate_agent_evaluations,
 )
 from bosshunter import __version__
-from bosshunter.ai.credentials import AIRequestError, get_ai_api_key, list_ai_models
+from bosshunter.ai.credentials import AIRequestError, call_anthropic_text, get_ai_api_key, list_ai_models
 from bosshunter.ai.scorer import sanitize_score_trace
 from bosshunter.cities import CityRefreshError, get_city_map, load_city_snapshot, refresh_city_cache
 from bosshunter.config import AI_SERVICE_PRESETS, load_config, remove_retired_collection_settings, save_config
@@ -2790,11 +2790,33 @@ def api_conversation_draft(conversation_id):
 	selected = facts[:2]
 	evidence = "；".join(f"{fact['title']}：{fact['content'][:180]}" for fact in selected)
 	draft = f"之前确实做过一些相关工作，比较接近的是：{evidence}。具体可以结合岗位要求再展开。"
+	generation_mode = "local_evidence"
+	model_error = None
+	config = load_config(CONFIG_PATH)
+	if get_ai_api_key(config):
+		prompt = (
+			"你是求职者的回复草稿助手。请根据 HR 的最新问题、对话上下文和已确认的真实经历，生成一段自然、简短、像真人沟通的中文回复。"
+			"只能使用给出的真实经历，不得补造数字、公司、项目结果或技能；不要提及 AI，不要发送消息，只输出回复正文。\n\n"
+			f"HR 最新问题：{latest['content'][:1000]}\n"
+			f"已确认经历：{evidence}\n"
+			f"对话上下文：{'；'.join(str(item['content'])[:300] for item in messages[-6:])}\n"
+		)
+		try:
+			model_draft = call_anthropic_text(prompt, config, 400, purpose="conversation_reply")
+			if model_draft and str(model_draft).strip():
+				draft = str(model_draft).strip()[:2000]
+				generation_mode = "configured_model"
+		except AIRequestError as exc:
+			model_error = exc.kind
+		except Exception:
+			model_error = "request_failed"
 	return _json_response({
 		"success": True,
 		"sent": False,
 		"draft": repo.save_draft(conversation_id, draft, int(latest["id"])),
 		"retrieved_facts": [{"id": fact["id"], "title": fact["title"]} for fact in selected],
+		"generation_mode": generation_mode,
+		"model_error": model_error,
 		"message": "草稿已生成，未发送；需要人工确认后才能进入发送流程",
 	})
 

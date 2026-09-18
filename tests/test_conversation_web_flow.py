@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from bosshunter.web import server
 
@@ -117,6 +118,23 @@ class ConversationWebFlowTests(unittest.TestCase):
         self.assertEqual(analytics["conversations_total"], 1)
         self.assertEqual(analytics["salary_paused"], 1)
         self.assertEqual(self.request("/api/conversations/scheduler/next")[1]["candidate"], None)
+
+    def test_configured_model_generates_contextual_draft_but_never_sends(self):
+        status, uploaded = self.request(
+            "/api/knowledge/documents/upload", "POST",
+            multipart=("experience.md", b"# Python project\nBuilt a Flask API", "text/markdown"),
+        )
+        fact_id = uploaded["document"]["id"]
+        self.request(f"/api/knowledge/facts/{fact_id}", "PATCH", {"fact_status": "confirmed", "public_allowed": True})
+        self.request("/api/conversations", "POST", {"id": "model-c", "platform": "test", "hr_name": "HR"})
+        self.request("/api/conversations/model-c/messages", "POST", {"sender_type": "hr", "content": "你用 Python 做过什么？", "platform_message_id": "m-model"})
+        with patch.object(server, "load_config", return_value={"ai": {"api_key": "configured", "provider": "openai_compatible", "base_url": "https://example.invalid", "model": "test"}}), \
+             patch.object(server, "call_anthropic_text", return_value="我之前用 Python 和 Flask 做过接口项目。") as call:
+            status, result = self.request("/api/conversations/model-c/draft", "POST", {})
+        self.assertTrue(status.startswith("200"), result)
+        self.assertEqual(result["generation_mode"], "configured_model")
+        self.assertFalse(result["sent"])
+        call.assert_called_once()
 
 
 if __name__ == "__main__":
