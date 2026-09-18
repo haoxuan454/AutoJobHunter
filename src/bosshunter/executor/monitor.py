@@ -2,6 +2,7 @@
 
 import time
 import json
+from pathlib import Path
 
 from rich.console import Console
 
@@ -1530,6 +1531,22 @@ def _handle_conversation(job: dict, config: dict, conversation: dict | None = No
         close_tab(target_id)
         _monitor_safety_guard(config).record_page_failure()
         return "failed"
+
+    # Persist the already-read platform snapshot locally. This bridge performs
+    # no browser action and keeps the new conversation center incremental.
+    from bosshunter.conversation_bridge import sync_extracted_messages
+    bridge_db = get_db()
+    try:
+        synced = sync_extracted_messages(
+            bridge_db, job=job, messages=messages, conversation=conversation,
+            base_dir=Path.cwd(), config=config,
+        )
+    finally:
+        bridge_db.close()
+    if synced["conversation"].get("status") == "paused_salary":
+        close_tab(target_id)
+        console.print("[yellow]    薪资话题已转人工接管，当前会话暂停自动处理[/yellow]")
+        return "paused_salary"
 
     _monitor_safety_guard(config).record_page_success()
 
