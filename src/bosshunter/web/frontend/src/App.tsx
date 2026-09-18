@@ -3,6 +3,10 @@ import { Sidebar } from './components/layout/Sidebar'
 import { Header } from './components/layout/Header'
 import DashboardPage from './pages/DashboardPage'
 import ConfigPage from './pages/ConfigPage'
+import KnowledgePage from './pages/KnowledgePage'
+import ConversationsPage from './pages/ConversationsPage'
+import ConversationDetailPage from './pages/ConversationDetailPage'
+import AnalyticsPage from './pages/AnalyticsPage'
 
 function JobsPage() {
   return <DashboardPage view="jobs" />
@@ -25,6 +29,10 @@ export default function App() {
               <Route path="/jobs" element={<JobsPage />} />
               <Route path="/monitor" element={<MonitorPage />} />
               <Route path="/config" element={<ConfigPage />} />
+              <Route path="/knowledge" element={<KnowledgePage />} />
+              <Route path="/conversations" element={<ConversationsPage />} />
+              <Route path="/conversations/:id" element={<ConversationDetailPage />} />
+              <Route path="/analytics" element={<AnalyticsPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </main>

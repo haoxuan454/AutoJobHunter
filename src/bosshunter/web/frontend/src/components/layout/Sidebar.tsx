@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom'
-import { BriefcaseBusiness, Github, LayoutDashboard, Radar, Settings } from 'lucide-react'
+import { BriefcaseBusiness, Github, LayoutDashboard, Radar, Settings, BookOpen, MessageSquare, BarChart3 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 
 const navItems = [
@@ -7,6 +7,9 @@ const navItems = [
   { to: '/jobs', icon: BriefcaseBusiness, label: '岗位池' },
   { to: '/monitor', icon: Radar, label: '监测执行' },
   { to: '/config', icon: Settings, label: '配置' },
+  { to: '/knowledge', icon: BookOpen, label: '个人知识库' },
+  { to: '/conversations', icon: MessageSquare, label: 'HR 会话' },
+  { to: '/analytics', icon: BarChart3, label: '数据分析' },
 ]
 
 const GITHUB_URL = 'https://github.com/powerycy/BossHunter'

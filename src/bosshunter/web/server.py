@@ -111,6 +111,15 @@ from bosshunter.web.tasks import (
 	WorkbenchTaskRunner,
 	wait_for_initial_monitor_cooldown,
 )
+from bosshunter.conversations import ConversationRepository, IncomingMessage
+from bosshunter.knowledge import (
+	 ingest_document,
+	 list_documents,
+	list_facts,
+	search_confirmed_facts,
+	safe_knowledge_filename,
+	update_fact_status,
+)
 
 mimetypes.add_type("application/javascript", ".js", strict=True)
 mimetypes.add_type("application/javascript", ".mjs", strict=True)
@@ -199,6 +208,10 @@ def set_base_dir(base_dir: Path | str) -> None:
 def _get_web_db():
 	"""Open the dashboard database from the resolved runtime data directory."""
 	return get_db(DATA_DIR / "bosshunter.db")
+
+
+def _conversation_repo():
+	return ConversationRepository(_get_web_db())
 
 
 def _json_response(data, status_code=200):
@@ -2530,6 +2543,159 @@ def api_config_download():
 		response.headers["Content-Disposition"] = "attachment; filename=config.yaml"
 		return _config_download_payload(load_config(CONFIG_PATH))
 	abort(404, "config.yaml not found")
+
+
+# --- Personal knowledge and conversation foundation ---
+
+@app.route("/api/knowledge/documents")
+def api_knowledge_documents():
+	return _json_response({"documents": list_documents(_get_web_db())})
+
+
+@app.route("/api/knowledge/facts")
+def api_knowledge_facts():
+	include_unconfirmed = request.params.get("include_unconfirmed", "1").lower() not in {"0", "false", "no"}
+	return _json_response({"facts": list_facts(_get_web_db(), include_unconfirmed=include_unconfirmed)})
+
+
+@app.route("/api/knowledge/documents/upload", method="POST")
+def api_knowledge_document_upload():
+	upload = request.files.get("file")
+	if not upload:
+		return _json_response({"error": "No file uploaded"}, 400)
+	raw_name = upload.raw_filename or upload.filename or ""
+	content = upload.file.read()
+	if len(content) > 20 * 1024 * 1024:
+		return _json_response({"error": "知识资料不能超过 20MB"}, 400)
+	try:
+		from bosshunter.web.resume_upload import safe_resume_filename
+		# Reuse filename sanitization while accepting the knowledge-specific formats.
+		name = str(raw_name).replace("\\", "/").rsplit("/", 1)[-1].strip()
+		if not name or Path(name).suffix.lower() not in {".md", ".txt", ".docx", ".xlsx", ".pdf"}:
+			return _json_response({"error": "知识资料仅支持 .md、.txt、.docx、.xlsx、.pdf"}, 400)
+		safe_name = safe_knowledge_filename(raw_name)
+		knowledge_dir = DATA_DIR / "knowledge"
+		knowledge_dir.mkdir(parents=True, exist_ok=True)
+		destination = knowledge_dir / safe_name
+		# Avoid overwriting unrelated files; duplicate content is handled by SHA256.
+		if destination.exists():
+			destination = knowledge_dir / f"{destination.stem}-{int(time.time())}{destination.suffix}"
+		destination.write_bytes(content)
+		result = ingest_document(
+			_get_web_db(), user_id="default", filename=safe_name, content=content,
+			storage_path=str(destination.resolve()), mime_type=upload.content_type or "",
+		)
+		return _json_response({"success": True, **result})
+	except Exception as exc:
+		return _json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/knowledge/facts/<fact_id>", method="PATCH")
+def api_knowledge_fact_update(fact_id):
+	body = request.json or {}
+	try:
+		fact = update_fact_status(
+			_get_web_db(), int(fact_id), status=str(body.get("fact_status") or "needs_confirmation"),
+			public_allowed=bool(body.get("public_allowed", False)),
+		)
+		return _json_response({"success": True, "fact": fact})
+	except (TypeError, ValueError) as exc:
+		return _json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/knowledge/search")
+def api_knowledge_search():
+	query = str(request.query.get("q") or "").strip()
+	return _json_response({"facts": search_confirmed_facts(_get_web_db(), query)})
+
+
+@app.route("/api/conversations")
+def api_conversations():
+	repo = _conversation_repo()
+	return _json_response({"conversations": repo.list_conversations()})
+
+
+@app.route("/api/conversations", method="POST")
+def api_conversation_create():
+	body = request.json or {}
+	try:
+		conversation = _conversation_repo().upsert_conversation(body)
+		return _json_response({"success": True, "conversation": conversation}, 201)
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/conversations/<conversation_id>")
+def api_conversation_detail(conversation_id):
+	repo = _conversation_repo()
+	conversation = repo.get_conversation(conversation_id)
+	if not conversation:
+		return _json_response({"error": "会话不存在"}, 404)
+	return _json_response({"conversation": conversation, "messages": repo.list_messages(conversation_id)})
+
+
+@app.route("/api/conversations/<conversation_id>/messages", method="POST")
+def api_conversation_messages(conversation_id):
+	body = request.json or {}
+	items = body.get("messages") if isinstance(body.get("messages"), list) else [body]
+	try:
+		messages = [IncomingMessage(
+			sender_type=str(item.get("sender_type") or ""), content=str(item.get("content") or ""),
+			message_time=item.get("message_time"), platform_message_id=item.get("platform_message_id"),
+			source_url=str(item.get("source_url") or ""), raw_payload=item.get("raw_payload"),
+			is_ai_generated=bool(item.get("is_ai_generated", False)), is_sent=bool(item.get("is_sent", False)),
+		) for item in items]
+		repo = _conversation_repo()
+		inserted = repo.append_messages(conversation_id, messages)
+		# Sensitive salary topics pause only this conversation; no browser action is triggered.
+		combined = " ".join(message.content for message in messages)
+		if any(token in combined for token in ("薪资", "工资", "薪酬", "月薪", "年薪", "几K", "几 k", "待遇")):
+			repo.update_status(conversation_id, "paused_salary", "检测到薪资或待遇话题，等待人工处理")
+		return _json_response({"success": True, "inserted": inserted, "conversation": repo.get_conversation(conversation_id)})
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/conversations/<conversation_id>/status", method="POST")
+def api_conversation_status(conversation_id):
+	body = request.json or {}
+	try:
+		conversation = _conversation_repo().update_status(
+			conversation_id, str(body.get("status") or "active"), str(body.get("reason") or ""),
+		)
+		return _json_response({"success": True, "conversation": conversation})
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/conversations/<conversation_id>/draft", method="POST")
+def api_conversation_draft(conversation_id):
+	"""Generate an evidence-only draft; this endpoint never sends to a platform."""
+	repo = _conversation_repo()
+	conversation = repo.get_conversation(conversation_id)
+	if not conversation:
+		return _json_response({"error": "会话不存在"}, 404)
+	if conversation["status"] in {"paused_salary", "paused_risk", "paused_manual", "closed"}:
+		return _json_response({"error": "当前会话处于人工接管或关闭状态，不能生成自动回复草稿"}, 409)
+	messages = repo.list_messages(conversation_id)
+	latest = next((item for item in reversed(messages) if item["sender_type"] == "hr"), None)
+	if not latest:
+		return _json_response({"error": "没有可回复的 HR 消息"}, 400)
+	facts = search_confirmed_facts(_get_web_db(), latest["content"])
+	if not facts:
+		return _json_response({"error": "没有检索到已确认且允许对外使用的真实经历，已阻止生成草稿"}, 409)
+	# Deterministic local draft is intentional for this phase: it is auditable,
+	# avoids an unconfigured external AI request, and never claims unsupported facts.
+	selected = facts[:2]
+	evidence = "；".join(f"{fact['title']}：{fact['content'][:180]}" for fact in selected)
+	draft = f"之前确实做过一些相关工作，比较接近的是：{evidence}。具体可以结合岗位要求再展开。"
+	return _json_response({
+		"success": True,
+		"sent": False,
+		"draft": repo.save_draft(conversation_id, draft, int(latest["id"])),
+		"retrieved_facts": [{"id": fact["id"], "title": fact["title"]} for fact in selected],
+		"message": "草稿已生成，未发送；需要人工确认后才能进入发送流程",
+	})
 
 
 # ─── Local Agent API ───────────────────────────────────────

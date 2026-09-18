@@ -130,6 +130,21 @@ def init_conversation_tables(conn: sqlite3.Connection) -> None:
             last_synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (conversation_id) REFERENCES conv_conversations(id)
         );
+
+        CREATE TABLE IF NOT EXISTS conv_drafts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL,
+            trigger_message_id INTEGER,
+            draft_text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'waiting_approval',
+            fact_check_status TEXT NOT NULL DEFAULT 'passed',
+            prompt_version TEXT NOT NULL DEFAULT 'local-evidence-v1',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (conversation_id) REFERENCES conv_conversations(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_conv_drafts_conversation
+            ON conv_drafts(conversation_id, created_at DESC);
         """
     )
     conn.commit()
@@ -288,3 +303,38 @@ class ConversationRepository:
             (conversation_id,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def list_conversations(self, user_id: str = "default") -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM conv_conversations WHERE user_id = ? ORDER BY updated_at DESC, id DESC",
+            (user_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_status(self, conversation_id: str, status: str, reason: str = "") -> dict[str, Any]:
+        if status not in CONVERSATION_STATUSES:
+            raise ValueError(f"unsupported conversation status: {status}")
+        self.conn.execute(
+            "UPDATE conv_conversations SET status = ?, pause_reason = ?, updated_at = ? WHERE id = ?",
+            (status, reason, utc_now(), conversation_id),
+        )
+        self.conn.commit()
+        row = self.get_conversation(conversation_id)
+        if not row:
+            raise ValueError(f"conversation does not exist: {conversation_id}")
+        return row
+
+    def save_draft(self, conversation_id: str, draft_text: str, trigger_message_id: int | None = None) -> dict[str, Any]:
+        if not self.get_conversation(conversation_id):
+            raise ValueError(f"conversation does not exist: {conversation_id}")
+        if not str(draft_text or "").strip():
+            raise ValueError("draft text is required")
+        cursor = self.conn.execute(
+            """INSERT INTO conv_drafts
+               (conversation_id, trigger_message_id, draft_text)
+               VALUES (?, ?, ?)""",
+            (conversation_id, trigger_message_id, str(draft_text).strip()),
+        )
+        self.conn.commit()
+        row = self.conn.execute("SELECT * FROM conv_drafts WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        return dict(row)

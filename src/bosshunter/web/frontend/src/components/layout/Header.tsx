@@ -6,6 +6,9 @@ const pageTitles: Record<string, string> = {
   '/jobs': '岗位池',
   '/monitor': '监测执行',
   '/config': '配置',
+  '/knowledge': '个人知识库',
+  '/conversations': 'HR 会话',
+  '/analytics': '数据分析',
 }
 
 export function Header() {

@@ -50,7 +50,12 @@ class ConversationRepositoryTests(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'conv_%'"
             )
         }
-        self.assertEqual(names, {"conv_conversations", "conv_messages", "conv_sync_cursors"})
+        self.assertEqual(names, {"conv_conversations", "conv_messages", "conv_sync_cursors", "conv_drafts"})
+
+    def test_draft_is_stored_but_not_sent(self):
+        draft = self.repo.save_draft("conv-1", "这是一个需要人工确认的草稿", 1)
+        self.assertEqual(draft["status"], "waiting_approval")
+        self.assertEqual(draft["draft_text"], "这是一个需要人工确认的草稿")
 
 
 if __name__ == "__main__":
