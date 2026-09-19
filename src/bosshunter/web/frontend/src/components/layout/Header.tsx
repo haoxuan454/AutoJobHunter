@@ -13,15 +13,6 @@ const pageTitles: Record<string, string> = {
 
 export function Header() {
   const location = useLocation()
-  const title = pageTitles[location.pathname] || 'BossHunter'
-
-  return (
-    <header className="h-16 border-b border-card-border bg-[#FFFCFA] flex items-center justify-between px-6">
-      <h1 className="text-lg font-black text-foreground">{title}</h1>
-      <div className="flex items-center gap-2 text-xs text-muted">
-        <Activity className="w-3 h-3 text-success" />
-        <span>本地服务运行中</span>
-      </div>
-    </header>
-  )
+  const title = pageTitles[location.pathname] || 'AutoJobHunter'
+  return <header className="flex h-16 items-center justify-between border-b border-card-border bg-[#FFFCFA] px-6"><h1 className="text-lg font-black text-foreground">{title}</h1><div className="flex items-center gap-2 text-xs text-muted"><Activity className="h-3 w-3 text-success" /><span>本地服务运行中</span></div></header>
 }
