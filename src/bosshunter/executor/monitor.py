@@ -66,7 +66,12 @@ def get_effective_monitor_interval_minutes(
     config: dict,
     base_interval_minutes: float | int | None = None,
 ) -> float:
-    """Apply the BOSS operation multiplier to the wait between monitor cycles."""
+    """Return the user-configured wait between monitor cycles.
+
+    The collection multiplier only controls page-operation pacing. Applying it
+    to the monitor scheduler made a visible 30-minute setting silently become
+    45 minutes, so scheduler cadence is intentionally kept independent.
+    """
     raw_interval = (
         base_interval_minutes
         if base_interval_minutes is not None
@@ -76,7 +81,7 @@ def get_effective_monitor_interval_minutes(
         interval = float(raw_interval)
     except (TypeError, ValueError):
         interval = 30.0
-    return max(interval, 1.0) * get_boss_operation_interval_multiplier(config)
+    return max(interval, 1.0)
 
 
 # JS: Extract chat list with full message context

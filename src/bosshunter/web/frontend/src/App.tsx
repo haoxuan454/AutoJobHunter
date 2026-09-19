@@ -7,6 +7,7 @@ import KnowledgePage from './pages/KnowledgePage'
 import ConversationsPage from './pages/ConversationsPage'
 import ConversationDetailPage from './pages/ConversationDetailPage'
 import AnalyticsPage from './pages/AnalyticsPage'
+import AssistantLabPage from './pages/AssistantLabPage'
 
 function JobsPage() {
   return <DashboardPage view="jobs" />
@@ -33,6 +34,7 @@ export default function App() {
               <Route path="/conversations" element={<ConversationsPage />} />
               <Route path="/conversations/:id" element={<ConversationDetailPage />} />
               <Route path="/analytics" element={<AnalyticsPage />} />
+              <Route path="/assistant-lab" element={<AssistantLabPage />} />
               <Route path="/notifications" element={<Navigate to="/config?section=notifications" replace />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>

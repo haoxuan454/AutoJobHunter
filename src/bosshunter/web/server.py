@@ -114,6 +114,7 @@ from bosshunter.web.tasks import (
 )
 from bosshunter.conversations import ConversationRepository, IncomingMessage
 from bosshunter.conversation_scheduler import SerialConversationScheduler, init_scheduler_tables
+from bosshunter.assistant_lab import open_sandbox, reset as reset_lab, send_message as lab_send_message, session_payload as lab_session_payload
 from bosshunter.knowledge import (
 	 ingest_document,
 	delete_document,
@@ -398,6 +399,28 @@ def _task_config(extra: dict | None = None) -> dict:
 	return config
 
 
+MANUAL_MONITOR_COOLDOWN_SECONDS = 5 * 60
+
+
+def _manual_monitor_state_path() -> Path:
+	return DATA_DIR / "runtime" / "monitor-manual-state.json"
+
+
+def _read_manual_monitor_state() -> dict:
+	path = _manual_monitor_state_path()
+	try:
+		value = json.loads(path.read_text(encoding="utf-8-sig"))
+		return value if isinstance(value, dict) else {}
+	except (OSError, ValueError, TypeError):
+		return {}
+
+
+def _write_manual_monitor_state(now: float) -> None:
+	path = _manual_monitor_state_path()
+	path.parent.mkdir(parents=True, exist_ok=True)
+	path.write_text(json.dumps({"last_started_at": now}, ensure_ascii=False), encoding="utf-8")
+
+
 def _log(task: WorkbenchTask, message: str) -> None:
 	task.logs.append(message)
 
@@ -652,6 +675,9 @@ def _execute_monitor(task: WorkbenchTask, config: dict, *, initial_cooldown: boo
 				_log(task, reason)
 				return
 			_log(task, f"本轮监测完成，{interval_min:g} 分钟后再次检查")
+			if config.get("_monitor_once"):
+				_log(task, "Manual monitor completed; one cycle only")
+				return
 			wakeup_event.wait(interval_sec)
 			wakeup_event.clear()
 	finally:
@@ -1735,6 +1761,46 @@ def api_workbench_task_start():
 		return _json_response({"error": str(e)}, 500)
 
 
+@app.route("/api/monitor/manual", method="POST")
+def api_monitor_manual():
+	"""Run exactly one safe monitor cycle, guarded by a server-side cooldown."""
+	now = time.time()
+	with job_mutation_lock:
+		state = _read_manual_monitor_state()
+		try:
+			last = float(state.get("last_started_at", 0))
+		except (TypeError, ValueError):
+			last = 0
+		remaining = max(0, int(MANUAL_MONITOR_COOLDOWN_SECONDS - (now - last)))
+		if remaining:
+			return _json_response({"error": "手动监测仍在安全冷却中", "code": "manual_monitor_cooldown", "remaining_seconds": remaining}, 429)
+		active = task_runner.status().get("active")
+		if active:
+			return _json_response({"error": "已有后台任务正在运行", "code": "task_running", "task": active}, 409)
+		_write_manual_monitor_state(now)
+		try:
+			task = task_runner.start("monitor", {**load_config(CONFIG_PATH), "_monitor_once": True})
+		except TaskAlreadyRunningError as exc:
+			return _json_response({"error": str(exc), "code": "task_running"}, 409)
+		return _json_response({"success": True, "task": task, "cooldown_seconds": MANUAL_MONITOR_COOLDOWN_SECONDS})
+
+
+@app.route("/api/monitor/manual")
+def api_monitor_manual_state():
+	now = time.time()
+	state = _read_manual_monitor_state()
+	try:
+		last = float(state.get("last_started_at", 0))
+	except (TypeError, ValueError):
+		last = 0
+	return _json_response({
+		"cooldown_seconds": MANUAL_MONITOR_COOLDOWN_SECONDS,
+		"remaining_seconds": max(0, int(MANUAL_MONITOR_COOLDOWN_SECONDS - (now - last))),
+		"last_started_at": last or None,
+		"task": task_runner.status().get("active"),
+	})
+
+
 @app.route("/api/collection/runs")
 def api_collection_runs():
 	try:
@@ -2628,6 +2694,48 @@ def api_conversation_scheduler_next():
 
 
 # --- Personal knowledge and conversation foundation ---
+
+def _assistant_lab_db_path() -> Path:
+	return DATA_DIR / "sandbox" / "autojobhunter-sandbox.db"
+
+
+@app.route("/api/assistant-lab/session")
+def api_assistant_lab_session():
+	conn = open_sandbox(_assistant_lab_db_path())
+	try:
+		return _json_response(lab_session_payload(conn, request.query.get("session_id")))
+	finally:
+		conn.close()
+
+
+@app.route("/api/assistant-lab/messages", method="POST")
+def api_assistant_lab_message():
+	body = request.json or {}
+	try:
+		question = str(body.get("content") or "").strip()
+		# The knowledge connection is read-only by convention: this route never
+		# calls the real conversation repository or any browser/platform module.
+		knowledge_conn = _get_web_db()
+		sandbox_conn = open_sandbox(_assistant_lab_db_path())
+		try:
+			result = lab_send_message(sandbox_conn, knowledge_conn, load_config(CONFIG_PATH), body.get("session_id"), question)
+		finally:
+			sandbox_conn.close()
+			knowledge_conn.close()
+		return _json_response(result)
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
+	except Exception as exc:
+		return _json_response({"error": str(exc)}, 500)
+
+
+@app.route("/api/assistant-lab/reset", method="POST")
+def api_assistant_lab_reset():
+	conn = open_sandbox(_assistant_lab_db_path())
+	try:
+		return _json_response(reset_lab(conn))
+	finally:
+		conn.close()
 
 @app.route("/api/knowledge/documents")
 def api_knowledge_documents():

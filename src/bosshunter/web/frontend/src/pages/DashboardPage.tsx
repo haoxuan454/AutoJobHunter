@@ -35,6 +35,7 @@ import {
   Pencil,
   Play,
   RefreshCw,
+  Radar,
   ShieldCheck,
   Send,
   Sparkles,
@@ -2128,6 +2129,40 @@ function MonitorExecutionView({
   const [notice, setNotice] = useState('')
   const [openingChatId, setOpeningChatId] = useState<number | null>(null)
   const [preparingReplyId, setPreparingReplyId] = useState<number | null>(null)
+  const [manualRemaining, setManualRemaining] = useState(0)
+  const [manualRunning, setManualRunning] = useState(false)
+
+  useEffect(() => {
+    let mounted = true
+    const loadManualState = async () => {
+      try {
+        const response = await fetch('/api/monitor/manual')
+        const data = await response.json()
+        if (mounted) setManualRemaining(Number(data.remaining_seconds) || 0)
+      } catch { /* the normal history refresh remains usable */ }
+    }
+    void loadManualState()
+    const timer = window.setInterval(() => {
+      setManualRemaining(value => Math.max(0, value - 1))
+      void loadManualState()
+    }, 1000)
+    return () => { mounted = false; window.clearInterval(timer) }
+  }, [])
+
+  const runManualMonitor = async () => {
+    if (manualRemaining > 0 || manualRunning) return
+    setManualRunning(true)
+    try {
+      const response = await fetch('/api/monitor/manual', { method: 'POST' })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(data.error || '手动监测启动失败')
+      setManualRemaining(Number(data.cooldown_seconds) || 300)
+      setNotice('已启动一次性 HR 新消息检查；本轮结束后不会自动持续轮询。')
+      await refresh()
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '手动监测启动失败')
+    } finally { setManualRunning(false) }
+  }
 
   const draftFor = (item: HistoryItem) => {
     const parsed = parseHistoryDetail(item)
@@ -2246,6 +2281,10 @@ function MonitorExecutionView({
           <Button variant="secondary" size="sm" onClick={refresh} disabled={refreshing}>
             <RefreshCw className={`mr-2 h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
             {refreshing ? '刷新中' : '立即刷新'}
+          </Button>
+          <Button variant="secondary" size="sm" onClick={() => void runManualMonitor()} disabled={manualRunning || manualRemaining > 0}>
+            <Radar className="mr-2 h-4 w-4" />
+            {manualRunning ? '启动中' : manualRemaining > 0 ? `安全冷却 ${Math.floor(manualRemaining / 60)}:${String(manualRemaining % 60).padStart(2, '0')}` : '立即检查 HR 新消息'}
           </Button>
           <span className="rounded-full bg-[#FFF0E5] px-3 py-2 text-xs font-black text-primary">待处理 {pendingItems.length}</span>
         </div>
