@@ -11,6 +11,7 @@ export default function KnowledgePage() {
   const [documents, setDocuments] = useState<Document[]>([])
   const [notice, setNotice] = useState('')
   const [deletingId, setDeletingId] = useState<number | null>(null)
+  const [expandedFactId, setExpandedFactId] = useState<number | null>(null)
 
   const refresh = async () => {
     const [documentsResponse, factsResponse] = await Promise.all([
@@ -82,7 +83,7 @@ export default function KnowledgePage() {
         </CardContent>
       </Card>
 
-      <Card><CardHeader><CardTitle className="flex items-center justify-between"><span>经验事实</span><span className="rounded-full bg-[#F1F8F4] px-2.5 py-1 text-xs font-black text-success">{facts.length} 条</span></CardTitle></CardHeader><CardContent><div className="space-y-3">{facts.length === 0 && <p className="text-sm text-muted">上传资料后，解析出的经验事实会显示在这里。</p>}{facts.map(fact => <div key={fact.id} className="rounded-2xl border border-card-border p-4"><div className="flex items-center justify-between gap-3"><div className="font-bold">{fact.title}</div>{fact.fact_status === 'confirmed' ? <span className="flex items-center gap-1 text-xs text-success"><CheckCircle2 className="h-4 w-4" />已确认</span> : <Button size="sm" onClick={() => void confirmFact(fact)}>确认可对外使用</Button>}</div><p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-muted">{fact.content}</p></div>)}</div></CardContent></Card>
+      <Card><CardHeader><CardTitle className="flex items-center justify-between"><span>经验事实</span><span className="rounded-full bg-[#F1F8F4] px-2.5 py-1 text-xs font-black text-success">{facts.length} 条</span></CardTitle></CardHeader><CardContent><div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">{facts.length === 0 && <p className="col-span-full text-sm text-muted">上传资料后，解析出的经验事实会显示在这里。</p>}{facts.map(fact => { const expanded = expandedFactId === fact.id; return <div key={fact.id} className="rounded-2xl border border-card-border bg-[#FFFCFA] p-4"><div className="flex items-start justify-between gap-3"><div className="min-w-0"><div className="truncate font-bold" title={fact.title}>{fact.title}</div><div className="mt-1 text-xs text-muted">{fact.fact_status === 'confirmed' ? '已确认，可供 AI 使用' : '待确认'}</div></div>{fact.fact_status === 'confirmed' ? <CheckCircle2 className="h-4 w-4 shrink-0 text-success" /> : <Button size="sm" onClick={() => void confirmFact(fact)}>确认使用</Button>}</div><p className={`mt-3 whitespace-pre-wrap text-sm leading-6 text-muted ${expanded ? '' : 'line-clamp-4'}`}>{fact.content}</p><button type="button" className="mt-3 text-xs font-bold text-primary hover:underline" onClick={() => setExpandedFactId(expanded ? null : fact.id)}>{expanded ? '收起内容' : '预览全部内容'}</button></div> })}</div></CardContent></Card>
     </div>
   )
 }

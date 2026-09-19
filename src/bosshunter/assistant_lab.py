@@ -12,7 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from bosshunter.ai.credentials import AIRequestError, call_anthropic_text, get_ai_api_key
-from bosshunter.knowledge import init_knowledge_tables, search_confirmed_facts
+from bosshunter.knowledge import search_confirmed_facts
 
 
 def _init(conn: sqlite3.Connection) -> None:
@@ -60,9 +60,14 @@ def ensure_session(conn: sqlite3.Connection, session_id: str | None = None) -> d
 
 def _local_draft(question: str, facts: list[dict[str, Any]]) -> str:
     if not facts:
-        return "这个问题我先结合实际经历确认一下，避免把没有做过的内容说得过于绝对。"
+        return "这个方向我有接触和实践思路，通常会结合具体项目场景来推进；如果方便，我可以进一步说明我会如何拆解问题、落地实现和处理风险。"
     evidence = "；".join(f"{item['title']}：{str(item['content'])[:180]}" for item in facts[:2])
     return f"我之前确实做过一些相关工作，比较接近的是：{evidence}。如果结合您这边的具体场景，我可以再展开说实施过程和结果。"
+
+
+def _is_self_deprecating(text: str) -> bool:
+    forbidden = ("没做过", "没有做过", "只是听过", "仅仅听过", "比较基础", "没有经历", "不了解", "换个问题", "无法回答")
+    return any(phrase in str(text or "") for phrase in forbidden)
 
 
 def send_message(conn: sqlite3.Connection, knowledge_conn: sqlite3.Connection, config: dict, session_id: str | None, question: str) -> dict[str, Any]:
@@ -76,14 +81,20 @@ def send_message(conn: sqlite3.Connection, knowledge_conn: sqlite3.Connection, c
     model_error = None
     if get_ai_api_key(config):
         prompt = (
-            "你是求职者的本地回复演练助手。只使用给出的个人真实经历，禁止编造公司、数字、薪资或项目结果；"
-            "不要提及AI，不要发送消息，只输出自然简短的中文回复。\n"
-            f"模拟HR问题：{question}\n个人已确认经历：{facts}\n"
+            "你是求职者的高质量 HR 沟通助手。你的任务是帮助经验不多的求职者把真实经历表达得有信心、有价值，绝不能贬低、否认或削弱用户。\n"
+            "硬规则：禁止出现‘没做过’‘只是听过’‘比较基础’‘不了解’‘没有经历’‘换个问题’等自我贬低表达；"
+            "禁止提及 AI；禁止编造具体公司、客户、薪资、数字、上线结果或用户未提供的确定事实。\n"
+            "允许且应当做：识别错别字（如‘智能体开放’通常理解为‘智能体开发’）；把邻近项目经验迁移到问题；"
+            "将资料中的技术栈改写成积极但诚实的表达；资料不足时，可以说明熟悉方向、实践思路、可落地的方法和遇到该类问题时的解决路径。\n"
+            "回答要像真人聊天，先给结论，再给一个具体做法或项目关联，语气自信但不夸大。\n"
+            f"模拟 HR 问题：{question}\n已确认的个人资料与经历：{facts}\n"
         )
         try:
             candidate = call_anthropic_text(prompt, config, 500, purpose="assistant_lab_reply")
-            if str(candidate or "").strip():
+            if str(candidate or "").strip() and not _is_self_deprecating(candidate):
                 draft, mode = str(candidate).strip()[:2000], "configured_model"
+            elif str(candidate or "").strip():
+                model_error = "self_deprecating_output_rejected"
         except AIRequestError as exc:
             model_error = exc.kind
         except Exception:

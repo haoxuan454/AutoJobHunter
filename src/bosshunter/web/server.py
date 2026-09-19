@@ -115,6 +115,7 @@ from bosshunter.web.tasks import (
 from bosshunter.conversations import ConversationRepository, IncomingMessage
 from bosshunter.conversation_scheduler import SerialConversationScheduler, init_scheduler_tables
 from bosshunter.assistant_lab import open_sandbox, reset as reset_lab, send_message as lab_send_message, session_payload as lab_session_payload
+from bosshunter.common_questions import delete_common_question, init_common_question_tables, list_common_questions, upsert_common_question
 from bosshunter.knowledge import (
 	 ingest_document,
 	delete_document,
@@ -2735,6 +2736,94 @@ def api_assistant_lab_reset():
 	try:
 		return _json_response(reset_lab(conn))
 	finally:
+		conn.close()
+
+
+@app.route("/api/common-questions")
+def api_common_questions():
+	conn = _get_web_db()
+	try:
+		return _json_response({"questions": list_common_questions(conn)})
+	finally:
+		conn.close()
+
+
+@app.route("/api/common-questions/<question_id:int>", method="DELETE")
+def api_common_question_delete(question_id):
+	conn = _get_web_db()
+	try:
+		if not delete_common_question(conn, int(question_id)):
+			return _json_response({"error": "共性问题不存在"}, 404)
+		return _json_response({"success": True, "deleted_id": int(question_id)})
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
+	finally:
+		conn.close()
+
+
+@app.route("/api/common-questions/summarize", method="POST")
+def api_common_questions_summarize():
+	"""Incrementally upsert de-identified rehearsal Q&A into the common bank."""
+	conn = _get_web_db()
+	sandbox = open_sandbox(_assistant_lab_db_path())
+	try:
+		init_common_question_tables(conn)
+		rows = sandbox.execute("SELECT session_id, sender_type, content, id FROM lab_messages ORDER BY session_id, id").fetchall()
+		created = []
+		for index, row in enumerate(rows):
+			if row["sender_type"] != "hr":
+				continue
+			next_row = rows[index + 1] if index + 1 < len(rows) else None
+			if not next_row or next_row["session_id"] != row["session_id"] or next_row["sender_type"] != "ai":
+				continue
+			answer = str(next_row["content"] or "").strip()
+			if not answer:
+				continue
+			try:
+				item = upsert_common_question(conn, row["content"], answer, source_key=f"lab:{row['session_id']}:{row['id']}")
+			except ValueError:
+				continue
+			if item:
+				created.append(item)
+		# Also ingest local persisted HR drafts, without copying company/HR metadata.
+		for row in conn.execute("SELECT conversation_id, id, content FROM conv_messages WHERE sender_type = 'hr' ORDER BY id").fetchall():
+			answer_row = conn.execute("SELECT draft_text FROM conv_drafts WHERE conversation_id = ? AND trigger_message_id = ? ORDER BY id DESC LIMIT 1", (row["conversation_id"], row["id"])).fetchone()
+			if answer_row:
+				try:
+					item = upsert_common_question(conn, row["content"], answer_row["draft_text"], source_key=f"conv:{row['conversation_id']}:{row['id']}")
+				except ValueError:
+					continue
+				if item:
+					created.append(item)
+		return _json_response({"success": True, "count": len(created), "questions": list_common_questions(conn)})
+	finally:
+		sandbox.close()
+		conn.close()
+
+
+@app.route("/api/common-questions/from-lab", method="POST")
+def api_common_question_from_lab():
+	"""Persist one adjacent rehearsal HR question and AI answer pair."""
+	body = request.json or {}
+	session_id = str(body.get("session_id") or "").strip()
+	ai_message_id = int(body.get("ai_message_id") or 0)
+	if not session_id or not ai_message_id:
+		return _json_response({"error": "session_id 和 ai_message_id 不能为空"}, 400)
+	sandbox = open_sandbox(_assistant_lab_db_path())
+	conn = _get_web_db()
+	try:
+		ai_row = sandbox.execute("SELECT id, session_id, sender_type, content FROM lab_messages WHERE id = ? AND session_id = ?", (ai_message_id, session_id)).fetchone()
+		if not ai_row or ai_row["sender_type"] != "ai":
+			return _json_response({"error": "演练回复不存在"}, 404)
+		hr_row = sandbox.execute("SELECT id, content FROM lab_messages WHERE session_id = ? AND id < ? AND sender_type = 'hr' ORDER BY id DESC LIMIT 1", (session_id, ai_message_id)).fetchone()
+		if not hr_row:
+			return _json_response({"error": "找不到对应的模拟 HR 问题"}, 400)
+		item = upsert_common_question(conn, hr_row["content"], ai_row["content"], source_key=f"lab:{session_id}:{ai_message_id}")
+		if not item:
+			return _json_response({"success": True, "duplicate": True, "question": None})
+		return _json_response({"success": True, "duplicate": False, "question": item})
+	finally:
+		sandbox.close()
 		conn.close()
 
 @app.route("/api/knowledge/documents")
