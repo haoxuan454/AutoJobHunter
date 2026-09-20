@@ -7,6 +7,7 @@ import re
 import httpx
 
 from bosshunter.config import AI_SERVICE_PRESETS
+from bosshunter.token_usage import record_token_usage
 
 
 _MODEL_RESOLVE_CACHE: dict[tuple[str, str, str], str] = {}
@@ -586,6 +587,15 @@ def call_anthropic_text(
             continue
         text = _extract_text_content(getattr(response, "content", None))
         if text:
+            record_token_usage(
+                config,
+                purpose=purpose or "unspecified",
+                prompt=prompt,
+                output=text,
+                provider="anthropic",
+                model=model,
+                usage=getattr(response, "usage", None),
+            )
             return text
     if output_truncated:
         raise AIRequestError("output_truncated", "AI 返回内容因输出 Token 上限被截断")
@@ -665,6 +675,15 @@ def call_openai_compatible_text(
         if not text:
             text = _extract_text_content(choice.get("text"))
         if text:
+            record_token_usage(
+                config,
+                purpose=purpose or "unspecified",
+                prompt=prompt,
+                output=text,
+                provider=get_ai_service(config),
+                model=model,
+                usage=payload_data.get("usage") if isinstance(payload_data, dict) else None,
+            )
             return text
     if output_truncated:
         raise AIRequestError("output_truncated", "AI 返回内容因输出 Token 上限被截断")

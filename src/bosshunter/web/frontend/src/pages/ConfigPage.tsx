@@ -615,6 +615,16 @@ export default function ConfigPage() {
                 max={600}
               />
             </Field>
+            <div className="grid gap-4 md:grid-cols-2">
+              <Field label="输入 Token 单价 / 百万">
+                <Input type="number" min={0} step={0.01} value={config.ai?.input_cost_per_million ?? 0} onChange={e => updateConfig('ai.input_cost_per_million', Number(e.target.value))} />
+                <p className="mt-1 text-xs text-muted">仅用于费用估算，不会改变模型调用。</p>
+              </Field>
+              <Field label="输出 Token 单价 / 百万">
+                <Input type="number" min={0} step={0.01} value={config.ai?.output_cost_per_million ?? 0} onChange={e => updateConfig('ai.output_cost_per_million', Number(e.target.value))} />
+                <p className="mt-1 text-xs text-muted">不知道价格时保持 0，页面只展示 Token 消耗。</p>
+              </Field>
+            </div>
             <Field label="AI 评分并发数">
               <Select
                 value={String(config.ai?.scoring_concurrency || 1)}

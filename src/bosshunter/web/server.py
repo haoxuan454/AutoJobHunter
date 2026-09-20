@@ -117,6 +117,7 @@ from bosshunter.conversation_scheduler import SerialConversationScheduler, init_
 from bosshunter.assistant_lab import open_sandbox, reset as reset_lab, send_message as lab_send_message, session_payload as lab_session_payload
 from bosshunter.interview_practice import create_session as create_interview_session, evaluate_round as evaluate_interview_round, generate_question as generate_interview_question
 from bosshunter.common_questions import delete_common_question, init_common_question_tables, list_common_questions, update_common_question, upsert_common_question
+from bosshunter.token_usage import token_usage_report
 from bosshunter.knowledge import (
 	 ingest_document,
 	delete_document,
@@ -2691,6 +2692,16 @@ def api_conversation_scheduler_next():
 	try:
 		candidate = SerialConversationScheduler(conn).next_candidate()
 		return _json_response({"mode": "serial", "candidate": candidate})
+	finally:
+		conn.close()
+
+
+@app.route("/api/ai-usage")
+def api_ai_usage():
+	conn = _get_web_db()
+	try:
+		granularity = request.params.get("granularity", "day")
+		return _json_response(token_usage_report(conn, start=request.params.get("start"), end=request.params.get("end"), granularity=granularity))
 	finally:
 		conn.close()
 

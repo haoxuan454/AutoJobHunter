@@ -166,6 +166,8 @@ DEFAULTS: dict[str, Any] = {
         "thinking": "auto",
         "thinking_budget": 2048,
         "timeout_seconds": 180,
+        "input_cost_per_million": 0.0,
+        "output_cost_per_million": 0.0,
         "scoring_max_tokens": 8192,
         "scoring_max_attempts": 2,
         "scoring_concurrency": 1,

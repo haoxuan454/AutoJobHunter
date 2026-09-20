@@ -1,5 +1,5 @@
 import { useLocation } from 'react-router-dom'
-import { Activity, BarChart3, BookOpen, BriefcaseBusiness, BrainCircuit, FlaskConical, ListChecks, MessageSquare, Radar, Settings, Target } from 'lucide-react'
+import { Activity, BarChart3, BookOpen, BriefcaseBusiness, BrainCircuit, Coins, FlaskConical, ListChecks, MessageSquare, Radar, Settings, Target } from 'lucide-react'
 
 const pageMeta: Record<string, { title: string; description: string; icon: typeof Target; tone: string }> = {
   '/assistant-lab': { title: 'AI 回复演练', description: '本地沙盒验证个人经验驱动的 HR 回复流程', icon: FlaskConical, tone: 'bg-indigo-50 text-indigo-600' },
@@ -10,6 +10,7 @@ const pageMeta: Record<string, { title: string; description: string; icon: typeo
   '/knowledge': { title: '个人知识库', description: '管理可供 AI 引用的真实经历与项目经验', icon: BookOpen, tone: 'bg-violet-50 text-violet-600' },
   '/conversations': { title: 'HR 会话', description: '按会话查看 HR 消息、上下文和回复草稿', icon: MessageSquare, tone: 'bg-cyan-50 text-cyan-600' },
   '/analytics': { title: '数据分析', description: '从沟通记录中观察岗位方向与 HR 兴趣', icon: BarChart3, tone: 'bg-rose-50 text-rose-600' },
+  '/ai-usage': { title: 'Token 消耗', description: '查看模型调用、Token 使用量和费用估算', icon: Coins, tone: 'bg-indigo-50 text-indigo-600' },
   '/config': { title: '配置', description: '设置个人资料、平台、AI 和安全规则', icon: Settings, tone: 'bg-amber-50 text-amber-700' },
 }
 

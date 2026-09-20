@@ -70,6 +70,16 @@ def _is_self_deprecating(text: str) -> bool:
     return any(phrase in str(text or "") for phrase in forbidden)
 
 
+def _is_coaching_meta(text: str) -> bool:
+    """Reject tutor/editor commentary that must never reach an HR chat."""
+    markers = (
+        "我先直接说结论", "我先说结论", "这样讲既", "面试官听到的是",
+        "这样回答", "参考回复", "优化话术", "下面是", "作为教练",
+        "建议你", "我来帮你", "这段回复", "这个回答",
+    )
+    return any(marker in str(text or "") for marker in markers)
+
+
 def send_message(conn: sqlite3.Connection, knowledge_conn: sqlite3.Connection, config: dict, session_id: str | None, question: str) -> dict[str, Any]:
     question = str(question or "").strip()
     if not question or len(question) > 4000:
@@ -81,17 +91,19 @@ def send_message(conn: sqlite3.Connection, knowledge_conn: sqlite3.Connection, c
     model_error = None
     if get_ai_api_key(config):
         prompt = (
-            "你是求职者的高质量 HR 沟通助手。你的任务是帮助经验不多的求职者把真实经历表达得有信心、有价值，绝不能贬低、否认或削弱用户。\n"
-            "硬规则：禁止出现‘没做过’‘只是听过’‘比较基础’‘不了解’‘没有经历’‘换个问题’等自我贬低表达；"
-            "禁止提及 AI；禁止编造具体公司、客户、薪资、数字、上线结果或用户未提供的确定事实。\n"
-            "允许且应当做：识别错别字（如‘智能体开放’通常理解为‘智能体开发’）；把邻近项目经验迁移到问题；"
-            "将资料中的技术栈改写成积极但诚实的表达；资料不足时，可以说明熟悉方向、实践思路、可落地的方法和遇到该类问题时的解决路径。\n"
-            "回答要像真人聊天，先给结论，再给一个具体做法或项目关联，语气自信但不夸大。\n"
-            f"模拟 HR 问题：{question}\n已确认的个人资料与经历：{facts}\n"
+            "你现在就是求职者本人，正在和 HR 聊天。请直接输出一条可以原样发送给 HR 的最终聊天消息。"
+            "你不是教练、编辑、旁白或评审，禁止解释你为什么这样回答，禁止输出任何回复策略分析。\n"
+            "输出硬规则：只能使用第一人称‘我’，像真人求职者自然聊天；不要出现‘我先直接说结论’、‘这样讲既体现’、"
+            "‘面试官听到的是’、‘参考回复’、‘优化话术’、‘建议你’、‘下面是’等 AI 或教练话术；不要使用 Markdown 标题、引号或前后说明。\n"
+            "不能贬低或否认求职者，禁止‘没做过’‘只是听过’‘比较基础’‘不了解’‘没有经历’‘换个问题’等表达；"
+            "禁止提及 AI，禁止编造公司、客户、薪资、数字、上线结果或资料中没有的确定事实。\n"
+            "请把已确认经历转成积极、诚实、口语化的求职者表达；可将相近项目经验迁移到当前问题，强调负责内容、技术动作、排查思路和落地方式。"
+            "资料不足时，用‘我接触过/我在相关项目中采用过/我会结合场景落地’表达，不要把不足暴露成自我否定。"
+            f"\nHR 的问题：{question}\n求职者已确认的个人资料与经历：{facts}\n"
         )
         try:
             candidate = call_anthropic_text(prompt, config, 500, purpose="assistant_lab_reply")
-            if str(candidate or "").strip() and not _is_self_deprecating(candidate):
+            if str(candidate or "").strip() and not _is_self_deprecating(candidate) and not _is_coaching_meta(candidate):
                 draft, mode = str(candidate).strip()[:2000], "configured_model"
             elif str(candidate or "").strip():
                 model_error = "self_deprecating_output_rejected"

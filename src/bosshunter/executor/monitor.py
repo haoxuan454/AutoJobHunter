@@ -322,7 +322,7 @@ def _call_claude(prompt: str, config: dict) -> str | None:
     """Call Claude API and return response text."""
     try:
         return run_cancellable(
-            lambda: call_anthropic_text(prompt, config, 500),
+            lambda: call_anthropic_text(prompt, config, 500, purpose="hr_monitor_reply"),
             config,
         )
     except OperationCancelled:

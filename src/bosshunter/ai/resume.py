@@ -535,7 +535,7 @@ def _call_claude(prompt: str, config: dict) -> str | None:
         ai_cfg = config.get("ai", {}) if isinstance(config, dict) else {}
         max_tokens = int(ai_cfg.get("resume_max_tokens") or 8000)
         return run_cancellable(
-            lambda: call_anthropic_text(prompt, config, max_tokens),
+            lambda: call_anthropic_text(prompt, config, max_tokens, purpose="tailored_resume"),
             config,
         )
     except OperationCancelled:
