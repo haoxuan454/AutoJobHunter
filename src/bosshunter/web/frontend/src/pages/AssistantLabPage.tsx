@@ -22,7 +22,13 @@ export default function AssistantLabPage() {
   const [currentRoundId, setCurrentRoundId] = useState<number | null>(null)
   const [answer, setAnswer] = useState('')
 
-  useEffect(() => { void loadReplySession(); fetch('/api/interview-practice/options').then(r => r.json()).then(d => setJobs(d.jobs || [])).catch(() => undefined) }, [])
+  useEffect(() => {
+    void loadReplySession()
+    fetch('/api/interview-practice/options')
+      .then(async response => { const data = await response.json(); if (!response.ok) throw new Error(data.error || `岗位选项加载失败（HTTP ${response.status}）`); return data })
+      .then(data => setJobs(data.jobs || []))
+      .catch(error => setNotice(error instanceof Error ? error.message : '岗位选项加载失败'))
+  }, [])
   const loadReplySession = async () => { try { const data = await (await fetch('/api/assistant-lab/session')).json(); setSessionId(data.session?.id || ''); setMessages(data.messages || []) } catch { setNotice('无法读取本地演练沙盒') } }
   const submitReply = async () => {
     if (!text.trim() || busy) return
@@ -31,7 +37,7 @@ export default function AssistantLabPage() {
   }
   const resetReply = async () => { const data = await (await fetch('/api/assistant-lab/reset', { method: 'POST' })).json(); setSessionId(data.session?.id || ''); setMessages(data.messages || []); setFacts([]); setNotice('模拟 HR 会话已清空') }
   const saveReply = async (message: LabMessage) => { const response = await fetch('/api/common-questions/from-lab', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: sessionId, ai_message_id: message.id }) }); const data = await response.json().catch(() => ({})); if (response.ok) { setSavedMessageIds(ids => ids.includes(message.id) ? ids : [...ids, message.id]); setNotice(data.duplicate ? '这条问答已经存在' : '已手动保存到共性问题库') } else setNotice(data.error || '同步失败') }
-  const startInterview = async () => { setBusy(true); try { const data = await (await fetch('/api/interview-practice/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job: selectedJob || {} }) })).json(); setSessionId(data.session.id); setRounds([]); setCurrentRoundId(null); setAnswer(''); await nextQuestion(data.session.id) } catch { setNotice('无法创建面试练习会话') } finally { setBusy(false) } }
+  const startInterview = async () => { setBusy(true); try { const response = await fetch('/api/interview-practice/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job: selectedJob || {} }) }); const data = await response.json(); if (!response.ok || !data.session?.id) throw new Error(data.error || `无法创建面试练习会话（HTTP ${response.status}）`); setSessionId(data.session.id); setRounds([]); setCurrentRoundId(null); setAnswer(''); await nextQuestion(data.session.id) } catch (error) { setNotice(error instanceof Error ? error.message : '无法创建面试练习会话') } finally { setBusy(false) } }
   const nextQuestion = async (id = sessionId) => { if (!id) return; setBusy(true); try { const res = await fetch('/api/interview-practice/question', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: id }) }); const data = await res.json(); if (!res.ok) throw new Error(data.error || '生成问题失败'); const round = data.round as PracticeRound; setSessionId(id); setRounds(data.rounds || []); setCurrentRoundId(round.id); setAnswer(''); setNotice(`第 ${round.round_number} 轮：${round.question_type}`) } catch (error) { setNotice(error instanceof Error ? error.message : '生成问题失败') } finally { setBusy(false) } }
   const evaluate = async () => { if (!currentRoundId || !answer.trim() || busy) return; setBusy(true); try { const res = await fetch('/api/interview-practice/evaluate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: sessionId, round_id: currentRoundId, answer }) }); const data = await res.json(); if (!res.ok) throw new Error(data.error || '评价失败'); setRounds(data.rounds || []); setNotice('本轮已评价，可以阅读优化话术后继续下一题') } catch (error) { setNotice(error instanceof Error ? error.message : '评价失败') } finally { setBusy(false) } }
   const currentRound = rounds.find(item => item.id === currentRoundId)

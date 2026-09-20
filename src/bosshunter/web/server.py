@@ -2744,7 +2744,10 @@ def api_assistant_lab_reset():
 def api_interview_practice_options():
 	conn = _get_web_db()
 	try:
-		rows = conn.execute("SELECT id, title, company, company_industry, company_size, jd, url, score FROM jobs WHERE status NOT IN ('deleted', 'rejected') ORDER BY updated_at DESC, id DESC LIMIT 100").fetchall()
+		# Practice may use every active collected job except jobs explicitly
+		# filtered out by scoring.  Keep the complete job/JD snapshot isolated in
+		# the sandbox when the user starts a practice session.
+		rows = conn.execute("SELECT id, title, company, company_industry, company_size, jd, url, score, status FROM jobs WHERE deleted_at IS NULL AND status <> 'filtered' ORDER BY updated_at DESC, id DESC LIMIT 500").fetchall()
 		return _json_response({"jobs": [dict(row) for row in rows]})
 	finally:
 		conn.close()

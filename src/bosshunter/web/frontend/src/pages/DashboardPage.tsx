@@ -1582,6 +1582,7 @@ function JobsPoolView() {
   const [recycleLoading, setRecycleLoading] = useState(false)
   const [permanentDeleteIds, setPermanentDeleteIds] = useState<string[]>([])
   const [permanentDeleteAcknowledged, setPermanentDeleteAcknowledged] = useState(false)
+  const [bulkSelecting, setBulkSelecting] = useState(false)
   const { items, total, allTotal, loading, error, refresh: refreshJobs } = useJobSearch(filters, page, pageSize, sortBy, sortOrder)
   const { workbench: deliveryWorkbench } = useDashboard('workbench')
   const deliveryTask = deliveryWorkbench.task?.mode === 'deliver'
@@ -1602,6 +1603,40 @@ function JobsPoolView() {
     setSelectedIds(previous => allPageSelected
       ? previous.filter(id => !pageIds.has(id))
       : [...new Set([...previous, ...pageIds])])
+  }
+
+  const selectJobsByScope = async (scope: string) => {
+    if (!scope) return
+    setBulkSelecting(true)
+    try {
+      const statusGroups: Record<string, string[]> = {
+        filtered: ['filtered'],
+        pending_confirmation: ['ready', 'approved'],
+        sent: ['sent', 'replied', 'resume_sent', 'needs_resume', 'follow_up_sent'],
+        all: [''],
+      }
+      const selected = new Set<string>()
+      for (const status of statusGroups[scope] || []) {
+        let offset = 0
+        while (true) {
+          const params = new URLSearchParams({ limit: '100', offset: String(offset), sort_by: 'created_at', sort_order: 'desc' })
+          if (status) params.set('status', status)
+          const response = await fetch(`/api/jobs/search?${params.toString()}`, { cache: 'no-store' })
+          const data = await response.json()
+          if (!response.ok) throw new Error(data.error || '批量选择岗位失败')
+          const rows = Array.isArray(data.items) ? data.items : []
+          rows.forEach((job: Job) => selected.add(String(job.id)))
+          offset += rows.length
+          if (!rows.length || rows.length < 100 || offset >= Number(data.total || 0)) break
+        }
+      }
+      setSelectedIds([...selected])
+      setNotice(`已从数据库查询并选择 ${selected.size} 个岗位，可继续批量移入回收站`)
+    } catch (cause) {
+      setNotice(cause instanceof Error ? cause.message : '批量选择岗位失败')
+    } finally {
+      setBulkSelecting(false)
+    }
   }
 
   const changeSort = (nextSortBy: JobSortKey) => {
@@ -1887,6 +1922,20 @@ function JobsPoolView() {
         <Button variant="secondary" size="sm" disabled={!items.length} onClick={toggleCurrentPage}>
           {allPageSelected ? '取消选择本页' : '选择本页'}
         </Button>
+        <select
+          defaultValue=""
+          disabled={bulkSelecting}
+          onChange={event => { void selectJobsByScope(event.target.value); event.target.value = '' }}
+          className="rounded-lg border border-card-border bg-white px-3 py-2 text-xs font-bold"
+          aria-label="按状态批量选择岗位"
+        >
+          <option value="">批量选择…</option>
+          <option value="filtered">全选已过滤</option>
+          <option value="pending_confirmation">全选待确认</option>
+          <option value="sent">全选已发送/已回复</option>
+          <option value="all">全选全部有效岗位</option>
+        </select>
+        {bulkSelecting && <span className="text-muted">正在从数据库读取…</span>}
         <span className="rounded-full bg-[#FFF0E5] px-3 py-2 font-bold text-primary">已选择 {selectedIds.length} 条</span>
         {selectedIds.length > 0 && <Button variant="ghost" size="sm" onClick={() => setSelectedIds([])}>清空选择</Button>}
         <Button variant="destructive" size="sm" disabled={!selectedIds.length} onClick={() => void softDelete(selectedIds)}>移入回收站</Button>
