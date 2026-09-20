@@ -84,3 +84,37 @@ def delete_common_question(conn: sqlite3.Connection, question_id: int) -> bool:
     cur = conn.execute("DELETE FROM common_questions WHERE id = ?", (int(question_id),))
     conn.commit()
     return cur.rowcount > 0
+
+
+def update_common_question(conn: sqlite3.Connection, question_id: int, question: str, answer: str) -> dict[str, Any]:
+    """Edit one reusable pair and persist it in SQLite.
+
+    The reusable bank is intentionally de-identified.  Re-normalising the
+    question on edit keeps the same deduplication rules used by ingestion and
+    prevents two records from acquiring the same key.
+    """
+    question = str(question or "").strip()
+    answer = str(answer or "").strip()
+    clean_question = _normalize_question(question)
+    if not clean_question or not answer:
+        raise ValueError("问题和参考回复都不能为空")
+    if any(phrase in answer for phrase in FORBIDDEN_PHRASES):
+        raise ValueError("参考回复包含不允许的自我贬低表达")
+    key = _key(clean_question)
+    init_common_question_tables(conn)
+    current = conn.execute("SELECT id FROM common_questions WHERE id = ?", (int(question_id),)).fetchone()
+    if not current:
+        raise ValueError("共性问题不存在")
+    conflict = conn.execute(
+        "SELECT id FROM common_questions WHERE question_key = ? AND id <> ?",
+        (key, int(question_id)),
+    ).fetchone()
+    if conflict:
+        raise ValueError("修改后的问题与已有共性问题重复")
+    conn.execute(
+        "UPDATE common_questions SET question_key = ?, question = ?, answer = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (key, clean_question, answer, int(question_id)),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM common_questions WHERE id = ?", (int(question_id),)).fetchone()
+    return dict(row)

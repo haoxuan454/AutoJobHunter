@@ -1282,5 +1282,12 @@ def send_greetings(config: dict, force: bool = False, db_path=None) -> int:
         report_total - sent_count - send_report["failed_count"],
         0,
     )
+    # Recalculate after the loop.  The report is consumed by the web task
+    # panel, so it must describe the quota after successful sends, not the
+    # quota that was available when the task started. Failed attempts do not
+    # consume quota because only successful history rows are counted.
+    already_sent_after = already_sent + sent_count
+    send_report["already_sent"] = already_sent_after
+    send_report["remaining_quota"] = max(int(daily_limit) - already_sent_after, 0)
     db.close()
     return sent_count

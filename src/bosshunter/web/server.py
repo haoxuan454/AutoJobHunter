@@ -115,7 +115,8 @@ from bosshunter.web.tasks import (
 from bosshunter.conversations import ConversationRepository, IncomingMessage
 from bosshunter.conversation_scheduler import SerialConversationScheduler, init_scheduler_tables
 from bosshunter.assistant_lab import open_sandbox, reset as reset_lab, send_message as lab_send_message, session_payload as lab_session_payload
-from bosshunter.common_questions import delete_common_question, init_common_question_tables, list_common_questions, upsert_common_question
+from bosshunter.interview_practice import create_session as create_interview_session, evaluate_round as evaluate_interview_round, generate_question as generate_interview_question
+from bosshunter.common_questions import delete_common_question, init_common_question_tables, list_common_questions, update_common_question, upsert_common_question
 from bosshunter.knowledge import (
 	 ingest_document,
 	delete_document,
@@ -2739,6 +2740,81 @@ def api_assistant_lab_reset():
 		conn.close()
 
 
+@app.route("/api/interview-practice/options")
+def api_interview_practice_options():
+	conn = _get_web_db()
+	try:
+		rows = conn.execute("SELECT id, title, company, company_industry, company_size, jd, url, score FROM jobs WHERE status NOT IN ('deleted', 'rejected') ORDER BY updated_at DESC, id DESC LIMIT 100").fetchall()
+		return _json_response({"jobs": [dict(row) for row in rows]})
+	finally:
+		conn.close()
+
+
+@app.route("/api/interview-practice/session", method="POST")
+def api_interview_practice_session():
+	body = request.json or {}
+	job = body.get("job") if isinstance(body.get("job"), dict) else {}
+	conn = open_sandbox(_assistant_lab_db_path())
+	try:
+		return _json_response(create_interview_session(conn, job))
+	finally:
+		conn.close()
+
+
+@app.route("/api/interview-practice/question", method="POST")
+def api_interview_practice_question():
+	body = request.json or {}
+	session_id = str(body.get("session_id") or "").strip()
+	if not session_id:
+		return _json_response({"error": "session_id 不能为空"}, 400)
+	sandbox = open_sandbox(_assistant_lab_db_path())
+	knowledge_conn = _get_web_db()
+	try:
+		return _json_response(generate_interview_question(sandbox, knowledge_conn, load_config(CONFIG_PATH), session_id))
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
+	finally:
+		sandbox.close(); knowledge_conn.close()
+
+
+@app.route("/api/interview-practice/evaluate", method="POST")
+def api_interview_practice_evaluate():
+	body = request.json or {}
+	session_id = str(body.get("session_id") or "").strip()
+	try:
+		round_id = int(body.get("round_id") or 0)
+	except (TypeError, ValueError):
+		round_id = 0
+	sandbox = open_sandbox(_assistant_lab_db_path())
+	knowledge_conn = _get_web_db()
+	try:
+		return _json_response(evaluate_interview_round(sandbox, knowledge_conn, load_config(CONFIG_PATH), session_id, round_id, body.get("answer")))
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
+	finally:
+		sandbox.close(); knowledge_conn.close()
+
+
+@app.route("/api/interview-practice/save-common-question", method="POST")
+def api_interview_practice_save_common_question():
+	body = request.json or {}
+	session_id = str(body.get("session_id") or "").strip()
+	try:
+		round_id = int(body.get("round_id") or 0)
+	except (TypeError, ValueError):
+		round_id = 0
+	sandbox = open_sandbox(_assistant_lab_db_path())
+	conn = _get_web_db()
+	try:
+		row = sandbox.execute("SELECT question, optimized_answer FROM interview_rounds WHERE id = ? AND session_id = ?", (round_id, session_id)).fetchone()
+		if not row or not row["optimized_answer"]:
+			return _json_response({"error": "请先完成这一轮回答评价"}, 400)
+		item = upsert_common_question(conn, row["question"], row["optimized_answer"], source_key=f"interview:{round_id}")
+		return _json_response({"success": True, "duplicate": item is None, "question": item})
+	finally:
+		sandbox.close(); conn.close()
+
+
 @app.route("/api/common-questions")
 def api_common_questions():
 	conn = _get_web_db()
@@ -2755,6 +2831,19 @@ def api_common_question_delete(question_id):
 		if not delete_common_question(conn, int(question_id)):
 			return _json_response({"error": "共性问题不存在"}, 404)
 		return _json_response({"success": True, "deleted_id": int(question_id)})
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
+	finally:
+		conn.close()
+
+
+@app.route("/api/common-questions/<question_id:int>", method="PUT")
+def api_common_question_update(question_id):
+	conn = _get_web_db()
+	try:
+		body = request.json or {}
+		item = update_common_question(conn, int(question_id), body.get("question"), body.get("answer"))
+		return _json_response({"success": True, "question": item})
 	except ValueError as exc:
 		return _json_response({"error": str(exc)}, 400)
 	finally:
