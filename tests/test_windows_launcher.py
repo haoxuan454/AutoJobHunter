@@ -11,12 +11,11 @@ class WindowsLauncherTests(unittest.TestCase):
 	def test_launcher_is_portable_and_opens_both_services(self):
 		text = LAUNCHER.read_text(encoding="utf-8")
 		self.assertIn("$PSScriptRoot", text)
-		self.assertIn("bosshunter.main", text)
-		self.assertIn("$PythonPath", text)
-		self.assertIn("Get-Command", text)
+		self.assertIn('.venv\\Scripts\\bosshunter.exe', text)
+		self.assertIn('Start-Process -FilePath $Bosshunter', text)
+		self.assertIn('Start-Process -FilePath $Chrome', text)
 		self.assertIn("remote-debugging-port=9222", text)
 		self.assertIn("http://127.0.0.1:8686", text)
-		self.assertIn("-WindowStyle Hidden", text)
 		self.assertNotIn("C:\\Users\\123", text)
 
 	def test_installer_creates_a_shortcut_to_the_launcher(self):

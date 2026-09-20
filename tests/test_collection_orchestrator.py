@@ -301,6 +301,16 @@ class CollectionOrchestratorTests(TestCase):
 class ValidateCollectionOptionsTests(TestCase):
     """validate_collection_options 错误路径覆盖。"""
 
+    def test_rejects_unknown_boss_city_before_browser_run(self):
+        with self.assertRaisesRegex(ValueError, "只支持具体城市"):
+            validate_collection_options({
+                "platform_order": ["boss"],
+                "auto_score": False,
+                "platforms": {
+                    "boss": {"keywords": ["java"], "cities": ["广东"], "max_pages": 1}
+                },
+            })
+
     def test_rejects_empty_platform_order(self):
         with self.assertRaises(ValueError, msg="至少选择一个采集平台"):
             normalize_collection_options({}, {"platform_order": [], "platforms": {}})

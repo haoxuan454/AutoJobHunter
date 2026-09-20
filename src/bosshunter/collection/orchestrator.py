@@ -24,6 +24,7 @@ from bosshunter.collection_run_store import (
     boss_combo_key, boss_resume_options, claim_boss_resume, create_collection_run,
     save_boss_checkpoint, update_collection_run,
 )
+from bosshunter.config import CITY_CODES
 from bosshunter.db import get_db, insert_job_if_new, job_identity_exists
 from bosshunter.job_filters import matching_blocked_company, matching_deal_breaker
 
@@ -160,6 +161,17 @@ def validate_collection_options(options: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{platform} 至少需要一个城市")
         city_codes = value.get("city_codes") if isinstance(value.get("city_codes"), dict) else {}
         city_codes = {str(key).strip(): str(code).strip() for key, code in city_codes.items() if str(key).strip()}
+        if platform == "boss":
+            missing_cities = [
+                city for city in cities
+                if not (city_codes.get(city) or CITY_CODES.get(city))
+            ]
+            if missing_cities:
+                names = "、".join(missing_cities)
+                raise ValueError(
+                    f"BOSS 直聘只支持具体城市，未识别城市：{names}。"
+                    "请改为广州、深圳等具体城市，不要填写省份名称。"
+                )
         if platform == "zhilian":
             for city in cities:
                 resolved = get_zhilian_city_code(city)

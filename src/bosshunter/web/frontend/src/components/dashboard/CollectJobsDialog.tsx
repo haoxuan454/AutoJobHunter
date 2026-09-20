@@ -109,6 +109,7 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
   const [starting, setStarting] = useState(false)
   const [resumableRuns, setResumableRuns] = useState<ResumableRun[]>([])
   const [resumeRunId, setResumeRunId] = useState('')
+  const [bossCities, setBossCities] = useState<PlatformCityOption[]>([])
   const [zhilianCities, setZhilianCities] = useState<PlatformCityOption[]>([])
   const [job51Cities, setJob51Cities] = useState<PlatformCityOption[]>([])
   const [liepinCities, setLiepinCities] = useState<PlatformCityOption[]>([])
@@ -168,6 +169,14 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
       })
       .catch(() => {
         if (!cancelled) setError('读取内置智联城市目录失败，可稍后重试。')
+      })
+    fetch('/api/cities', { cache: 'no-store' })
+      .then(response => response.json())
+      .then(data => {
+        if (!cancelled && Array.isArray(data.cities)) setBossCities(data.cities)
+      })
+      .catch(() => {
+        if (!cancelled) setError('读取 BOSS 城市目录失败，可稍后重试。')
       })
     fetch('/api/cities?platform=51job', { cache: 'no-store' })
       .then(response => response.json())
@@ -239,9 +248,17 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
       }
       const configuredCodes = parseCityCodes(draft.cityCodes)
       const platformCities = platform === 'zhilian' ? zhilianCities : platform === '51job' ? job51Cities : platform === 'liepin' ? liepinCities : []
-      const cityCodes = platform !== 'boss'
-        ? Object.fromEntries(cities.map(city => [city, findPlatformCity(city, platformCities)?.code || configuredCodes[city] || '']).filter(([, code]) => code))
-        : configuredCodes
+      const cityCodes = Object.fromEntries(
+        cities.map(city => [
+          city,
+          findPlatformCity(city, platform === 'boss' ? bossCities : platformCities)?.code || configuredCodes[city] || '',
+        ]).filter(([, code]) => code),
+      )
+      if (platform === 'boss' && cities.some(city => !cityCodes[city])) {
+        const missing = cities.filter(city => !cityCodes[city]).join('、')
+        setError(`BOSS 直聘未识别城市：${missing}。请选择具体城市，不要填写省份名称。`)
+        return
+      }
       if (platform !== 'boss' && cities.some(city => !cityCodes[city])) {
         const missing = cities.filter(city => !cityCodes[city]).join('、')
         setError(`${PLATFORM_SHORT_LABELS[platform]} 内置城市目录暂未收录：${missing}。请选择已验证城市。`)
@@ -324,7 +341,9 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
           {(['boss', 'zhilian', '51job', 'liepin'] as PlatformId[]).map(platform => {
             const draft = drafts[platform]
             const label = PLATFORM_LABELS[platform]
-            const platformCities = platform === 'zhilian' ? zhilianCities : platform === '51job' ? job51Cities : liepinCities
+            const platformCities = platform === 'boss'
+              ? bossCities
+              : platform === 'zhilian' ? zhilianCities : platform === '51job' ? job51Cities : liepinCities
             return (
               <section key={platform} className={`rounded-2xl border p-4 ${draft.enabled ? 'border-primary/30 bg-[#FFFCFA]' : 'border-card-border bg-white opacity-70'}`}>
                 <div className="flex items-center justify-between gap-3">
@@ -333,8 +352,11 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
                 </div>
                 {draft.enabled && <div className="mt-4 space-y-3">
                   <label className="block text-xs font-bold text-muted">关键词（逗号或换行分隔）<Input value={draft.keywords} onChange={event => updateDraft(platform, 'keywords', event.target.value)} placeholder="AI 产品经理, 产品运营" /></label>
-                  <label className="block text-xs font-bold text-muted">城市（逗号或换行分隔）<Input list={platform !== 'boss' ? `${platform}-city-options` : undefined} value={draft.cities} onChange={event => updateDraft(platform, 'cities', event.target.value)} placeholder={platform === '51job' ? '上海' : '北京'} /></label>
-                  {platform !== 'boss' ? <>
+                  <label className="block text-xs font-bold text-muted">城市（逗号或换行分隔）<Input list={`${platform}-city-options`} value={draft.cities} onChange={event => updateDraft(platform, 'cities', event.target.value)} placeholder={platform === '51job' ? '上海' : '北京'} /></label>
+                  {platform === 'boss' ? <>
+                    <datalist id="boss-city-options">{bossCities.map(city => <option key={city.code} value={city.name} />)}</datalist>
+                    <p className="rounded-xl border border-card-border bg-white px-3 py-2 text-xs text-muted">BOSS 请输入具体城市，例如广州、深圳；“广东”等省份名称不能直接作为 BOSS 搜索城市。</p>
+                  </> : <>
                     <datalist id={`${platform}-city-options`}>{platformCities.map(city => <option key={city.code} value={city.name} />)}</datalist>
                     <div className="rounded-xl border border-card-border bg-white px-3 py-2 text-xs text-muted">
                       <div className="font-bold text-foreground">平台城市编码</div>
@@ -345,7 +367,7 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
                         </span>)}
                       </div>}
                     </div>
-                  </> : <p className="rounded-xl border border-card-border bg-white px-3 py-2 text-xs text-muted">BOSS 城市编码由系统内置匹配，无需填写。</p>}
+                  </>}
                   <div className="grid grid-cols-2 gap-2">
                     <label className="text-xs font-bold text-muted">最大页数<Input type="number" min={1} max={10} value={draft.maxPages} onChange={event => updateDraft(platform, 'maxPages', event.target.value)} /></label>
                     <label className="text-xs font-bold text-muted">排序<Select value={draft.sort} onChange={event => updateDraft(platform, 'sort', event.target.value)}><option value="default">默认</option>{platform !== '51job' && <option value="newest">最新</option>}</Select></label>
