@@ -110,7 +110,7 @@ def _bounds(start: str | None, end: str | None) -> tuple[str, str]:
     return start_dt.strftime("%Y-%m-%d %H:%M:%S"), end_dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def token_usage_report(conn: sqlite3.Connection, *, start: str | None = None, end: str | None = None, granularity: str = "day") -> dict[str, Any]:
+def token_usage_report(conn: sqlite3.Connection, *, start: str | None = None, end: str | None = None, granularity: str = "day", offset: int = 0, limit: int = 15) -> dict[str, Any]:
     init_token_usage_tables(conn)
     start_value, end_value = _bounds(start, end)
     bucket = "strftime('%Y-%m-%d %H:00:00', created_at)" if granularity == "hour" else "strftime('%Y-%m-%d', created_at)"
@@ -132,6 +132,11 @@ def token_usage_report(conn: sqlite3.Connection, *, start: str | None = None, en
         f"SELECT {bucket} bucket, COUNT(*) calls, SUM(input_tokens) input_tokens, SUM(output_tokens) output_tokens, SUM(total_tokens) total_tokens, SUM(total_cost) total_cost FROM ai_token_usage WHERE {where} GROUP BY bucket ORDER BY bucket",
         params,
     ).fetchall()
+    recent_total = conn.execute(f"SELECT COUNT(*) FROM ai_token_usage WHERE {where}", params).fetchone()[0]
+    recent = conn.execute(
+        f"SELECT id, provider, model, purpose, input_tokens, output_tokens, total_tokens, estimated, total_cost, created_at FROM ai_token_usage WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+        (*params, max(1, min(int(limit), 100)), max(int(offset), 0)),
+    ).fetchall()
     return {
         "start": start_value,
         "end": end_value,
@@ -140,4 +145,6 @@ def token_usage_report(conn: sqlite3.Connection, *, start: str | None = None, en
         "by_purpose": [dict(row) for row in by_purpose],
         "by_model": [dict(row) for row in by_model],
         "series": [dict(row) for row in series],
+        "recent_total": recent_total,
+        "recent": [dict(row) for row in recent],
     }

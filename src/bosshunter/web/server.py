@@ -115,7 +115,7 @@ from bosshunter.web.tasks import (
 from bosshunter.conversations import ConversationRepository, IncomingMessage
 from bosshunter.conversation_scheduler import SerialConversationScheduler, init_scheduler_tables
 from bosshunter.assistant_lab import open_sandbox, reset as reset_lab, send_message as lab_send_message, session_payload as lab_session_payload
-from bosshunter.interview_practice import create_session as create_interview_session, evaluate_round as evaluate_interview_round, generate_question as generate_interview_question
+from bosshunter.interview_practice import create_session as create_interview_session, evaluate_round as evaluate_interview_round, generate_question as generate_interview_question, list_sessions as list_interview_sessions
 from bosshunter.common_questions import delete_common_question, init_common_question_tables, list_common_questions, update_common_question, upsert_common_question
 from bosshunter.token_usage import token_usage_report
 from bosshunter.knowledge import (
@@ -2584,8 +2584,11 @@ def api_config_post():
 
 		# Write YAML (backend exclusively owns YAML serialization)
 		_write_config(data)
+		# Return the effective, redacted configuration so the UI can verify the
+		# exact values that the next task will load from disk.
+		persisted = _redact_config_for_response(load_config(CONFIG_PATH))
 
-		return _json_response({"success": True, "message": "配置已保存"})
+		return _json_response({"success": True, "message": "配置已保存", "config": persisted})
 	except Exception as e:
 		return _json_response({"error": str(e)}, 500)
 
@@ -2701,7 +2704,12 @@ def api_ai_usage():
 	conn = _get_web_db()
 	try:
 		granularity = request.params.get("granularity", "day")
-		return _json_response(token_usage_report(conn, start=request.params.get("start"), end=request.params.get("end"), granularity=granularity))
+		try:
+			offset = max(int(request.params.get("offset", 0)), 0)
+			limit = max(min(int(request.params.get("limit", 15)), 100), 1)
+		except (TypeError, ValueError):
+			return _json_response({"error": "offset/limit 参数无效"}, 400)
+		return _json_response(token_usage_report(conn, start=request.params.get("start"), end=request.params.get("end"), granularity=granularity, offset=offset, limit=limit))
 	finally:
 		conn.close()
 
@@ -2771,6 +2779,28 @@ def api_interview_practice_session():
 	conn = open_sandbox(_assistant_lab_db_path())
 	try:
 		return _json_response(create_interview_session(conn, job))
+	finally:
+		conn.close()
+
+
+@app.route("/api/interview-practice/sessions")
+def api_interview_practice_sessions():
+	conn = open_sandbox(_assistant_lab_db_path())
+	try:
+		return _json_response({"sessions": list_interview_sessions(conn)})
+	finally:
+		conn.close()
+
+
+@app.route("/api/interview-practice/session/<session_id>")
+def api_interview_practice_session_detail(session_id):
+	conn = open_sandbox(_assistant_lab_db_path())
+	try:
+		from bosshunter.interview_practice import _payload
+		payload = _payload(conn, str(session_id))
+		if not payload.get("session"):
+			return _json_response({"error": "面试历史不存在"}, 404)
+		return _json_response(payload)
 	finally:
 		conn.close()
 

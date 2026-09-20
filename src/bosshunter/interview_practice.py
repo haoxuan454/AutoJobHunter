@@ -80,6 +80,23 @@ def create_session(conn: sqlite3.Connection, job: dict[str, Any] | None = None) 
     return _payload(conn, session_id)
 
 
+def list_sessions(conn: sqlite3.Connection, limit: int = 100) -> list[dict[str, Any]]:
+    """Return historical practice sessions, newest first."""
+    _init(conn)
+    rows = conn.execute(
+        "SELECT s.id, s.title, s.status, s.created_at, s.updated_at, s.job_snapshot_json, "
+        "(SELECT COUNT(*) FROM interview_rounds r WHERE r.session_id = s.id) AS round_count "
+        "FROM interview_sessions s ORDER BY s.updated_at DESC, s.created_at DESC LIMIT ?",
+        (max(1, min(int(limit), 200)),),
+    ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["job_snapshot"] = json.loads(item.pop("job_snapshot_json") or "{}")
+        result.append(item)
+    return result
+
+
 def _fallback_question(job: dict[str, Any], round_number: int, asked: list[str]) -> tuple[str, str]:
     title = str(job.get("title") or "目标岗位")
     jd = str(job.get("jd") or "")[:600]
@@ -158,4 +175,3 @@ def evaluate_round(conn: sqlite3.Connection, knowledge_conn: sqlite3.Connection,
     result = _payload(conn, session_id)
     result["round"] = next(item for item in result["rounds"] if item["id"] == int(round_id))
     return result
-
