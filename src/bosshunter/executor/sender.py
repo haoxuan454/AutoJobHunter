@@ -787,6 +787,16 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
         const text = document.body ? document.body.innerText : '';
         const title = document.title || '';
         const closedMarkers = {json.dumps(list(JOB_CLOSED_MARKERS), ensure_ascii=False)};
+        const loggedInMarker = /退出登录|我的消息|在线沟通|我的简历/.test(text);
+        const loginWall = /登录\/注册|立即登录|扫码登录|手机号登录|请先登录|登录失效/.test(text);
+        if (loginWall && !loggedInMarker) {{
+            return JSON.stringify({{
+                success: false,
+                error: 'login_required',
+                history_detail: 'BOSS 登录状态已失效，请先在项目专用 Chrome 中重新登录',
+                skip_backoff: true
+            }});
+        }}
         if (
             title.includes('访问的页面不存在') ||
             closedMarkers.some((marker) => text.includes(marker))

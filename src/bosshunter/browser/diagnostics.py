@@ -33,6 +33,26 @@ ZHILIAN_PAGE_STATE_SCRIPT = """
 """
 
 
+BOSS_PAGE_STATE_SCRIPT = """
+(() => {
+  const text = document.body ? document.body.innerText : '';
+  const url = String(location.href || '');
+  const loggedInMarker = /退出登录|我的消息|在线沟通|我的简历/.test(text);
+  const loginWall = /登录\/注册|立即登录|扫码登录|手机号登录|请先登录|登录失效/.test(text);
+  if (/验证码|访问频繁|频率限制|账号异常/.test(text)) {
+    return JSON.stringify({status: 'blocked', message: 'BOSS 页面受到验证码或风控拦截'});
+  }
+  if (/\/login|signin/.test(url) || (loginWall && !loggedInMarker)) {
+    return JSON.stringify({status: 'login_required', message: 'BOSS 页面要求登录'});
+  }
+  if (document.querySelector('input[placeholder*="职位"], input[placeholder*="搜索"]')) {
+    return JSON.stringify({status: 'ready', message: 'BOSS 页面已发现搜索入口'});
+  }
+  return JSON.stringify({status: 'unknown', message: '未识别到可用的 BOSS 招聘页面'});
+})()
+"""
+
+
 def inspect_zhilian_page(target: dict[str, Any] | None) -> dict[str, str]:
     """Inspect only the visible DOM state of an existing Zhilian tab."""
     if not isinstance(target, dict):
@@ -57,6 +77,28 @@ def inspect_zhilian_page(target: dict[str, Any] | None) -> dict[str, str]:
     return {"status": "unknown", "message": "智联页面状态检查未返回有效结果"}
 
 
+def inspect_boss_page(target: dict[str, Any] | None) -> dict[str, str]:
+    """Inspect the visible DOM of the existing BOSS tab for login/risk state."""
+    if not isinstance(target, dict):
+        return {"status": "missing", "message": "未发现 BOSS 招聘页面"}
+    target_id = str(target.get("targetId") or target.get("id") or "").strip()
+    if not target_id:
+        return {"status": "unknown", "message": "BOSS 页面缺少可检查的标签页标识"}
+    try:
+        raw = evaluate(target_id, BOSS_PAGE_STATE_SCRIPT, timeout=5)
+    except Exception:
+        return {"status": "unknown", "message": "BOSS 页面状态检查失败，请重新检查浏览器连接"}
+    payload = raw
+    if isinstance(raw, str):
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            payload = None
+    if isinstance(payload, dict):
+        return {str(key): str(value) for key, value in payload.items()}
+    return {"status": "unknown", "message": "BOSS 页面状态检查未返回有效结果"}
+
+
 def run_browser_diagnostics(config: dict[str, Any] | None = None) -> dict[str, Any]:
     """Collect Browser Runtime readiness state."""
     node = check_node_available()
@@ -70,6 +112,7 @@ def run_browser_diagnostics(config: dict[str, Any] | None = None) -> dict[str, A
         health = runtime_health(config) or health
     boss_tab = find_boss_tab() if runtime_ready else None
     zhilian_tab = find_zhilian_tab() if runtime_ready else None
+    boss_page = inspect_boss_page(boss_tab) if runtime_ready and boss_tab else None
     zhilian_page = inspect_zhilian_page(zhilian_tab) if runtime_ready and zhilian_tab else None
     browser_product, browser_name = _browser_identity(health)
 
@@ -90,6 +133,7 @@ def run_browser_diagnostics(config: dict[str, Any] | None = None) -> dict[str, A
         "chrome": isinstance(targets, list),
         "targets": targets or [],
         "boss_tab": boss_tab,
+        "boss_page": boss_page,
         "zhilian_tab": zhilian_tab,
         "zhilian_page": zhilian_page,
         "errors": errors,

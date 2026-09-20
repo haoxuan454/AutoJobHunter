@@ -381,19 +381,22 @@ def check_browser_connection(config: dict, collection_options: dict | None = Non
 		selected_platforms = set(collection_options.get("platform_order", [])) if collection_options else {"boss"}
 		if "boss" in selected_platforms:
 			boss_tab = result.get("boss_tab")
+			boss_page = result.get("boss_page") or {}
 			if boss_tab:
 				url = str(boss_tab.get("url") or "")
-				if any(marker in url.lower() for marker in ("/login", "/user/", "signin")):
+				if any(marker in url.lower() for marker in ("/login", "/user/", "signin")) or boss_page.get("status") == "login_required":
 					checks.append(
 						_check(
 							"boss_login",
 							"BOSS 直聘登录",
-							"warning",
+							"error",
 							"BOSS 直聘可能尚未登录",
 							"请在已连接的 Google Chrome 中完成登录，再开始任务。",
 							"browser",
 						)
 					)
+				elif boss_page.get("status") == "blocked":
+					checks.append(_check("boss_blocked", "BOSS 页面状态", "error", "BOSS 页面受到验证码或风控拦截", str(boss_page.get("message") or "请人工处理 BOSS 页面后再试。"), "browser"))
 				else:
 					checks.append(
 						_check(
