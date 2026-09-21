@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from bosshunter.conversations import ConversationRepository, IncomingMessage
-from bosshunter.notifications import enqueue_alert, load_email_settings
+from bosshunter.notification_service import process_hr_message
 
 
 def _stable_conversation_id(job: dict[str, Any], conversation: dict[str, Any] | None, platform: str) -> str:
@@ -74,17 +74,21 @@ def sync_extracted_messages(
     cursor = hashlib.sha256("\x1e".join(f"{item.sender_type}:{item.content}" for item in incoming).encode("utf-8")).hexdigest()
     repo.save_cursor(conversation_id, cursor)
 
-    combined = " ".join(item.content for item in incoming if item.sender_type == "hr")
-    notification = None
-    if any(token in combined for token in ("薪资", "工资", "薪酬", "月薪", "年薪", "几K", "几 k", "待遇")):
-        record = repo.update_status(conversation_id, "paused_salary", "检测到薪资或待遇话题，等待人工处理")
-        settings = load_email_settings(base_dir or Path.cwd(), config or {})
-        if settings.get("to_email"):
-            notification = enqueue_alert(
-                conn,
-                conversation_id=conversation_id,
-                recipient=settings["to_email"],
-                subject=f"BossHunter 人工接管提醒：{record.get('hr_name') or 'HR'} 提到薪资",
-                body=f"HR：{record.get('hr_name') or ''}\n岗位链接：{record.get('hr_profile_url') or ''}\n\n{combined}",
-            )
-    return {"conversation": record, "inserted": inserted, "notification": notification}
+    notifications = []
+    # Only classify messages inserted in this snapshot. Previously seen HR
+    # messages must never be reprocessed on every polling cycle.
+    for item in inserted:
+        if item.get("sender_type") != "hr":
+            continue
+        result = process_hr_message(
+            conn,
+            conversation_id=conversation_id,
+            message=str(item.get("content") or ""),
+            message_id=item.get("id") or item.get("platform_message_id"),
+            base_dir=base_dir or Path.cwd(),
+            config=config or {},
+        )
+        if result.get("notification"):
+            notifications.append(result["notification"])
+        record = result.get("conversation") or record
+    return {"conversation": record, "inserted": inserted, "notification": notifications[-1] if notifications else None, "notifications": notifications}

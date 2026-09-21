@@ -7,6 +7,7 @@ when the user explicitly enables ``auto_send`` in local settings.
 
 from __future__ import annotations
 
+import html
 import json
 import smtplib
 import sqlite3
@@ -29,6 +30,11 @@ def init_notification_tables(conn: sqlite3.Connection) -> None:
             recipient TEXT NOT NULL,
             subject TEXT NOT NULL,
             body TEXT NOT NULL,
+            html_body TEXT,
+            category TEXT NOT NULL DEFAULT 'custom',
+            confidence REAL NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'conversation',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
             status TEXT NOT NULL DEFAULT 'pending',
             attempts INTEGER NOT NULL DEFAULT 0,
             last_error TEXT,
@@ -40,6 +46,18 @@ def init_notification_tables(conn: sqlite3.Connection) -> None:
             ON notification_outbox(status, created_at);
         """
     )
+    # Incremental migration for databases created by earlier versions.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(notification_outbox)").fetchall()}
+    migrations = {
+        "html_body": "ALTER TABLE notification_outbox ADD COLUMN html_body TEXT",
+        "category": "ALTER TABLE notification_outbox ADD COLUMN category TEXT NOT NULL DEFAULT 'custom'",
+        "confidence": "ALTER TABLE notification_outbox ADD COLUMN confidence REAL NOT NULL DEFAULT 0",
+        "source": "ALTER TABLE notification_outbox ADD COLUMN source TEXT NOT NULL DEFAULT 'conversation'",
+        "metadata_json": "ALTER TABLE notification_outbox ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
+    }
+    for column, statement in migrations.items():
+        if column not in columns:
+            conn.execute(statement)
     conn.commit()
 
 
@@ -70,13 +88,18 @@ def load_email_settings(base_dir: Path, config: dict[str, Any] | None = None) ->
         "from_email": str(public.get("from_email") or ""),
         "to_email": str(public.get("to_email") or ""),
         "password": str(private.get("password") or ""),
+        "notification_types": list(public.get("notification_types") or ["salary", "interview", "offer", "wechat"]),
+        "confidence_threshold": float(public.get("confidence_threshold", 0.8) or 0.8),
     }
     result["password_set"] = bool(result["password"])
     return result
 
 
 def validate_email_settings(value: dict[str, Any]) -> dict[str, Any]:
-    allowed = {"enabled", "auto_send", "smtp_host", "smtp_port", "use_tls", "username", "from_email", "to_email", "password"}
+    allowed = {
+        "enabled", "auto_send", "smtp_host", "smtp_port", "use_tls", "username", "from_email", "to_email", "password",
+        "password_set", "notification_types", "confidence_threshold",
+    }
     unknown = set(value) - allowed
     if unknown:
         raise ValueError(f"unsupported email settings: {sorted(unknown)}")
@@ -89,11 +112,18 @@ def validate_email_settings(value: dict[str, Any]) -> dict[str, Any]:
         "username": str(value.get("username") or "").strip(),
         "from_email": str(value.get("from_email") or "").strip(),
         "to_email": str(value.get("to_email") or "").strip(),
+        "notification_types": [str(item).strip() for item in (value.get("notification_types") or []) if str(item).strip()],
+        "confidence_threshold": float(value.get("confidence_threshold", 0.8) or 0.8),
     }
     if not 1 <= result["smtp_port"] <= 65535:
         raise ValueError("smtp_port must be between 1 and 65535")
     if result["enabled"] and (not result["smtp_host"] or not result["to_email"]):
         raise ValueError("enabled email notifications require smtp_host and to_email")
+    if not 0.5 <= result["confidence_threshold"] <= 1:
+        raise ValueError("confidence_threshold must be between 0.5 and 1")
+    allowed_types = {"salary", "interview", "offer", "wechat", "contract", "interest", "custom"}
+    if any(item not in allowed_types for item in result["notification_types"]):
+        raise ValueError("unsupported notification type")
     return result
 
 
@@ -117,14 +147,26 @@ def save_email_settings(base_dir: Path, config: dict[str, Any], value: dict[str,
     return load_email_settings(base_dir, public_config)
 
 
-def enqueue_alert(conn: sqlite3.Connection, *, conversation_id: str, recipient: str, subject: str, body: str, kind: str = "salary") -> dict[str, Any]:
+def enqueue_alert(
+    conn: sqlite3.Connection,
+    *,
+    conversation_id: str,
+    recipient: str,
+    subject: str,
+    body: str,
+    kind: str = "salary",
+    confidence: float = 0.0,
+    source: str = "conversation",
+    metadata: dict[str, Any] | None = None,
+    html_body: str | None = None,
+) -> dict[str, Any]:
     init_notification_tables(conn)
     conn.execute(
         """INSERT INTO notification_outbox
-           (conversation_id, kind, recipient, subject, body)
-           VALUES (?, ?, ?, ?, ?)
+           (conversation_id, kind, recipient, subject, body, html_body, category, confidence, source, metadata_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(conversation_id, kind, subject) DO NOTHING""",
-        (conversation_id, kind, recipient, subject, body),
+        (conversation_id, kind, recipient, subject, body, html_body, kind, float(confidence), source, json.dumps(metadata or {}, ensure_ascii=False)),
     )
     conn.commit()
     row = conn.execute(
@@ -158,9 +200,24 @@ def send_outbox_item(conn: sqlite3.Connection, item_id: int, settings: dict[str,
     message["To"] = row["recipient"]
     message["Subject"] = row["subject"]
     message.set_content(row["body"])
-    factory = smtp_factory or smtplib.SMTP_SSL
+    if row["html_body"]:
+        message.add_alternative(row["html_body"], subtype="html")
+    # QQ uses implicit TLS on 465. Other SMTP providers commonly expose a
+    # plain socket plus STARTTLS, or no TLS at all; select the transport from
+    # the saved settings so the setting remains meaningful and testable.
+    factory = smtp_factory
     try:
-        with factory(settings["smtp_host"], int(settings.get("smtp_port") or 465), timeout=15) as smtp:
+        port = int(settings.get("smtp_port") or 465)
+        use_tls = bool(settings.get("use_tls", True))
+        if factory is not None:
+            smtp_context = factory(settings["smtp_host"], port, timeout=15)
+        elif use_tls and port == 465:
+            smtp_context = smtplib.SMTP_SSL(settings["smtp_host"], port, timeout=15)
+        else:
+            smtp_context = smtplib.SMTP(settings["smtp_host"], port, timeout=15)
+        with smtp_context as smtp:
+            if factory is None and use_tls and port != 465:
+                smtp.starttls()
             if settings.get("username"):
                 smtp.login(settings["username"], password)
             smtp.send_message(message)

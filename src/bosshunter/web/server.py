@@ -136,6 +136,13 @@ from bosshunter.notifications import (
 	save_email_settings,
 	send_outbox_item,
 )
+from bosshunter.notification_service import process_hr_message, process_lab_message
+from bosshunter.daily_summary import (
+	generate_daily_summary,
+	load_daily_summary_settings,
+	save_daily_summary_settings,
+)
+from bosshunter.daily_summary_scheduler import start_daily_summary_scheduler
 
 mimetypes.add_type("application/javascript", ".js", strict=True)
 mimetypes.add_type("application/javascript", ".mjs", strict=True)
@@ -2646,11 +2653,57 @@ def api_notification_email_post():
 	body = request.json or {}
 	try:
 		value = body.get("email") if isinstance(body.get("email"), dict) else body
+		if not isinstance(value, dict):
+			return _json_response({"error": "email settings must be an object"}, 400)
 		settings = save_email_settings(BASE_DIR, load_config(CONFIG_PATH), value)
 		settings.pop("password", None)
 		return _json_response({"success": True, "email": settings})
 	except (TypeError, ValueError, OSError) as exc:
 		return _json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/notifications/daily-summary")
+def api_daily_summary_settings_get():
+	return _json_response({"daily_summary": load_daily_summary_settings(load_config(CONFIG_PATH))})
+
+
+@app.route("/api/notifications/daily-summary", method="POST")
+def api_daily_summary_settings_post():
+	body = request.json or {}
+	try:
+		value = body.get("daily_summary") if isinstance(body.get("daily_summary"), dict) else body
+		if not isinstance(value, dict):
+			return _json_response({"error": "daily_summary settings must be an object"}, 400)
+		settings = save_daily_summary_settings(BASE_DIR, load_config(CONFIG_PATH), value)
+		return _json_response({"success": True, "daily_summary": settings})
+	except (TypeError, ValueError, OSError) as exc:
+		return _json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/notifications/daily-summary/generate", method="POST")
+def api_daily_summary_generate():
+	body = request.json or {}
+	conn = _get_web_db()
+	try:
+		result = generate_daily_summary(conn, base_dir=BASE_DIR, config=load_config(CONFIG_PATH), day=body.get("date"), allow_send=False)
+		return _json_response({"success": True, **result})
+	except (TypeError, ValueError, OSError) as exc:
+		return _json_response({"error": str(exc)}, 400)
+	finally:
+		conn.close()
+
+
+@app.route("/api/notifications/daily-summary/send", method="POST")
+def api_daily_summary_send():
+	body = request.json or {}
+	conn = _get_web_db()
+	try:
+		result = generate_daily_summary(conn, base_dir=BASE_DIR, config=load_config(CONFIG_PATH), day=body.get("date"), allow_send=True)
+		return _json_response({"success": True, **result})
+	except (TypeError, ValueError, OSError, smtplib.SMTPException) as exc:
+		return _json_response({"error": str(exc)}, 400)
+	finally:
+		conn.close()
 
 
 @app.route("/api/notifications/outbox")
@@ -2740,7 +2793,21 @@ def api_assistant_lab_message():
 		knowledge_conn = _get_web_db()
 		sandbox_conn = open_sandbox(_assistant_lab_db_path())
 		try:
-			result = lab_send_message(sandbox_conn, knowledge_conn, load_config(CONFIG_PATH), body.get("session_id"), question)
+			config = load_config(CONFIG_PATH)
+			result = lab_send_message(sandbox_conn, knowledge_conn, config, body.get("session_id"), question)
+			if bool(body.get("notification_test")):
+				notification_conn = _get_web_db()
+				try:
+					result["notification_test"] = process_lab_message(
+						notification_conn,
+						session_id=str(result["session"]["id"]),
+						message=question,
+						base_dir=BASE_DIR,
+						config=config,
+						allow_send=bool(body.get("send_notification")),
+					)
+				finally:
+					notification_conn.close()
 		finally:
 			sandbox_conn.close()
 			knowledge_conn.close()
@@ -3091,31 +3158,22 @@ def api_conversation_messages(conversation_id):
 		) for item in items]
 		repo = _conversation_repo()
 		inserted = repo.append_messages(conversation_id, messages)
-		# Sensitive salary topics pause only this conversation; no browser action is triggered.
-		combined = " ".join(message.content for message in messages)
-		if any(token in combined for token in ("薪资", "工资", "薪酬", "月薪", "年薪", "几K", "几 k", "待遇")):
-			repo.update_status(conversation_id, "paused_salary", "检测到薪资或待遇话题，等待人工处理")
-			notification = None
-			settings = load_email_settings(BASE_DIR, load_config(CONFIG_PATH))
-			if settings.get("to_email"):
-				conversation = repo.get_conversation(conversation_id) or {}
-				subject = f"BossHunter 人工接管提醒：{conversation.get('hr_name') or 'HR'} 提到薪资"
-				body_text = (
-					f"HR：{conversation.get('hr_name') or ''}\n"
-					f"公司：{conversation.get('company_id') or ''}\n"
-					f"岗位链接：{conversation.get('hr_profile_url') or conversation.get('company_url') or ''}\n"
-					f"会话：{conversation_id}\n\n最新消息：\n{combined}\n\n"
-					"平台已暂停该会话的自动草稿流程，请人工确认后再恢复。"
-				)
-				notification = enqueue_alert(repo.conn, conversation_id=conversation_id, recipient=settings["to_email"], subject=subject, body=body_text)
-				if settings.get("enabled") and settings.get("auto_send") and notification.get("status") != "sent":
-					try:
-						notification = send_outbox_item(repo.conn, notification["id"], settings)
-					except Exception as exc:
-						notification = dict(notification)
-						notification["delivery_error"] = str(exc)
-			return _json_response({"success": True, "inserted": inserted, "notification": notification, "conversation": repo.get_conversation(conversation_id)})
-		return _json_response({"success": True, "inserted": inserted, "notification": None, "conversation": repo.get_conversation(conversation_id)})
+		notifications = []
+		config = load_config(CONFIG_PATH)
+		for item in inserted:
+			if item.get("sender_type") != "hr":
+				continue
+			result = process_hr_message(
+				repo.conn,
+				conversation_id=conversation_id,
+				message=str(item.get("content") or ""),
+				message_id=item.get("id") or item.get("platform_message_id"),
+				base_dir=BASE_DIR,
+				config=config,
+			)
+			if result.get("notification"):
+				notifications.append(result["notification"])
+		return _json_response({"success": True, "inserted": inserted, "notification": notifications[-1] if notifications else None, "notifications": notifications, "conversation": repo.get_conversation(conversation_id)})
 	except ValueError as exc:
 		return _json_response({"error": str(exc)}, 400)
 
@@ -4019,10 +4077,20 @@ def run_server(host: str = "127.0.0.1", port: int = 8686, open_browser: bool = T
 			webbrowser.open(f"http://{host}:{port}")
 		threading.Thread(target=_open, daemon=True).start()
 
-	app.run(
-		host=host,
-		port=port,
-		quiet=False,
-		reloader=False,
-		server_class=ThreadingWSGIServer,
+	# Local opt-in summary worker; it never participates in platform tasks.
+	daily_summary_scheduler = start_daily_summary_scheduler(
+		base_dir=BASE_DIR,
+		db_path=DATA_DIR / "bosshunter.db",
+		config_path=CONFIG_PATH,
 	)
+
+	try:
+		app.run(
+			host=host,
+			port=port,
+			quiet=False,
+			reloader=False,
+			server_class=ThreadingWSGIServer,
+		)
+	finally:
+		daily_summary_scheduler.stop()

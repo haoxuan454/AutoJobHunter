@@ -191,6 +191,32 @@ DEFAULTS: dict[str, Any] = {
         # Hard safety gate: platform messages require an explicit human approval.
         "require_human_confirmation": True,
     },
+    "notifications": {
+        "email": {
+            "enabled": False,
+            "auto_send": False,
+            "smtp_host": "smtp.qq.com",
+            "smtp_port": 465,
+            "use_tls": True,
+            "username": "",
+            "from_email": "",
+            "to_email": "",
+            "notification_types": ["salary", "interview", "offer", "wechat"],
+            "confidence_threshold": 0.8,
+        },
+        "daily_summary": {
+            "enabled": False,
+            "auto_send": False,
+            "send_time": "20:00",
+            "timezone": "Asia/Shanghai",
+            "top_jobs_limit": 3,
+            "include_job_count": True,
+            "include_conversation_count": True,
+            "include_interested_hr": True,
+            "include_top_jobs": True,
+            "detail_level": "compact",
+        },
+    },
     "follow_up": {
         "enabled": False,
         "interval_hours": 48,
