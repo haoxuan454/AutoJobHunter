@@ -116,6 +116,7 @@ from bosshunter.conversations import ConversationRepository, IncomingMessage
 from bosshunter.conversation_scheduler import SerialConversationScheduler, init_scheduler_tables
 from bosshunter.assistant_lab import open_sandbox, reset as reset_lab, send_message as lab_send_message, session_payload as lab_session_payload
 from bosshunter.interview_practice import create_session as create_interview_session, evaluate_round as evaluate_interview_round, generate_question as generate_interview_question, list_sessions as list_interview_sessions
+from bosshunter.voice_assistant import generate_reply as generate_voice_reply
 from bosshunter.common_questions import delete_common_question, init_common_question_tables, list_common_questions, update_common_question, upsert_common_question
 from bosshunter.token_usage import token_usage_report
 from bosshunter.knowledge import (
@@ -2757,6 +2758,24 @@ def api_assistant_lab_reset():
 		return _json_response(reset_lab(conn))
 	finally:
 		conn.close()
+
+
+@app.route("/api/voice-assistant/reply", method="POST")
+def api_voice_assistant_reply():
+	"""Generate a reply from a final browser speech transcript only."""
+	body = request.json or {}
+	try:
+		question = str(body.get("question") or body.get("transcript") or "").strip()
+		knowledge_conn = _get_web_db()
+		try:
+			result = generate_voice_reply(knowledge_conn, load_config(CONFIG_PATH), question)
+		finally:
+			knowledge_conn.close()
+		return _json_response(result)
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
+	except Exception as exc:
+		return _json_response({"error": str(exc)}, 500)
 
 
 @app.route("/api/interview-practice/options")

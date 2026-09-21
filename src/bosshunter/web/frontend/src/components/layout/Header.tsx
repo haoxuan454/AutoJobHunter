@@ -1,7 +1,8 @@
 import { useLocation } from 'react-router-dom'
-import { Activity, BarChart3, BookOpen, BriefcaseBusiness, BrainCircuit, Coins, FlaskConical, ListChecks, MessageSquare, Radar, Settings, Target } from 'lucide-react'
+import { Activity, AudioLines, BarChart3, BookOpen, BriefcaseBusiness, BrainCircuit, Coins, FlaskConical, ListChecks, MessageSquare, Radar, Settings, Target } from 'lucide-react'
 
 const pageMeta: Record<string, { title: string; description: string; icon: typeof Target; tone: string }> = {
+  '/voice-assistant': { title: '语音求职助手', description: '实时转写 HR 问题并生成求职者口吻回复', icon: AudioLines, tone: 'bg-indigo-50 text-indigo-600' },
   '/assistant-lab': { title: 'AI 回复演练', description: '本地沙盒验证个人经验驱动的 HR 回复流程', icon: FlaskConical, tone: 'bg-indigo-50 text-indigo-600' },
   '/common-questions': { title: '共性问题库', description: '查看和整理脱敏后的 HR 共性问题与回复', icon: ListChecks, tone: 'bg-teal-50 text-teal-600' },
   '/': { title: '工作台', description: '查看今日求职任务与整体进度', icon: Target, tone: 'bg-orange-50 text-orange-600' },
