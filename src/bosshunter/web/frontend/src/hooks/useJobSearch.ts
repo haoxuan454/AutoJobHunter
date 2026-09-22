@@ -19,6 +19,7 @@ export function useJobSearch(
   pageSize: number,
   sortBy: JobSortKey = 'created_at',
   sortOrder: JobSortOrder = 'desc',
+  priorityScope = '',
 ) {
   const debouncedQuery = useDebouncedValue(filters.query, 250)
   const [items, setItems] = useState<Job[]>([])
@@ -53,6 +54,7 @@ export function useJobSearch(
     if (filters.recruitmentType) params.set('recruitment_type', filters.recruitmentType)
     params.set('sort_by', sortBy)
     params.set('sort_order', sortOrder)
+    if (priorityScope) params.set('priority_scope', priorityScope)
 
     setLoading(true)
     fetch(`/api/jobs/search?${params.toString()}`, { cache: 'no-store', signal: controller.signal })
@@ -76,7 +78,7 @@ export function useJobSearch(
       })
 
     return () => controller.abort()
-  }, [debouncedQuery, filters.minScore, filters.salaryMin, filters.salaryMax, filters.status, filters.createdWithin, filters.sourcePlatform, filters.education, filters.recruitmentType, page, pageSize, sortBy, sortOrder, revision])
+  }, [debouncedQuery, filters.minScore, filters.salaryMin, filters.salaryMax, filters.status, filters.createdWithin, filters.sourcePlatform, filters.education, filters.recruitmentType, page, pageSize, sortBy, sortOrder, priorityScope, revision])
 
   return { items, total, allTotal, loading, error, refresh: () => setRevision(value => value + 1) }
 }

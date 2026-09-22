@@ -53,6 +53,16 @@ class UnverifiedDeliveryAdapter:
         )
 
 
+def dry_run_result(platform: str) -> DeliveryResult:
+    return DeliveryResult(
+        success=False,
+        verified=False,
+        platform=platform,
+        error="platform_delivery_not_verified",
+        history_detail=f"{platform} 本地演练不会打开外部页面，也不会复用 BOSS 选择器；真实适配器仍需单条验收。",
+    )
+
+
 class _BossAdapter:
     """Marker adapter for the legacy BOSS sender implementation.
 
@@ -83,4 +93,14 @@ _ADAPTERS: dict[str, DeliveryAdapter] = {
 
 
 def get_delivery_adapter(platform: str) -> DeliveryAdapter:
-    return _ADAPTERS.get(str(platform or "boss"), UnverifiedDeliveryAdapter(str(platform or "unknown")))
+    platform = str(platform or "boss")
+    if platform == "zhilian":
+        from .zhilian import ZhilianDeliveryAdapter
+        return ZhilianDeliveryAdapter()
+    if platform == "51job":
+        from .job51 import Job51DeliveryAdapter
+        return Job51DeliveryAdapter()
+    if platform == "liepin":
+        from .liepin import LiepinDeliveryAdapter
+        return LiepinDeliveryAdapter()
+    return _ADAPTERS.get(platform, UnverifiedDeliveryAdapter(platform))

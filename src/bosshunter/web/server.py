@@ -1255,7 +1255,19 @@ def api_job_search():
 		"hr_active": "COALESCE(hr_active, '')",
 		"created_at": "COALESCE(created_at, '')",
 	}
-	query += f" ORDER BY {sort_expressions[sort_by]} {sort_order.upper()}, created_at DESC, score DESC"
+	priority_scope = request.params.get("priority_scope", "").strip()
+	if priority_scope not in {"", "filtered", "pending_confirmation", "sent"}:
+		return _json_response({"error": "priority_scope invalid"}, 400)
+	# Do not use the literal ``0`` here: SQLite treats ORDER BY 0 as a
+	# positional-column reference and raises "term out of range".
+	priority_expression = "CASE WHEN 1 = 1 THEN 0 ELSE 1 END"
+	if priority_scope == "filtered":
+		priority_expression = "CASE WHEN status = 'filtered' THEN 0 ELSE 1 END"
+	elif priority_scope == "pending_confirmation":
+		priority_expression = "CASE WHEN status IN ('ready', 'approved') THEN 0 ELSE 1 END"
+	elif priority_scope == "sent":
+		priority_expression = "CASE WHEN status IN ('sent', 'replied', 'resume_sent', 'needs_resume', 'follow_up_sent') THEN 0 ELSE 1 END"
+	query += f" ORDER BY {priority_expression}, {sort_expressions[sort_by]} {sort_order.upper()}, created_at DESC, score DESC"
 
 	db = _get_web_db()
 	try:

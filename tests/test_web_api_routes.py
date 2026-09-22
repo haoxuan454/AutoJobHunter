@@ -822,6 +822,31 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertTrue(invalid_sort_status.startswith("400"), invalid_sort_body)
         self.assertTrue(invalid_order_status.startswith("400"), invalid_order_body)
 
+    def test_job_search_priority_scope_orders_before_pagination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                for index in range(5):
+                    job_id = f"priority-{index}"
+                    job = _job(job_id)
+                    insert_job(db, job)
+                    update_job_status(db, job_id, "filtered" if index in {0, 1, 2} else "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+            first_status, _, first_body = self._request(
+                "/api/jobs/search?priority_scope=filtered&limit=2&offset=0"
+            )
+            second_status, _, second_body = self._request(
+                "/api/jobs/search?priority_scope=filtered&limit=2&offset=2"
+            )
+
+        self.assertTrue(first_status.startswith("200"), first_body)
+        self.assertTrue(second_status.startswith("200"), second_body)
+        self.assertEqual([job["status"] for job in json.loads(first_body)["items"]], ["filtered", "filtered"])
+        self.assertEqual([job["status"] for job in json.loads(second_body)["items"]], ["filtered", "ready"])
+
     def test_job_search_decodes_chinese_keyword_as_utf8(self):
         with tempfile.TemporaryDirectory() as tmp:
             base_dir = Path(tmp)

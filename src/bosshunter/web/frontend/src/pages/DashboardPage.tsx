@@ -1584,11 +1584,9 @@ function JobsPoolView() {
   const [permanentDeleteAcknowledged, setPermanentDeleteAcknowledged] = useState(false)
   const [bulkSelecting, setBulkSelecting] = useState(false)
   const [bulkScope, setBulkScope] = useState('')
-  const { items, total, allTotal, loading, error, refresh: refreshJobs } = useJobSearch(filters, page, pageSize, sortBy, sortOrder)
-  const displayItems = useMemo(
-    () => [...items].sort((left, right) => Number(selectedIds.includes(right.id)) - Number(selectedIds.includes(left.id))),
-    [items, selectedIds],
-  )
+  const priorityScope = bulkScope === 'all' ? '' : bulkScope
+  const { items, total, allTotal, loading, error, refresh: refreshJobs } = useJobSearch(filters, page, pageSize, sortBy, sortOrder, priorityScope)
+  const displayItems = items
   const { workbench: deliveryWorkbench } = useDashboard('workbench')
   const deliveryTask = deliveryWorkbench.task?.mode === 'deliver'
     ? deliveryWorkbench.task
@@ -1596,7 +1594,7 @@ function JobsPoolView() {
 
   useEffect(() => {
     setPage(0)
-  }, [filters.query, filters.minScore, filters.salaryMin, filters.salaryMax, filters.status, filters.createdWithin, filters.sourcePlatform, filters.education, filters.recruitmentType])
+  }, [filters.query, filters.minScore, filters.salaryMin, filters.salaryMax, filters.status, filters.createdWithin, filters.sourcePlatform, filters.education, filters.recruitmentType, priorityScope])
 
   const toggleSelected = (jobId: string) => {
     setSelectedIds(previous => previous.includes(jobId) ? previous.filter(id => id !== jobId) : [...previous, jobId])
@@ -1737,7 +1735,7 @@ function JobsPoolView() {
   const deliverSelectedJobs = async () => {
     if (!selectedIds.length) return
     const count = selectedIds.length
-    if (!window.confirm(`确认投递已选择的 ${count} 个岗位吗？仅 BOSS 岗位可进入发送队列，且仍受发送时间窗口和每日额度限制。`)) return
+    if (!window.confirm(`确认投递已选择的 ${count} 个岗位吗？已验证的平台会进入对应发送队列，仍受发送时间窗口和每日额度限制。`)) return
     try {
       const result = await postJobAction('/api/workbench/deliver', { job_ids: selectedIds })
       setSelectedIds([])
@@ -1946,7 +1944,7 @@ function JobsPoolView() {
         {selectedIds.length > 0 && <Button variant="ghost" size="sm" onClick={() => setSelectedIds([])}>清空选择</Button>}
         <Button variant="destructive" size="sm" disabled={!selectedIds.length} onClick={() => void softDelete(selectedIds)}>移入回收站</Button>
         <Button size="sm" disabled={!selectedIds.length} onClick={() => void deliverSelectedJobs()}>
-          <Send className="mr-1 h-4 w-4" />BOSS 一键投递已选
+          <Send className="mr-1 h-4 w-4" />一键投递已选
         </Button>
         <Button size="sm" onClick={() => void startQuickScoring()} disabled={quickScoring || !total}>
           {quickScoring ? '启动评分中…' : '一键 AI 评分'}
@@ -1960,7 +1958,7 @@ function JobsPoolView() {
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
               <div className="text-sm font-black">投递队列</div>
-              <p className="mt-1 text-xs text-muted">只展示已人工确认的 BOSS 发送任务；智联和 51job 不会进入此队列。</p>
+              <p className="mt-1 text-xs text-muted">只展示已人工确认且通过平台能力验证的发送任务。</p>
             </div>
             <span className="rounded-full bg-[#FFF0E5] px-3 py-1 text-xs font-black text-primary">
               {deliveryTask.status === 'running' ? '处理中' : deliveryTask.status === 'completed' ? '已完成' : deliveryTask.status === 'failed' ? '失败' : deliveryTask.status}

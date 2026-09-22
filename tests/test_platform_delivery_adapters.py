@@ -21,6 +21,10 @@ class PlatformDeliveryAdapterTests(unittest.TestCase):
             self.assertEqual(result.error, "platform_delivery_not_verified")
             self.assertIn("不会复用 BOSS", result.history_detail)
 
+    def test_real_adapters_are_not_marked_verified_before_acceptance(self):
+        for platform in ("zhilian", "51job", "liepin"):
+            self.assertFalse(get_delivery_adapter(platform).verified)
+
     def test_boss_adapter_does_not_bypass_legacy_sender(self):
         result = get_delivery_adapter("boss").send_greeting(
             {"id": "fixture-job"}, "本地测试", DeliveryContext(dry_run=True)
