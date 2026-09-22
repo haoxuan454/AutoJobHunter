@@ -54,7 +54,10 @@ DETAIL_DELAY_MAX_SECONDS = 18.0
 PAGE_DELAY_MIN_SECONDS = 20.0
 PAGE_DELAY_MAX_SECONDS = 35.0
 RENDER_POLL_INTERVAL_SECONDS = 0.75
-RENDER_POLL_ATTEMPTS = 10
+# The desktop result list is hydrated after the document reports `complete`.
+# Keep polling the same page instead of issuing another request; this avoids
+# mistaking a slow client-side render for an empty/unsupported result page.
+RENDER_POLL_ATTEMPTS = 24
 
 _INTERNSHIP_TITLE_TERMS = ("实习", "intern", "internship", "管培")
 
@@ -245,6 +248,13 @@ class LiepinCollector:
         self.uniform = uniform
         self.detail_delay_range = detail_delay_range
         self.page_delay_range = page_delay_range
+        # List-only mode is an explicit, bounded collection mode for low-risk
+        # verification runs.  The production default remains detail enrichment
+        # so existing callers keep the previous behaviour.
+        platform_cfg = self.config.get("platforms", {})
+        liepin_cfg = platform_cfg.get("liepin", {}) if isinstance(platform_cfg, dict) else {}
+        search_cfg = liepin_cfg.get("search", {}) if isinstance(liepin_cfg, dict) else {}
+        self.fetch_details = bool(search_cfg.get("fetch_details", True)) if isinstance(search_cfg, dict) else True
 
     @staticmethod
     def build_search_url(request: PlatformCollectionRequest, city: str, keyword: str, page: int = 1) -> str:
@@ -405,6 +415,10 @@ class LiepinCollector:
                             if not self._passes_filters(candidate):
                                 continue
                             if not hooks.on_list_candidate(candidate):
+                                continue
+                            if not self.fetch_details:
+                                if not hooks.on_candidate(candidate):
+                                    return PlatformCollectionResult(self.platform, "completed", "callback_stopped", "采集回调已停止")
                                 continue
                             detail_req = self.uniform(*self.detail_delay_range)
                             hooks.on_event(phase="pacing", keyword=keyword, city=city, page=page, message=f"详情页安全间隔 {detail_req:.1f} 秒")

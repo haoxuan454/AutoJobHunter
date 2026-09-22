@@ -4,7 +4,7 @@ from typing import Any
 
 from bosshunter.browser import close_tab
 from .base import DeliveryContext, DeliveryResult, dry_run_result
-from .browser_helpers import click_text_or_selectors, fill_first_visible_input, inspect_page, open_job, verify_sent
+from .browser_helpers import find_text_or_selectors, inspect_page, open_job
 
 
 class ZhilianDeliveryAdapter:
@@ -22,29 +22,20 @@ class ZhilianDeliveryAdapter:
             if state.get("login_required"):
                 close_tab(target_id)
                 return DeliveryResult(False, platform=self.platform, error="login_required", history_detail="智联招聘当前页面未确认登录")
-            action = click_text_or_selectors(target_id, ["在线沟通", "立即沟通"], [".job-detail-summary__prechat"])
-            if not action.get("success"):
-                close_tab(target_id)
+            action = find_text_or_selectors(target_id, ["在线沟通", "立即沟通", "先聊聊"], [".job-detail-summary__prechat"])
+            close_tab(target_id)
+            if action.get("success"):
                 return DeliveryResult(
                     False,
                     platform=self.platform,
                     error="default_greeting_action_required",
                     history_detail=(
-                        "智联招聘当前岗位只有“先聊聊”入口，点击会立即发送平台默认招呼语；"
-                        "为避免误发，适配器不会把它当作自定义消息发送。请人工确认后继续。"
+                        "智联招聘当前入口会先发送平台默认招呼语，未发现可安全确认的自定义消息输入流程；"
+                        "本次未点击入口、未发送任何外部消息。"
                     ),
                     target_id=target_id,
                 )
-            filled = fill_first_visible_input(target_id, ["textarea", "input[placeholder*='消息']", "textarea[placeholder*='消息']"], greeting)
-            if not filled.get("success"):
-                close_tab(target_id)
-                return DeliveryResult(False, platform=self.platform, error=filled.get("error", "message_input_missing"), history_detail="智联招聘沟通窗口未找到输入框", target_id=target_id)
-            sent = click_text_or_selectors(target_id, ["发送", "发送消息"], ["button[type='submit']", ".send-btn", ".message-send"])
-            if not sent.get("success"):
-                close_tab(target_id)
-                return DeliveryResult(False, platform=self.platform, error="send_button_missing", history_detail="智联招聘沟通窗口未找到发送按钮", target_id=target_id)
-            verified = verify_sent(target_id, greeting, self.platform)
-            return DeliveryResult(bool(verified.get("success")), bool(verified.get("verified")), self.platform, verified.get("error"), verified.get("history_detail", ""), target_id=target_id)
+            return DeliveryResult(False, platform=self.platform, error="chat_capability_unverified", history_detail="智联招聘未发现可安全验证的自定义消息入口", target_id=target_id)
         except Exception as exc:
             close_tab(target_id)
             return DeliveryResult(False, platform=self.platform, error="adapter_exception", history_detail=f"智联招聘适配器异常：{exc}", target_id=target_id)

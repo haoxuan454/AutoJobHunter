@@ -16,6 +16,43 @@ from bosshunter.collection.text import clean_job_description
 
 
 class LiepinCollectorTests(TestCase):
+    def test_explicit_list_only_mode_skips_detail_navigation(self):
+        list_payload = json.dumps({"status": "ready", "jobs": [{
+            "source_job_id": "1980000000", "title": "Java开发工程师",
+            "company": "示例公司", "salary": "12-18k", "city": "上海",
+            "experience": "3-5年", "education": "本科",
+            "url": "https://www.liepin.com/job/1980000000.shtml",
+        }]}, ensure_ascii=False)
+        browser = LiepinBrowser(
+            new_tab=lambda url, **_kwargs: "list-tab",
+            close_tab=lambda _target: True,
+            evaluate=lambda _target, _script: list_payload,
+            scroll=lambda *_args, **_kwargs: True,
+            wait_for_load=lambda *_args, **_kwargs: True,
+        )
+        collector = LiepinCollector(
+            config={"throttle": {"send_windows": ["00:00-23:59"], "day_off_probability": 0},
+                    "platforms": {"liepin": {"search": {"fetch_details": False}}}},
+            browser=browser,
+            sleep=lambda seconds: None,
+            uniform=lambda low, high: 0,
+        )
+        received = []
+        hooks = CollectorHooks(
+            stop_event=None,
+            on_list_candidate=lambda _candidate: True,
+            on_candidate=lambda candidate: received.append(candidate) or True,
+            on_parse_failed=lambda _reason: self.fail("列表模式不应打开详情页"),
+            on_event=lambda **_kwargs: None,
+            can_checkpoint=lambda: True,
+        )
+        result = collector.collect(
+            PlatformCollectionRequest("liepin", ["AI"], ["上海"], {"上海": "020"}, max_pages=1),
+            hooks,
+        )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(len(received), 1)
+
     def setUp(self):
         self._patches = [
             patch("bosshunter.collection.platforms.liepin.SendWindowChecker.is_active", return_value=True),

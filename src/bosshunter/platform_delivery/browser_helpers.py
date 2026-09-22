@@ -67,6 +67,29 @@ def click_text_or_selectors(target_id: str, texts: list[str], selectors: list[st
     """, timeout=10))
 
 
+def find_text_or_selectors(target_id: str, texts: list[str], selectors: list[str]) -> dict[str, Any]:
+    """Inspect an action without clicking it (important for preset greetings)."""
+    return parse_result(evaluate(target_id, f"""
+    (() => {{
+      const visible = e => {{ const r=e.getBoundingClientRect(), s=getComputedStyle(e);
+        return !!(r.width && r.height && s.display !== 'none' && s.visibility !== 'hidden' && s.pointerEvents !== 'none');
+      }};
+      const texts = {json.dumps(texts, ensure_ascii=False)};
+      const selectors = {json.dumps(selectors, ensure_ascii=False)};
+      const candidates = [
+        ...selectors.flatMap(s => Array.from(document.querySelectorAll(s))),
+        ...Array.from(document.querySelectorAll('button,a,[role="button"]'))
+      ].filter((el, i, all) => all.indexOf(el) === i && visible(el));
+      const target = candidates.find(el => {{
+        const text = (el.innerText || el.textContent || '').replace(/\\s+/g, '').trim();
+        return texts.some(value => text.includes(String(value).replace(/\\s+/g, '')));
+      }});
+      if (!target) return JSON.stringify({{success:false,error:'action_button_missing'}});
+      return JSON.stringify({{success:true, text:(target.innerText||target.textContent||'').trim().slice(0,100), tag:target.tagName, className:String(target.className||'')}});
+    }})()
+    """, timeout=10))
+
+
 def fill_first_visible_input(target_id: str, selectors: list[str], message: str) -> dict[str, Any]:
     result = parse_result(evaluate(target_id, f"""
     (() => {{
