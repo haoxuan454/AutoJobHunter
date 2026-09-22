@@ -35,6 +35,11 @@ body {
   font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', sans-serif;
 }
 
+.assistant-lab-page .min-h-\[360px\] {
+  max-height: 560px;
+  overflow-y: auto;
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar {
   width: 6px;

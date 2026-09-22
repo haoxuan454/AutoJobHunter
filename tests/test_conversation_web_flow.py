@@ -138,6 +138,24 @@ class ConversationWebFlowTests(unittest.TestCase):
         self.assertFalse(result["sent"])
         call.assert_called_once()
 
+    def test_conversation_center_sort_resume_and_local_delete_flow(self):
+        self.request("/api/conversations", "POST", {"id": "c-delete", "platform": "boss", "external_conversation_id": "ext-delete", "company_id": "公司A", "job_id": "岗位A", "hr_name": "HR A"})
+        self.request("/api/conversations/c-delete/messages", "POST", {"sender_type": "hr", "content": "我们聊一下薪资", "platform_message_id": "salary-delete"})
+        status, listed = self.request("/api/conversations?sort=frequency")
+        self.assertTrue(status.startswith("200"), listed)
+        self.assertEqual(listed["conversations"][0]["round_count"], 1)
+        self.assertEqual(listed["conversations"][0]["platform"], "boss")
+
+        status, blocked = self.request("/api/conversations/c-delete", "DELETE", {})
+        self.assertTrue(status.startswith("400"), blocked)
+        status, resumed = self.request("/api/conversations/c-delete/status", "POST", {"status": "active", "reason": "用户人工恢复"})
+        self.assertTrue(status.startswith("200"), resumed)
+        self.assertEqual(resumed["conversation"]["status"], "active")
+        status, deleted = self.request("/api/conversations/c-delete", "DELETE", {"confirmation": "DELETE_LOCAL_CONVERSATION"})
+        self.assertTrue(status.startswith("200"), deleted)
+        self.assertTrue(deleted["platform_untouched"])
+        self.assertTrue(self.request("/api/conversations/c-delete")[0].startswith("404"))
+
 
 if __name__ == "__main__":
     unittest.main()

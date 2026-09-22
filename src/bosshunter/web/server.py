@@ -3119,7 +3119,11 @@ def api_knowledge_search():
 @app.route("/api/conversations")
 def api_conversations():
 	repo = _conversation_repo()
-	return _json_response({"conversations": repo.list_conversations()})
+	sort = str(request.query.get("sort") or "recent")
+	try:
+		return _json_response({"sort": sort, "conversations": repo.list_conversations(sort=sort)})
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
 
 
 @app.route("/api/conversations", method="POST")
@@ -3188,6 +3192,18 @@ def api_conversation_status(conversation_id):
 		return _json_response({"success": True, "conversation": conversation})
 	except ValueError as exc:
 		return _json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/conversations/<conversation_id>", method="DELETE")
+def api_conversation_delete(conversation_id):
+	body = request.json or {}
+	if body.get("confirmation") != "DELETE_LOCAL_CONVERSATION":
+		return _json_response({"error": "删除本地会话需要二次确认"}, 400)
+	try:
+		result = _conversation_repo().delete_conversation(conversation_id)
+		return _json_response({"success": True, **result})
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 404)
 
 
 @app.route("/api/conversations/<conversation_id>/draft", method="POST")

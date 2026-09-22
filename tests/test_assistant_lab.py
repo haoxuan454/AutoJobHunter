@@ -52,6 +52,18 @@ class AssistantLabContextTests(unittest.TestCase):
         self.assertNotIn("A 公司的", assistant_lab._conversation_context(self.conn, "session-b"))
         self.assertIn("B 公司的", assistant_lab._conversation_context(self.conn, "session-b"))
 
+    @patch("bosshunter.assistant_lab.search_confirmed_facts", return_value=[])
+    def test_default_session_is_stable_and_reset_is_scoped(self, facts):
+        first = assistant_lab.session_payload(self.conn)
+        assistant_lab.send_message(self.conn, self.knowledge, {}, None, "第一条问题")
+        second = assistant_lab.session_payload(self.conn)
+        self.assertEqual(first["session"]["id"], assistant_lab.DEFAULT_SESSION_ID)
+        self.assertEqual(second["session"]["id"], assistant_lab.DEFAULT_SESSION_ID)
+        self.assertEqual(len(second["messages"]), 2)
+        assistant_lab.reset(self.conn)
+        self.assertEqual(assistant_lab.session_payload(self.conn)["session"]["id"], assistant_lab.DEFAULT_SESSION_ID)
+        self.assertEqual(assistant_lab.session_payload(self.conn)["messages"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

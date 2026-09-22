@@ -171,6 +171,20 @@ CREATE TABLE conv_sync_cursors (
     CONSTRAINT fk_conv_cursor_conversation FOREIGN KEY (conversation_id) REFERENCES conv_conversations(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+CREATE TABLE conv_deleted_conversations (
+    conversation_id CHAR(36) NOT NULL PRIMARY KEY,
+    user_id BIGINT UNSIGNED NOT NULL,
+    platform VARCHAR(32) NOT NULL,
+    external_conversation_id VARCHAR(255) NULL,
+    hr_external_id VARCHAR(255) NULL,
+    company_id BIGINT UNSIGNED NULL,
+    job_id BIGINT UNSIGNED NULL,
+    deleted_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    UNIQUE KEY uq_conv_deleted_external (user_id, platform, external_conversation_id),
+    KEY idx_conv_deleted_platform (user_id, platform, deleted_at),
+    CONSTRAINT fk_conv_deleted_user FOREIGN KEY (user_id) REFERENCES sys_users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
 CREATE TABLE notification_outbox (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
     conversation_id CHAR(36) NOT NULL,

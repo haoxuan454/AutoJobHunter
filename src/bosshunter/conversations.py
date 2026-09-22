@@ -145,6 +145,21 @@ def init_conversation_tables(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_conv_drafts_conversation
             ON conv_drafts(conversation_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS conv_deleted_conversations (
+            conversation_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL DEFAULT 'default',
+            platform TEXT NOT NULL,
+            external_conversation_id TEXT,
+            hr_external_id TEXT,
+            company_id TEXT,
+            job_id TEXT,
+            deleted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_conv_deleted_external_identity
+            ON conv_deleted_conversations(user_id, platform, external_conversation_id)
+            WHERE external_conversation_id IS NOT NULL
+              AND external_conversation_id != '';
         """
     )
     conn.commit()
@@ -214,6 +229,13 @@ class ConversationRepository:
             "SELECT * FROM conv_conversations WHERE id = ?", (conversation_id,)
         ).fetchone()
         return dict(row) if row else None
+
+    def is_deleted(self, conversation_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM conv_deleted_conversations WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        return bool(row)
 
     def append_messages(self, conversation_id: str, messages: Iterable[IncomingMessage]) -> list[dict[str, Any]]:
         if not self.get_conversation(conversation_id):
@@ -311,9 +333,28 @@ class ConversationRepository:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def list_conversations(self, user_id: str = "default") -> list[dict[str, Any]]:
+    def list_conversations(self, user_id: str = "default", sort: str = "recent") -> list[dict[str, Any]]:
+        if sort not in {"recent", "frequency", "created"}:
+            raise ValueError("unsupported conversation sort")
+        order_by = {
+            "recent": "COALESCE(c.last_message_at, c.updated_at) DESC, c.id DESC",
+            "frequency": "round_count DESC, COALESCE(c.last_message_at, c.updated_at) DESC, c.id DESC",
+            "created": "c.created_at DESC, c.id DESC",
+        }[sort]
         rows = self.conn.execute(
-            "SELECT * FROM conv_conversations WHERE user_id = ? ORDER BY updated_at DESC, id DESC",
+            f"""SELECT c.*,
+                       COUNT(m.id) AS message_count,
+                       SUM(CASE WHEN m.sender_type = 'hr' THEN 1 ELSE 0 END) AS hr_message_count,
+                       SUM(CASE WHEN m.sender_type IN ('user', 'ai') THEN 1 ELSE 0 END) AS user_message_count,
+                       SUM(CASE WHEN m.sender_type = 'hr' THEN 1 ELSE 0 END) AS round_count,
+                       (SELECT m2.content FROM conv_messages m2
+                          WHERE m2.conversation_id = c.id
+                          ORDER BY COALESCE(m2.message_time, m2.created_at) DESC, m2.id DESC LIMIT 1) AS last_message_preview
+                FROM conv_conversations c
+                LEFT JOIN conv_messages m ON m.conversation_id = c.id
+                WHERE c.user_id = ?
+                GROUP BY c.id
+                ORDER BY {order_by}""",
             (user_id,),
         ).fetchall()
         return [dict(row) for row in rows]
@@ -330,6 +371,33 @@ class ConversationRepository:
         if not row:
             raise ValueError(f"conversation does not exist: {conversation_id}")
         return row
+
+    def delete_conversation(self, conversation_id: str, user_id: str = "default") -> dict[str, Any]:
+        """Delete local records and retain a tombstone so sync cannot recreate them."""
+        row = self.get_conversation(conversation_id)
+        if not row or row.get("user_id") != user_id:
+            raise ValueError("conversation does not exist")
+        self.conn.execute("BEGIN")
+        try:
+            self.conn.execute(
+                """INSERT OR REPLACE INTO conv_deleted_conversations
+                   (conversation_id, user_id, platform, external_conversation_id,
+                    hr_external_id, company_id, job_id, deleted_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    row["id"], row["user_id"], row["platform"], row.get("external_conversation_id"),
+                    row.get("hr_external_id"), row.get("company_id"), row.get("job_id"), utc_now(),
+                ),
+            )
+            self.conn.execute("DELETE FROM conv_drafts WHERE conversation_id = ?", (conversation_id,))
+            self.conn.execute("DELETE FROM conv_messages WHERE conversation_id = ?", (conversation_id,))
+            self.conn.execute("DELETE FROM conv_sync_cursors WHERE conversation_id = ?", (conversation_id,))
+            self.conn.execute("DELETE FROM conv_conversations WHERE id = ? AND user_id = ?", (conversation_id, user_id))
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return {"conversation_id": conversation_id, "deleted": True, "platform_untouched": True}
 
     def save_draft(self, conversation_id: str, draft_text: str, trigger_message_id: int | None = None) -> dict[str, Any]:
         if not self.get_conversation(conversation_id):

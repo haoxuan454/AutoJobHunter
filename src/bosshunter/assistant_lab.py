@@ -10,10 +10,11 @@ import sqlite3
 import re
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from bosshunter.ai.credentials import AIRequestError, call_anthropic_text, get_ai_api_key
 from bosshunter.knowledge import search_confirmed_facts
+
+DEFAULT_SESSION_ID = "assistant-lab:default"
 
 
 def _init(conn: sqlite3.Connection) -> None:
@@ -50,7 +51,7 @@ def open_sandbox(path: Path) -> sqlite3.Connection:
 
 def ensure_session(conn: sqlite3.Connection, session_id: str | None = None) -> dict[str, Any]:
     _init(conn)
-    session_id = str(session_id or "").strip() or str(uuid4())
+    session_id = str(session_id or "").strip() or DEFAULT_SESSION_ID
     row = conn.execute("SELECT * FROM lab_sessions WHERE id = ?", (session_id,)).fetchone()
     if row:
         return dict(row)
@@ -166,7 +167,7 @@ def send_message(conn: sqlite3.Connection, knowledge_conn: sqlite3.Connection, c
     conn.execute("INSERT INTO lab_messages (session_id, sender_type, content, retrieved_fact_ids, generation_mode, sent) VALUES (?, 'ai', ?, ?, ?, 0)", (session["id"], draft, fact_ids, mode))
     conn.execute("UPDATE lab_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session["id"],))
     conn.commit()
-    return {"session": ensure_session(conn, session["id"]), "messages": list_messages(conn, session["id"]), "retrieved_facts": facts, "sent": False, "generation_mode": mode, "model_error": model_error}
+    return {"session": ensure_session(conn, session["id"]), "messages": list_messages(conn, session["id"])[-10:], "retrieved_facts": facts, "sent": False, "generation_mode": mode, "model_error": model_error}
 
 
 def list_messages(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
@@ -176,12 +177,12 @@ def list_messages(conn: sqlite3.Connection, session_id: str) -> list[dict[str, A
 
 def session_payload(conn: sqlite3.Connection, session_id: str | None = None) -> dict[str, Any]:
     session = ensure_session(conn, session_id)
-    return {"session": session, "messages": list_messages(conn, session["id"]), "sent": False}
+    return {"session": session, "messages": list_messages(conn, session["id"])[-10:], "sent": False}
 
 
 def reset(conn: sqlite3.Connection) -> dict[str, Any]:
     _init(conn)
-    conn.execute("DELETE FROM lab_messages")
-    conn.execute("DELETE FROM lab_sessions")
+    conn.execute("DELETE FROM lab_messages WHERE session_id = ?", (DEFAULT_SESSION_ID,))
+    conn.execute("DELETE FROM lab_sessions WHERE id = ?", (DEFAULT_SESSION_ID,))
     conn.commit()
     return session_payload(conn)

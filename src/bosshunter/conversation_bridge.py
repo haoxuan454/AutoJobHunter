@@ -37,6 +37,8 @@ def sync_extracted_messages(
     conversation = conversation or {}
     repo = ConversationRepository(conn)
     conversation_id = _stable_conversation_id(job, conversation, platform)
+    if repo.is_deleted(conversation_id):
+        return {"conversation": None, "inserted": [], "notification": None, "notifications": [], "deleted": True}
     existing = repo.get_conversation(conversation_id)
     record = repo.upsert_conversation({
         "id": conversation_id,
