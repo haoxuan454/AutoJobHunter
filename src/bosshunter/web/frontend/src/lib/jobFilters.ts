@@ -46,17 +46,29 @@ export function hasActiveJobFilters(filters: JobFilters) {
 }
 
 function parseMonthlySalaryK(salary: string): [number, number] | null {
-  const range = salary.match(/(\d+(?:\.\d+)?)\s*[kK]?\s*-\s*(\d+(?:\.\d+)?)\s*[kK]/)
+  const normalized = (salary || '').replace(/，/g, ',')
+  if (!normalized || normalized.includes('面议') || /\/(?:天|日|小时|时)/.test(normalized)) return null
+  const convert = (value: number, unit: string, source: string) => {
+    if (unit.toLowerCase() === 'k') return value
+    if (unit === '万') return value * 10
+    if (unit === '千') return value
+    return /(?:元\/月|元／月|块\/月|月薪|每月|月工资)/.test(source) ? value / 1000 : null
+  }
+  const range = normalized.match(/(\d+(?:\.\d+)?)\s*([kK万千]?)\s*[-~至到]\s*(\d+(?:\.\d+)?)\s*([kK万千]?)/)
   if (range) {
-    const low = Number(range[1])
-    const high = Number(range[2])
-    return [Math.min(low, high), Math.max(low, high)]
+    const left = convert(Number(range[1]), range[2] || range[4], normalized)
+    const right = convert(Number(range[3]), range[4] || range[2], normalized)
+    if (left !== null && right !== null) return [Math.min(left, right), Math.max(left, right)]
   }
-  const single = salary.match(/(\d+(?:\.\d+)?)\s*[kK](?!\w)/)
+  const single = normalized.match(/(\d+(?:\.\d+)?)\s*([kK万千])/)
   if (single) {
-    const value = Number(single[1])
-    return [value, value]
+    const value = convert(Number(single[1]), single[2], normalized)
+    if (value !== null) return [value, /(?:以上|起|底薪)/.test(normalized) ? Number.POSITIVE_INFINITY : value]
   }
+  const plainRange = normalized.match(/(\d+(?:\.\d+)?)\s*[-~至到]\s*(\d+(?:\.\d+)?)\s*(?:元|块)?\s*\/?\s*月/)
+  if (plainRange) return [Math.min(Number(plainRange[1]), Number(plainRange[2])) / 1000, Math.max(Number(plainRange[1]), Number(plainRange[2])) / 1000]
+  const plainSingle = normalized.match(/(\d+(?:\.\d+)?)\s*(?:元|块)\s*\/?\s*月/)
+  if (plainSingle) return [Number(plainSingle[1]) / 1000, Number(plainSingle[1]) / 1000]
   return null
 }
 

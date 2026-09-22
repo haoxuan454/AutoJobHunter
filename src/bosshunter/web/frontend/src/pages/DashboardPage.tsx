@@ -1583,7 +1583,12 @@ function JobsPoolView() {
   const [permanentDeleteIds, setPermanentDeleteIds] = useState<string[]>([])
   const [permanentDeleteAcknowledged, setPermanentDeleteAcknowledged] = useState(false)
   const [bulkSelecting, setBulkSelecting] = useState(false)
+  const [bulkScope, setBulkScope] = useState('')
   const { items, total, allTotal, loading, error, refresh: refreshJobs } = useJobSearch(filters, page, pageSize, sortBy, sortOrder)
+  const displayItems = useMemo(
+    () => [...items].sort((left, right) => Number(selectedIds.includes(right.id)) - Number(selectedIds.includes(left.id))),
+    [items, selectedIds],
+  )
   const { workbench: deliveryWorkbench } = useDashboard('workbench')
   const deliveryTask = deliveryWorkbench.task?.mode === 'deliver'
     ? deliveryWorkbench.task
@@ -1631,6 +1636,7 @@ function JobsPoolView() {
         }
       }
       setSelectedIds([...selected])
+      setBulkScope(scope)
       setNotice(`已从数据库查询并选择 ${selected.size} 个岗位，可继续批量移入回收站`)
     } catch (cause) {
       setNotice(cause instanceof Error ? cause.message : '批量选择岗位失败')
@@ -1923,9 +1929,9 @@ function JobsPoolView() {
           {allPageSelected ? '取消选择本页' : '选择本页'}
         </Button>
         <select
-          defaultValue=""
+          value={bulkScope}
           disabled={bulkSelecting}
-          onChange={event => { void selectJobsByScope(event.target.value); event.target.value = '' }}
+          onChange={event => { const nextScope = event.target.value; setBulkScope(nextScope); void selectJobsByScope(nextScope) }}
           className="rounded-lg border border-card-border bg-white px-3 py-2 text-xs font-bold"
           aria-label="按状态批量选择岗位"
         >
@@ -1968,7 +1974,7 @@ function JobsPoolView() {
       )}
       {error && <div className="mb-4 rounded-xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-danger">{error}</div>}
       <JobsTable
-        jobs={items}
+        jobs={displayItems}
         page={page}
         pageSize={pageSize}
         total={total}

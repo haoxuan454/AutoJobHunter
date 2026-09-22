@@ -111,6 +111,15 @@ class SalaryParseEdgeCaseTests(unittest.TestCase):
     def test_lowercase_k(self):
         self.assertEqual(parse_monthly_salary_k("10-15k"), (10.0, 15.0))
 
+    def test_cross_platform_monthly_salary_formats(self):
+        self.assertEqual(parse_monthly_salary_k("8000-12000元/月"), (8.0, 12.0))
+        self.assertEqual(parse_monthly_salary_k("8千-12千"), (8.0, 12.0))
+        self.assertEqual(parse_monthly_salary_k("1.5-2.5万"), (15.0, 25.0))
+        self.assertEqual(parse_monthly_salary_k("15K以上"), (15.0, float("inf")))
+
+    def test_daily_salary_is_not_treated_as_monthly(self):
+        self.assertIsNone(parse_monthly_salary_k("150-200元/天"))
+
 
 if __name__ == "__main__":
     unittest.main()
