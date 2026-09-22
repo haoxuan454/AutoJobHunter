@@ -156,6 +156,24 @@ class ConversationWebFlowTests(unittest.TestCase):
         self.assertTrue(deleted["platform_untouched"])
         self.assertTrue(self.request("/api/conversations/c-delete")[0].startswith("404"))
 
+    def test_assistant_lab_history_is_projected_to_one_center_conversation(self):
+        status, first = self.request("/api/assistant-lab/session")
+        self.assertTrue(status.startswith("200"), first)
+        self.assertEqual(first["session"]["id"], "assistant-lab:default")
+        status, sent = self.request("/api/assistant-lab/messages", "POST", {"content": "你之前做过哪些 Python 项目？"})
+        self.assertTrue(status.startswith("200"), sent)
+        status, sent_again = self.request("/api/assistant-lab/messages", "POST", {"session_id": "old-uuid-that-must-be-ignored", "content": "细说一下具体负责什么？"})
+        self.assertTrue(status.startswith("200"), sent_again)
+        self.assertEqual(sent_again["session"]["id"], "assistant-lab:default")
+        status, listed = self.request("/api/conversations?sort=frequency")
+        self.assertTrue(status.startswith("200"), listed)
+        lab = [item for item in listed["conversations"] if item["platform"] == "assistant_lab"]
+        self.assertEqual(len(lab), 1)
+        self.assertEqual(lab[0]["round_count"], 2)
+        detail_status, detail = self.request("/api/conversations/assistant-lab%3Aassistant-lab%3Adefault")
+        self.assertTrue(detail_status.startswith("200"), detail)
+        self.assertEqual(len(detail["messages"]), 4)
+
 
 if __name__ == "__main__":
     unittest.main()

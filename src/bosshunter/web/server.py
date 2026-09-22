@@ -8,7 +8,7 @@ Serves:
 import json
 import smtplib
 from ipaddress import ip_address
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 import math
 import mimetypes
 import random
@@ -114,7 +114,7 @@ from bosshunter.web.tasks import (
 )
 from bosshunter.conversations import ConversationRepository, IncomingMessage
 from bosshunter.conversation_scheduler import SerialConversationScheduler, init_scheduler_tables
-from bosshunter.assistant_lab import open_sandbox, reset as reset_lab, send_message as lab_send_message, session_payload as lab_session_payload
+from bosshunter.assistant_lab import list_messages as lab_list_messages, open_sandbox, reset as reset_lab, send_message as lab_send_message, session_payload as lab_session_payload
 from bosshunter.interview_practice import create_session as create_interview_session, evaluate_round as evaluate_interview_round, generate_question as generate_interview_question, list_sessions as list_interview_sessions
 from bosshunter.voice_assistant import generate_reply as generate_voice_reply
 from bosshunter.common_questions import delete_common_question, init_common_question_tables, list_common_questions, update_common_question, upsert_common_question
@@ -136,7 +136,7 @@ from bosshunter.notifications import (
 	save_email_settings,
 	send_outbox_item,
 )
-from bosshunter.notification_service import process_hr_message, process_lab_message
+from bosshunter.notification_service import process_hr_message, process_lab_message, sync_assistant_lab_history
 from bosshunter.daily_summary import (
 	generate_daily_summary,
 	load_daily_summary_settings,
@@ -2778,7 +2778,13 @@ def _assistant_lab_db_path() -> Path:
 def api_assistant_lab_session():
 	conn = open_sandbox(_assistant_lab_db_path())
 	try:
-		return _json_response(lab_session_payload(conn, request.query.get("session_id")))
+		payload = lab_session_payload(conn)
+		main_conn = _get_web_db()
+		try:
+			sync_assistant_lab_history(main_conn, lab_list_messages(conn, payload["session"]["id"]))
+		finally:
+			main_conn.close()
+		return _json_response(payload)
 	finally:
 		conn.close()
 
@@ -2794,7 +2800,12 @@ def api_assistant_lab_message():
 		sandbox_conn = open_sandbox(_assistant_lab_db_path())
 		try:
 			config = load_config(CONFIG_PATH)
-			result = lab_send_message(sandbox_conn, knowledge_conn, config, body.get("session_id"), question)
+			result = lab_send_message(sandbox_conn, knowledge_conn, config, None, question)
+			notification_conn = _get_web_db()
+			try:
+				sync_assistant_lab_history(notification_conn, lab_list_messages(sandbox_conn, result["session"]["id"]))
+			finally:
+				notification_conn.close()
 			if bool(body.get("notification_test")):
 				notification_conn = _get_web_db()
 				try:
@@ -3136,8 +3147,20 @@ def api_conversation_create():
 		return _json_response({"error": str(exc)}, 400)
 
 
+def _decoded_conversation_id(conversation_id: str) -> str:
+	"""Normalize IDs captured from encoded Bottle path parameters.
+
+	Conversation IDs contain separators such as ``:``. Browsers correctly
+	percent-encode those IDs in links and fetch requests, but the WSGI path
+	parameter is not consistently decoded by every Bottle/server combination.
+	Keep the transport encoding and normalize once at the API boundary.
+	"""
+	return unquote(str(conversation_id or "")).strip()
+
+
 @app.route("/api/conversations/<conversation_id>")
 def api_conversation_detail(conversation_id):
+	conversation_id = _decoded_conversation_id(conversation_id)
 	repo = _conversation_repo()
 	conversation = repo.get_conversation(conversation_id)
 	if not conversation:
@@ -3151,6 +3174,7 @@ def api_conversation_detail(conversation_id):
 
 @app.route("/api/conversations/<conversation_id>/messages", method="POST")
 def api_conversation_messages(conversation_id):
+	conversation_id = _decoded_conversation_id(conversation_id)
 	body = request.json or {}
 	items = body.get("messages") if isinstance(body.get("messages"), list) else [body]
 	try:
@@ -3184,6 +3208,7 @@ def api_conversation_messages(conversation_id):
 
 @app.route("/api/conversations/<conversation_id>/status", method="POST")
 def api_conversation_status(conversation_id):
+	conversation_id = _decoded_conversation_id(conversation_id)
 	body = request.json or {}
 	try:
 		conversation = _conversation_repo().update_status(
@@ -3196,6 +3221,7 @@ def api_conversation_status(conversation_id):
 
 @app.route("/api/conversations/<conversation_id>", method="DELETE")
 def api_conversation_delete(conversation_id):
+	conversation_id = _decoded_conversation_id(conversation_id)
 	body = request.json or {}
 	if body.get("confirmation") != "DELETE_LOCAL_CONVERSATION":
 		return _json_response({"error": "删除本地会话需要二次确认"}, 400)
@@ -3209,6 +3235,7 @@ def api_conversation_delete(conversation_id):
 @app.route("/api/conversations/<conversation_id>/draft", method="POST")
 def api_conversation_draft(conversation_id):
 	"""Generate an evidence-only draft; this endpoint never sends to a platform."""
+	conversation_id = _decoded_conversation_id(conversation_id)
 	repo = _conversation_repo()
 	conversation = repo.get_conversation(conversation_id)
 	if not conversation:

@@ -30,6 +30,12 @@ class ConversationRepositoryTests(unittest.TestCase):
         self.assertEqual(len(self.repo.append_messages("conv-1", [message, message])), 1)
         self.assertEqual(len(self.repo.list_messages("conv-1")), 1)
 
+    def test_distinct_platform_ids_preserve_identical_messages(self):
+        first = IncomingMessage("ai", "same reply", "2026-09-19T01:02:00+08:00", "lab-1")
+        second = IncomingMessage("ai", "same reply", "2026-09-19T01:02:00+08:00", "lab-2")
+        self.assertEqual(len(self.repo.append_messages("conv-1", [first, second])), 2)
+        self.assertEqual(len(self.repo.list_messages("conv-1")), 2)
+
     def test_cursor_is_saved_and_updated_on_conversation(self):
         self.assertIsNone(self.repo.get_cursor("conv-1"))
         self.repo.save_cursor("conv-1", "cursor-10")

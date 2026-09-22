@@ -8,9 +8,42 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from bosshunter.conversations import ConversationRepository
+from bosshunter.conversations import ConversationRepository, IncomingMessage
 from bosshunter.notification_classifier import CATEGORY_LABELS, classify_hr_message
 from bosshunter.notifications import enqueue_alert, load_email_settings, send_outbox_item
+
+ASSISTANT_LAB_CONVERSATION_ID = "assistant-lab:assistant-lab:default"
+
+
+def sync_assistant_lab_history(conn: sqlite3.Connection, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Project the local rehearsal transcript into one read-only center conversation."""
+    repo = ConversationRepository(conn)
+    existing = repo.get_conversation(ASSISTANT_LAB_CONVERSATION_ID)
+    conversation = repo.upsert_conversation({
+        "id": ASSISTANT_LAB_CONVERSATION_ID,
+        "platform": "assistant_lab",
+        "external_conversation_id": ASSISTANT_LAB_CONVERSATION_ID,
+        "hr_name": "AI 回复演练 HR",
+        "hr_title": "演练岗位",
+        "company_id": "AI 回复演练",
+        "hr_profile_url": "http://127.0.0.1:8686/assistant-lab",
+        "status": str((existing or {}).get("status") or "active"),
+    })
+    incoming = []
+    for item in messages:
+        sender_type = "hr" if item.get("sender_type") == "hr" else "ai"
+        incoming.append(IncomingMessage(
+            sender_type=sender_type,
+            content=str(item.get("content") or ""),
+            message_time=item.get("created_at"),
+            platform_message_id=f"assistant-lab-message:{item.get('id')}",
+            source_url="http://127.0.0.1:8686/assistant-lab",
+            raw_payload={"lab_message_id": item.get("id")},
+            is_ai_generated=sender_type == "ai",
+            is_sent=sender_type == "ai",
+        ))
+    repo.append_messages(ASSISTANT_LAB_CONVERSATION_ID, incoming)
+    return repo.get_conversation(ASSISTANT_LAB_CONVERSATION_ID) or conversation
 
 
 def _email_html(*, category: str, confidence: float, summary: str, conversation: dict[str, Any], message: str, source: str) -> str:
@@ -119,7 +152,7 @@ def process_lab_message(
     allow_send: bool = False,
 ) -> dict[str, Any]:
     """Use a synthetic conversation for explicit Assistant Lab notification tests."""
-    conversation_id = f"assistant-lab:{session_id}"
+    conversation_id = ASSISTANT_LAB_CONVERSATION_ID
     repo = ConversationRepository(conn)
     repo.upsert_conversation({
         "id": conversation_id,

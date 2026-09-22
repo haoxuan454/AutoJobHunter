@@ -119,8 +119,13 @@ def init_conversation_tables(conn: sqlite3.Connection) -> None:
             ON conv_messages(conversation_id, platform_message_id)
             WHERE platform_message_id IS NOT NULL
               AND platform_message_id != '';
+        -- Keep content fallback identity for legacy rows without a platform
+        -- ID. Rows with an authoritative platform ID may legitimately share
+        -- timestamp and content with another message.
+        DROP INDEX IF EXISTS uq_conv_fallback_message;
         CREATE UNIQUE INDEX IF NOT EXISTS uq_conv_fallback_message
-            ON conv_messages(conversation_id, sender_type, message_time, content_hash);
+            ON conv_messages(conversation_id, sender_type, message_time, content_hash)
+            WHERE platform_message_id IS NULL OR platform_message_id = '';
         CREATE INDEX IF NOT EXISTS idx_conv_messages_time
             ON conv_messages(conversation_id, message_time, id);
 
@@ -255,7 +260,11 @@ class ConversationRepository:
                     "SELECT * FROM conv_messages WHERE conversation_id = ? AND platform_message_id = ?",
                     (conversation_id, message.platform_message_id),
                 ).fetchone()
-            if existing is None:
+            # A platform message ID is the authoritative identity. Content-based
+            # fallback deduplication is only for legacy messages that have no
+            # platform ID; otherwise two legitimate identical replies in one
+            # conversation can be collapsed into one row.
+            if existing is None and not message.platform_message_id:
                 existing = self.conn.execute(
                     """SELECT * FROM conv_messages
                        WHERE conversation_id = ? AND sender_type = ?
@@ -353,6 +362,7 @@ class ConversationRepository:
                 FROM conv_conversations c
                 LEFT JOIN conv_messages m ON m.conversation_id = c.id
                 WHERE c.user_id = ?
+                  AND NOT (c.platform = 'assistant_lab' AND c.id <> 'assistant-lab:assistant-lab:default')
                 GROUP BY c.id
                 ORDER BY {order_by}""",
             (user_id,),

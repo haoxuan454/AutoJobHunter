@@ -46,7 +46,35 @@ def open_sandbox(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     _init(conn)
+    migrate_legacy_sessions(conn)
     return conn
+
+
+def migrate_legacy_sessions(conn: sqlite3.Connection) -> None:
+    """Merge old UUID-based rehearsal messages into the single default session."""
+    default = conn.execute("SELECT 1 FROM lab_messages WHERE session_id = ? LIMIT 1", (DEFAULT_SESSION_ID,)).fetchone()
+    if default:
+        return
+    legacy = conn.execute(
+        """SELECT m.sender_type, m.content, m.retrieved_fact_ids, m.generation_mode,
+                         m.sent, m.created_at
+             FROM lab_messages m
+             WHERE m.session_id <> ?
+             ORDER BY m.created_at, m.id""",
+        (DEFAULT_SESSION_ID,),
+    ).fetchall()
+    if not legacy:
+        return
+    ensure_session(conn, DEFAULT_SESSION_ID)
+    for row in legacy:
+        conn.execute(
+            """INSERT INTO lab_messages
+               (session_id, sender_type, content, retrieved_fact_ids, generation_mode, sent, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (DEFAULT_SESSION_ID, row[0], row[1], row[2], row[3], row[4], row[5]),
+        )
+    conn.execute("UPDATE lab_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (DEFAULT_SESSION_ID,))
+    conn.commit()
 
 
 def ensure_session(conn: sqlite3.Connection, session_id: str | None = None) -> dict[str, Any]:
