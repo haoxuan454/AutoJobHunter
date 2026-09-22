@@ -3,15 +3,15 @@ import { Activity, AudioLines, BarChart3, BookOpen, BriefcaseBusiness, Coins, Fl
 import { useEffect, useState } from 'react'
 
 const navItems = [
-  { to: '/voice-assistant', icon: AudioLines, label: '语音求职助手' },
-  { to: '/assistant-lab', icon: FlaskConical, label: 'AI 回复演练' },
-  { to: '/common-questions', icon: ListChecks, label: '共性问题库' },
   { to: '/', icon: LayoutDashboard, label: '工作台' },
   { to: '/jobs', icon: BriefcaseBusiness, label: '岗位池' },
-  { to: '/monitor', icon: Radar, label: '监测执行' },
-  { to: '/knowledge', icon: BookOpen, label: '个人知识库' },
   { to: '/conversations', icon: MessageSquare, label: 'HR 会话' },
+  { to: '/monitor', icon: Radar, label: '监测执行' },
   { to: '/analytics', icon: BarChart3, label: '数据分析' },
+  { to: '/knowledge', icon: BookOpen, label: '个人知识库' },
+  { to: '/common-questions', icon: ListChecks, label: '共性问题库' },
+  { to: '/assistant-lab', icon: FlaskConical, label: 'AI 回复演练' },
+  { to: '/voice-assistant', icon: AudioLines, label: '语音求职助手' },
   { to: '/ai-usage', icon: Coins, label: 'Token 消耗' },
   { to: '/config', icon: Settings, label: '配置' },
 ]

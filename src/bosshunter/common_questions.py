@@ -52,9 +52,28 @@ def _key(question: str) -> str:
     return hashlib.sha256(_normalize_question(question).encode("utf-8")).hexdigest()
 
 
-def list_common_questions(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def list_common_questions(
+    conn: sqlite3.Connection,
+    query: str = "",
+    sort: str = "occurrence",
+) -> list[dict[str, Any]]:
+    """List reusable questions with database-backed search and ordering."""
     init_common_question_tables(conn)
-    return [dict(row) for row in conn.execute("SELECT * FROM common_questions ORDER BY updated_at DESC, id DESC").fetchall()]
+    order_by = {
+        "occurrence": "occurrence_count DESC, updated_at DESC, id DESC",
+        "updated": "updated_at DESC, id DESC",
+    }.get(str(sort or "occurrence"))
+    if not order_by:
+        raise ValueError("unsupported common question sort")
+    query = str(query or "").strip()
+    if query:
+        rows = conn.execute(
+            f"SELECT * FROM common_questions WHERE question LIKE ? ORDER BY {order_by}",
+            (f"%{query}%",),
+        ).fetchall()
+    else:
+        rows = conn.execute(f"SELECT * FROM common_questions ORDER BY {order_by}").fetchall()
+    return [dict(row) for row in rows]
 
 
 def upsert_common_question(conn: sqlite3.Connection, question: str, answer: str, source_key: str | None = None) -> dict[str, Any] | None:

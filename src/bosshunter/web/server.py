@@ -2960,7 +2960,13 @@ def api_interview_practice_save_common_question():
 def api_common_questions():
 	conn = _get_web_db()
 	try:
-		return _json_response({"questions": list_common_questions(conn)})
+		query = str(request.query.getunicode("q") or "").strip()
+		sort = str(request.query.get("sort") or "occurrence").strip()
+		if sort not in {"occurrence", "updated"}:
+			return _json_response({"error": "排序规则无效"}, 400)
+		return _json_response({"questions": list_common_questions(conn, query=query, sort=sort), "query": query, "sort": sort})
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 400)
 	finally:
 		conn.close()
 
