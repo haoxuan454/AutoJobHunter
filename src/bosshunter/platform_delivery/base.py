@@ -32,6 +32,9 @@ class DeliveryAdapter(Protocol):
     def send_greeting(self, job: dict, greeting: str, context: DeliveryContext) -> DeliveryResult:
         ...
 
+    def start_conversation(self, job: dict, context: DeliveryContext) -> DeliveryResult:
+        ...
+
 
 class UnverifiedDeliveryAdapter:
     """Fail closed until a platform-specific DOM acceptance test is approved."""

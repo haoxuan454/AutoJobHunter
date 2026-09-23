@@ -917,8 +917,10 @@ def get_jobs_ready_to_send(
         SELECT * FROM jobs
         WHERE status IN ('ready', 'approved')
           AND deleted_at IS NULL
-          AND greeting IS NOT NULL
-          AND TRIM(greeting) != ''
+          AND (
+              COALESCE(source_platform, 'boss') = 'zhilian'
+              OR (greeting IS NOT NULL AND TRIM(greeting) != '')
+          )
           {review_filter}
           AND (status = 'approved' OR NOT EXISTS (
               SELECT 1 FROM history AS evaluation
@@ -940,8 +942,10 @@ def get_jobs_with_send_errors(conn: sqlite3.Connection) -> list[dict]:
         SELECT * FROM jobs
         WHERE status = 'error'
           AND deleted_at IS NULL
-          AND greeting IS NOT NULL
-          AND TRIM(greeting) != ''
+          AND (
+              COALESCE(source_platform, 'boss') = 'zhilian'
+              OR (greeting IS NOT NULL AND TRIM(greeting) != '')
+          )
         ORDER BY updated_at DESC, score DESC
     """).fetchall()
     return [dict(row) for row in rows]

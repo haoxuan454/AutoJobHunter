@@ -1745,7 +1745,7 @@ def api_workbench_task_start():
 			]
 			if collection_only:
 				return _json_response({
-					"error": "智联和前程无忧当前只支持单独采集，不能进入发送全流程",
+					"error": "当前所选平台中仍有未开放发送全流程的平台",
 					"collection_only_platforms": collection_only,
 				}, 400)
 			collection_options["auto_score"] = True
@@ -1912,6 +1912,7 @@ def api_workbench_deliver():
 				str(row["id"])
 				for row in platform_rows
 				if direct_send
+				and str(row["source_platform"] or "boss") != "zhilian"
 				and str(row["status"] or "") in allowed_statuses
 				and not str(row["greeting"] or "").strip()
 			}
@@ -3641,7 +3642,7 @@ def api_agent_task_start():
 				]
 				if collection_only:
 					return _json_response({
-						"error": "智联、前程无忧和猎聘只能单独采集，不能进入投递全流程",
+						"error": "当前所选平台中仍有未开放发送全流程的平台",
 						"collection_only_platforms": collection_only,
 					}, 400)
 				options["auto_score"] = True

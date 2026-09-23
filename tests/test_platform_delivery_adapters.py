@@ -1,6 +1,7 @@
 import unittest
 
 from bosshunter.platform_delivery import DeliveryContext, get_delivery_adapter
+from bosshunter.platform_delivery.zhilian import ZhilianDeliveryAdapter
 
 
 class PlatformDeliveryAdapterTests(unittest.TestCase):
@@ -21,8 +22,9 @@ class PlatformDeliveryAdapterTests(unittest.TestCase):
             self.assertEqual(result.error, "platform_delivery_not_verified")
             self.assertIn("不会复用 BOSS", result.history_detail)
 
-    def test_real_adapters_are_not_marked_verified_before_acceptance(self):
-        for platform in ("zhilian", "51job", "liepin"):
+    def test_only_accepted_zhilian_adapter_is_marked_verified(self):
+        self.assertTrue(get_delivery_adapter("zhilian").verified)
+        for platform in ("51job", "liepin"):
             self.assertFalse(get_delivery_adapter(platform).verified)
 
     def test_boss_adapter_does_not_bypass_legacy_sender(self):
@@ -31,6 +33,108 @@ class PlatformDeliveryAdapterTests(unittest.TestCase):
         )
         self.assertFalse(result.success)
         self.assertEqual(result.error, "legacy_sender_required")
+
+    def test_zhilian_generic_greeting_never_sends_ai_first_message(self):
+        result = ZhilianDeliveryAdapter().send_greeting({}, "AI 不应发送", DeliveryContext(dry_run=False))
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "platform_managed_first_contact")
+
+    def test_zhilian_contact_state_is_company_scoped(self):
+        self.assertEqual(ZhilianDeliveryAdapter.contact_scope, "company")
+
+    def test_zhilian_platform_flow_clicks_default_greeting_and_verifies(self):
+        import json
+        from unittest.mock import patch
+
+        calls = []
+
+        def fake_open(_job):
+            return "zhilian-target", None
+
+        def fake_click(target, selectors):
+            calls.append((target, selectors))
+            return {"success": True, "selector": selectors[0]}
+
+        def fake_eval(_target, _expression, timeout=15):
+            if "getBoundingClientRect" in _expression:
+                return json.dumps({"success": True, "visible": True, "confirmation": True})
+            return json.dumps({"success": True, "modalVisible": False, "hasConversationEntry": True})
+
+        with patch("bosshunter.platform_delivery.zhilian._open_zhilian_job", fake_open), \
+             patch("bosshunter.platform_delivery.zhilian.inspect_page", return_value={"login_required": False}), \
+             patch("bosshunter.platform_delivery.zhilian._entry_state", return_value={"mode": "first_contact"}), \
+             patch("bosshunter.platform_delivery.zhilian._click_zhilian_selector", fake_click), \
+             patch("bosshunter.platform_delivery.zhilian.evaluate", fake_eval), \
+             patch("bosshunter.platform_delivery.zhilian.close_tab"):
+            result = ZhilianDeliveryAdapter().start_conversation(
+                {"url": "https://www.zhaopin.com/jobdetail/example"},
+                DeliveryContext(),
+            )
+        self.assertTrue(result.success)
+        self.assertTrue(result.verified)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("deliver-greeting-modal", calls[1][1][0])
+
+    def test_zhilian_hidden_modal_template_is_accepted_after_entry_changes(self):
+        from unittest.mock import patch
+
+        states = iter([
+            {"success": True, "visible": False, "confirmation": True},
+            {"success": True, "visible": False, "confirmation": True},
+        ])
+        with patch("bosshunter.platform_delivery.zhilian._modal_state", side_effect=states), \
+             patch("bosshunter.platform_delivery.zhilian._entry_state", return_value={"mode": "existing_conversation"}):
+            from bosshunter.platform_delivery.zhilian import _wait_for_default_greeting_modal
+            result = _wait_for_default_greeting_modal("zhilian-target", timeout=0.1)
+
+        self.assertTrue(result["confirmation"])
+        self.assertEqual(result["entry_mode"], "existing_conversation")
+
+    def test_zhilian_existing_conversation_skips_greeting_modal(self):
+        from unittest.mock import patch
+
+        with patch("bosshunter.platform_delivery.zhilian._open_zhilian_job", return_value=("zhilian-target", None)), \
+             patch("bosshunter.platform_delivery.zhilian.inspect_page", return_value={"login_required": False}), \
+             patch("bosshunter.platform_delivery.zhilian._entry_state", return_value={"mode": "existing_conversation"}), \
+             patch("bosshunter.platform_delivery.zhilian._click_zhilian_selector", return_value={"success": True}), \
+             patch("bosshunter.platform_delivery.zhilian._wait_for_conversation", return_value={"jobDetail": False, "imRoute": True, "modalVisible": False, "hasChatInput": True, "conversationRoute": True}), \
+             patch("bosshunter.platform_delivery.zhilian._post_start_state", return_value={"jobDetail": False, "imRoute": True, "modalVisible": False, "hasChatInput": True, "conversationRoute": True}), \
+             patch("bosshunter.platform_delivery.zhilian.close_tab") as close_tab:
+            result = ZhilianDeliveryAdapter().start_conversation({"url": "https://www.zhaopin.com/jobdetail/example"}, DeliveryContext())
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.verified)
+        self.assertIn("已有 HR 会话", result.history_detail)
+        close_tab.assert_not_called()
+
+    def test_zhilian_existing_conversation_does_not_count_nav_search_as_chat(self):
+        from unittest.mock import patch
+
+        with patch("bosshunter.platform_delivery.zhilian._open_zhilian_job", return_value=("zhilian-target", None)), \
+             patch("bosshunter.platform_delivery.zhilian.inspect_page", return_value={"login_required": False}), \
+             patch("bosshunter.platform_delivery.zhilian._entry_state", return_value={"mode": "existing_conversation"}), \
+             patch("bosshunter.platform_delivery.zhilian._click_zhilian_selector", return_value={"success": True}), \
+             patch("bosshunter.platform_delivery.zhilian._wait_for_conversation", return_value={"jobDetail": True, "imRoute": False, "modalVisible": False, "conversationRoute": False, "hasChatInput": False}), \
+             patch("bosshunter.platform_delivery.zhilian.close_tab"):
+            result = ZhilianDeliveryAdapter().start_conversation({"url": "https://www.zhaopin.com/jobdetail/example"}, DeliveryContext())
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "existing_conversation_not_verified")
+
+    def test_zhilian_send_message_requires_im_route_and_sender(self):
+        from unittest.mock import patch
+
+        with patch("bosshunter.platform_delivery.zhilian._open_zhilian_job", return_value=("zhilian-target", None)), \
+             patch("bosshunter.platform_delivery.zhilian.inspect_page", return_value={"login_required": False}), \
+             patch("bosshunter.platform_delivery.zhilian._entry_state", return_value={"mode": "existing_conversation"}), \
+             patch("bosshunter.platform_delivery.zhilian._click_zhilian_selector", return_value={"success": True}), \
+             patch("bosshunter.platform_delivery.zhilian._wait_for_conversation", return_value={"imRoute": True, "hasChatInput": True}), \
+             patch("bosshunter.platform_delivery.zhilian._fill_and_send_zhilian_message", return_value={"success": True}), \
+             patch("bosshunter.platform_delivery.zhilian.close_tab"):
+            result = ZhilianDeliveryAdapter().send_message({"url": "https://www.zhaopin.com/jobdetail/example"}, "本地测试", DeliveryContext())
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.verified)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ from bosshunter.executor.sender import _send_greeting_once
 from bosshunter.executor.sender import _submit_chat_message_background
 from bosshunter.executor.sender import _submit_startchat_greeting
 from bosshunter.executor.sender import _wait_for_chat_page
+from bosshunter.platform_delivery.base import DeliveryResult
 
 
 def _job(job_id: str, title: str = "Engineer") -> dict:
@@ -48,6 +49,27 @@ def _job(job_id: str, title: str = "Engineer") -> dict:
 
 
 class JobSelectionTests(unittest.TestCase):
+    def test_zhilian_send_path_uses_platform_default_contact_flow(self):
+        from unittest.mock import patch
+
+        job = _job("zhilian-job")
+        job["source_platform"] = "zhilian"
+        adapter = unittest.mock.Mock()
+        adapter.start_conversation.return_value = DeliveryResult(
+            success=True,
+            verified=True,
+            platform="zhilian",
+            history_detail="智联平台默认招呼已确认发送",
+            target_id="zhilian-target",
+        )
+        with patch("bosshunter.executor.sender.get_delivery_adapter", return_value=adapter):
+            result, target_id = _send_greeting_once(job, "", {})
+
+        adapter.start_conversation.assert_called_once()
+        self.assertTrue(result["success"])
+        self.assertTrue(result["verified"])
+        self.assertEqual(target_id, "zhilian-target")
+
     def test_chat_button_script_prefers_real_anchor_over_visible_wrapper(self):
         script = CHAT_BUTTON_SCRIPT_FOR_TESTS
 

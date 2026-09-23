@@ -2,10 +2,9 @@
 
 PLATFORM_CAPABILITIES: dict[str, frozenset[str]] = {
     "boss": frozenset({"collect", "score", "greet", "deliver", "monitor"}),
-    # New platforms start read-only. Delivery and monitoring stay locked until
-    # an authorized real-account acceptance test has verified the live DOM and
-    # the maintainer explicitly enables those capabilities in a later change.
-    "zhilian": frozenset({"collect", "score", "greet"}),
+    #智联首次联系由平台默认招呼流程完成；真实账号闭环验收后开放 deliver。
+    #monitor 仍保持关闭，直到智联会话列表轮询与未读同步单独验收。
+    "zhilian": frozenset({"collect", "score", "greet", "deliver"}),
     "51job": frozenset({"collect", "score", "greet"}),
     "liepin": frozenset({"collect", "score", "greet"}),
 }

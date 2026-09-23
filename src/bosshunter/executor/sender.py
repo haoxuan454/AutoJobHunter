@@ -25,6 +25,7 @@ from bosshunter.db import (
 from bosshunter.collection.capabilities import platform_supports
 from bosshunter.throttle import RequestThrottle, SendWindowChecker, ProgressiveBackoff, should_take_day_off
 from bosshunter.platform_safety import PlatformAccessGuard, PlatformSafetyStop
+from bosshunter.platform_delivery import DeliveryContext, get_delivery_adapter
 
 console = Console()
 
@@ -749,6 +750,19 @@ def _detect_job_closed_on_page(target_id: str) -> dict | None:
 
 
 def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tuple[dict, str | None]:
+    if str(job.get("source_platform") or "boss").strip().lower() == "zhilian":
+        result = get_delivery_adapter("zhilian").start_conversation(
+            job,
+            DeliveryContext(metadata={"workbench": True}),
+        )
+        return {
+            "success": result.success,
+            "verified": result.verified,
+            "first_contact": True,
+            "error": result.error,
+            "history_detail": result.history_detail,
+        }, result.target_id
+
     stop_event = throttle_config.get("_workbench_stop_event")
     existing_target_ids = {
         str(target.get("targetId") or "")
@@ -1160,7 +1174,8 @@ def send_greetings(config: dict, force: bool = False, db_path=None) -> int:
                 break
 
             greeting = job.get("greeting", "")
-            if not greeting:
+            is_zhilian = str(job.get("source_platform") or "boss").strip().lower() == "zhilian"
+            if not greeting and not is_zhilian:
                 update_job_status(db, job["id"], "error")
                 update_job_last_error(db, job["id"], "该岗位没有已生成的招呼语，无法发送", "no_greeting")
                 send_report["attempted_count"] += 1
@@ -1217,7 +1232,12 @@ def send_greetings(config: dict, force: bool = False, db_path=None) -> int:
                 throttle.mark()
                 update_job_status(db, job["id"], "sent")
                 update_job_last_error(db, job["id"], "")
-                add_history(db, job["id"], "sent", greeting[:50])
+                add_history(
+                    db,
+                    job["id"],
+                    "sent",
+                    greeting[:50] or result_data.get("history_detail", "智联平台默认招呼已确认"),
+                )
                 sent_count += 1
                 send_report["sent_count"] = sent_count
                 backoff.record_success()
