@@ -1851,6 +1851,18 @@ def api_workbench_task_stop(task_id):
 		return _json_response({"error": str(e)}, 500)
 
 
+def _is_user_confirmable_low_score(row, threshold: float) -> bool:
+	if str(row["status"] or "") != "filtered" or int(row["quick_score"] or 0) <= 0:
+		return False
+	try:
+		score = float(row["score"])
+	except (TypeError, ValueError):
+		return False
+	reason = str(row["score_reason"] or "")
+	failed_prefixes = ("预筛不通过:", "AI评分失败:", "AI 评分失败:", "评分失败:")
+	return bool(reason.strip()) and score < threshold and not reason.startswith(failed_prefixes)
+
+
 @app.route("/api/workbench/deliver", method="POST")
 def api_workbench_deliver():
 	try:
@@ -1859,6 +1871,12 @@ def api_workbench_deliver():
 		if not job_ids:
 			return _json_response({"error": "请选择要投递的岗位"}, 400)
 		direct_send = bool(body.get("direct_send"))
+		confirm_low_score = body.get("confirm_low_score") is True
+		ack_zhilian_default_greeting = body.get("ack_zhilian_default_greeting") is True
+		try:
+			low_score_threshold = float(load_config(CONFIG_PATH).get("scoring", {}).get("threshold", 60))
+		except (TypeError, ValueError):
+			low_score_threshold = 60
 		with job_mutation_lock:
 			validation_db = _get_web_db()
 			try:
@@ -1871,7 +1889,7 @@ def api_workbench_deliver():
 					).fetchall()
 				}
 				platform_rows = validation_db.execute(
-					f"SELECT id, status, greeting, greeting_selection, COALESCE(source_platform, 'boss') AS source_platform FROM jobs WHERE deleted_at IS NULL AND id IN ({placeholders})",
+					f"SELECT id, status, score, quick_score, score_reason, greeting, greeting_selection, COALESCE(source_platform, 'boss') AS source_platform FROM jobs WHERE deleted_at IS NULL AND id IN ({placeholders})",
 					job_ids,
 				).fetchall()
 			finally:
@@ -1901,6 +1919,16 @@ def api_workbench_deliver():
 					"code": "greeting_review_required",
 					"invalid_ids": pending_review_ids,
 				}, 409)
+			low_score_ids = {
+				str(row["id"])
+				for row in platform_rows
+				if _is_user_confirmable_low_score(row, low_score_threshold)
+			}
+			zhilian_default_greeting_ids = [
+				str(row["id"])
+				for row in platform_rows
+				if str(row["source_platform"] or "boss") == "zhilian"
+			]
 			allowed_statuses = {"ready", "approved", "error"} if direct_send else {"ready", "approved"}
 			completed_statuses = {"sent", "replied", "resume_sent", "needs_resume", "follow_up_sent"}
 			already_sent_ids = {
@@ -1913,13 +1941,14 @@ def api_workbench_deliver():
 				for row in platform_rows
 				if direct_send
 				and str(row["source_platform"] or "boss") != "zhilian"
-				and str(row["status"] or "") in allowed_statuses
+				and (str(row["status"] or "") in allowed_statuses or str(row["id"]) in low_score_ids)
 				and not str(row["greeting"] or "").strip()
 			}
 			not_ready_ids = {
 				str(row["id"])
 				for row in platform_rows
 				if str(row["status"] or "") not in allowed_statuses
+				and str(row["id"]) not in low_score_ids
 				and str(row["status"] or "") not in completed_statuses
 			}
 			invalid_status_ids = [
@@ -1942,6 +1971,17 @@ def api_workbench_deliver():
 					"already_sent_ids": [job_id for job_id in job_ids if job_id in already_sent_ids],
 					"not_ready_ids": [job_id for job_id in job_ids if job_id in not_ready_ids],
 					"missing_greeting_ids": [job_id for job_id in job_ids if job_id in missing_greeting_ids],
+				}, 409)
+			confirmations_required = {}
+			if low_score_ids and not confirm_low_score:
+				confirmations_required["low_score_ids"] = [job_id for job_id in job_ids if job_id in low_score_ids]
+			if zhilian_default_greeting_ids and not ack_zhilian_default_greeting:
+				confirmations_required["zhilian_default_greeting_ids"] = zhilian_default_greeting_ids
+			if confirmations_required:
+				return _json_response({
+					"error": "所选岗位包含需要单独确认的投递行为",
+					"code": "delivery_confirmation_required",
+					"confirmations_required": confirmations_required,
 				}, 409)
 
 			status = task_runner.status()
@@ -1990,7 +2030,12 @@ def api_workbench_deliver():
 			try:
 				for job_id in status_job_ids:
 					update_job_status(db, job_id, "approved")
-					add_history(db, job_id, "approved", "Web Dashboard 确认直接发送" if direct_send else "Web Dashboard 确认投递")
+					detail = "Web Dashboard 确认直接发送" if direct_send else "Web Dashboard 确认投递"
+					if job_id in low_score_ids:
+						detail += "；用户已明确确认 AI 低分岗位"
+					if job_id in zhilian_default_greeting_ids:
+						detail += "；智联按平台默认招呼/会话流程处理"
+					add_history(db, job_id, "approved", detail)
 			finally:
 				db.close()
 

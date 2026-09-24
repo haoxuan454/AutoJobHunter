@@ -94,7 +94,7 @@ class ConfigExampleTests(unittest.TestCase):
         config = yaml.safe_load((ROOT / "config.example.yaml").read_text(encoding="utf-8"))
 
         self.assertEqual(config["profile"]["salary_ceil_ratio"], 1.5)
-        self.assertIs(config["profile"]["filter_unparsed_salary"], True)
+        self.assertIs(config["profile"]["filter_unparsed_salary"], False)
 
     def test_example_defaults_to_disabled_follow_up(self):
         config = yaml.safe_load((ROOT / "config.example.yaml").read_text(encoding="utf-8"))
@@ -129,7 +129,7 @@ class ConfigValidationTests(unittest.TestCase):
 
         self.assertIs(config["profile"]["allow_internship"], False)
         self.assertEqual(config["profile"]["salary_ceil_ratio"], 1.5)
-        self.assertIs(config["profile"]["filter_unparsed_salary"], True)
+        self.assertIs(config["profile"]["filter_unparsed_salary"], False)
         self.assertNotIn("prefilter_threshold", config["scoring"])
 
     def test_load_config_defaults_to_disabled_follow_up(self):
@@ -375,20 +375,26 @@ class PrefilterHardGateTests(unittest.TestCase):
         self.assertEqual(score, 0)
         self.assertIn("薪资远超期望上限", reason)
 
-    def test_unparsed_salary_is_filtered_by_default_and_can_be_kept(self):
+    def test_unparsed_salary_is_not_filtered_by_default_or_legacy_flag(self):
         from bosshunter.ai.prefilter import quick_score
 
         job = {"title": "AI产品经理", "jd": "", "salary": "面议"}
         score, reason = quick_score(job, {"profile": {"deal_breakers": [], "salary_min": 7}})
-        self.assertEqual(score, 0)
-        self.assertIn("无法解析", reason)
-
-        score, reason = quick_score(
-            job,
-            {"profile": {"deal_breakers": [], "salary_min": 7, "filter_unparsed_salary": False}},
-        )
         self.assertEqual(score, 100)
-        self.assertIn("交由 AI 判断", reason)
+        self.assertIn("不据此过滤", reason)
+
+        for legacy_value in (True, False, "true", 1):
+            with self.subTest(legacy_filter_unparsed_salary=legacy_value):
+                score, reason = quick_score(
+                    job,
+                    {"profile": {
+                        "deal_breakers": [],
+                        "salary_min": 7,
+                        "filter_unparsed_salary": legacy_value,
+                    }},
+                )
+                self.assertEqual(score, 100)
+                self.assertIn("不据此过滤", reason)
 
     def test_passing_job_returns_hard_gate_pass(self):
         from bosshunter.ai.prefilter import quick_score
@@ -598,7 +604,8 @@ class DashboardPageTests(unittest.TestCase):
 
         # Act / Assert
         self.assertIn("sendReadyGreetings", self.source)
-        self.assertIn("direct_send: true", self.source)
+        self.assertIn("submitDeliveryWithConfirmations(ids, true)", self.source)
+        self.assertIn("direct_send: directSend", self.source)
         self.assertIn("已直接进入发送流程", self.source)
         self.assertNotIn("confirmDeliver(pendingGreetingJobs.map", self.source)
         self.assertNotIn("confirmDeliver([job.id])}>发送招呼语", self.source)
@@ -830,11 +837,11 @@ class ConfigPageTests(unittest.TestCase):
         self.assertIn("profile.jd_deal_breakers", self.source)
         self.assertIn("完整 JD 含这些词时会在 AI 评分前跳过", self.source)
 
-    def test_config_page_exposes_salary_filter_controls(self):
+    def test_config_page_explains_unknown_salary_is_left_to_ai(self):
         self.assertIn("薪资上限放宽倍数", self.source)
         self.assertIn("profile.salary_ceil_ratio", self.source)
-        self.assertIn("过滤面议/无法解析薪资", self.source)
-        self.assertIn("profile.filter_unparsed_salary", self.source)
+        self.assertIn("面议或暂时无法识别格式的薪资不会单独触发过滤", self.source)
+        self.assertNotIn("profile.filter_unparsed_salary", self.source)
 
     def test_config_page_api_failure_displays_error_instead_of_infinite_loading(self):
         # Act / Assert
@@ -927,8 +934,7 @@ class ConfigSchemaTests(unittest.TestCase):
 
         self.assertEqual(fields["salary_ceil_ratio"]["label"], "薪资上限放宽倍数")
         self.assertEqual(fields["salary_ceil_ratio"]["default"], 1.5)
-        self.assertEqual(fields["filter_unparsed_salary"]["type"], "switch")
-        self.assertIs(fields["filter_unparsed_salary"]["default"], True)
+        self.assertNotIn("filter_unparsed_salary", fields)
 
     def test_schema_defaults_to_disabled_follow_up(self):
         follow_up = next(section for section in self.schema["sections"] if section["key"] == "follow_up")

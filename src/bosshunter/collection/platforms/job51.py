@@ -46,7 +46,7 @@ from bosshunter.db import (
     prune_page_progress,
     upsert_page_progress,
 )
-from bosshunter.job_filters import matching_blocked_company, matching_deal_breaker
+from bosshunter.job_filters import matching_blocked_company, matching_deal_breaker, parse_monthly_salary_k
 from bosshunter.throttle import SendWindowChecker, should_take_day_off
 
 
@@ -206,6 +206,10 @@ def _parse_salary_range(salary: str) -> tuple[float, float] | None:
     「8千-1.2万」「1-2万」「1.5-2万·13薪」以及年薪「25-38万/年」（换算月薪）。
     """
     import re
+
+    shared_range = parse_monthly_salary_k(salary)
+    if shared_range is not None:
+        return shared_range
 
     normalized = str(salary or "").strip()
 

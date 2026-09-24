@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import DashboardPage from './DashboardPage'
+import DashboardPage, { submitDeliveryWithConfirmations } from './DashboardPage'
 import type { WorkbenchTask } from '@/hooks/useDashboard'
 
 let workbenchPayload: Record<string, unknown> = {}
@@ -192,6 +192,47 @@ describe('DashboardPage workbench task panel', () => {
     await waitFor(() => expect(send.disabled).toBe(false))
     expect(batchSend.disabled).toBe(false)
     expect(within(screen.getByLabelText('最终发送版本')).getByText(saved.greeting)).toBeTruthy()
+  })
+
+  it('retries only after confirming low-score and Zhilian default-greeting requirements', async () => {
+    const confirmation = vi.fn(() => true)
+    vi.stubGlobal('confirm', confirmation)
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        code: 'delivery_confirmation_required',
+        confirmations_required: {
+          low_score_ids: ['low-score'],
+          zhilian_default_greeting_ids: ['zhilian-job'],
+        },
+      }), { status: 409, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(jsonResponse({ queued_count: 2 }))
+
+    const result = await submitDeliveryWithConfirmations(['low-score', 'zhilian-job'], true)
+
+    expect(result).toEqual({ queued_count: 2 })
+    expect(confirmation).toHaveBeenCalledWith(expect.stringContaining('智联岗位将按平台状态分流'))
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
+      job_ids: ['low-score', 'zhilian-job'],
+      direct_send: true,
+      confirm_low_score: true,
+      ack_zhilian_default_greeting: true,
+    })
+  })
+
+  it('does not retry or mutate delivery when the user declines the extra confirmation', async () => {
+    const confirmation = vi.fn(() => false)
+    vi.stubGlobal('confirm', confirmation)
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      code: 'delivery_confirmation_required',
+      confirmations_required: { low_score_ids: ['low-score'] },
+    }), { status: 409, headers: { 'Content-Type': 'application/json' } }))
+
+    const result = await submitDeliveryWithConfirmations(['low-score'])
+
+    expect(result).toBeNull()
+    expect(confirmation).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
 })

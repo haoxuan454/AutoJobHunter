@@ -359,13 +359,9 @@ export default function ConfigPage() {
               />
               <p className="mt-1 text-xs text-muted">按岗位薪资区间下限判断；下限超过最高薪资 × 放宽倍数时会在 AI 评分前跳过。</p>
             </Field>
-            <div className="flex items-center justify-between rounded-xl border border-card-border bg-[#FFFCFA] px-3 py-2">
-              <div>
-                <label className="text-xs text-foreground">过滤面议/无法解析薪资</label>
-                <p className="mt-1 text-xs text-muted">关闭后这类岗位会保留给 AI 综合判断。</p>
-              </div>
-              <Switch checked={config.profile?.filter_unparsed_salary ?? true} onChange={v => updateConfig('profile.filter_unparsed_salary', v)} />
-            </div>
+            <p className="rounded-xl border border-card-border bg-[#FFFCFA] px-3 py-2 text-xs leading-5 text-muted">
+              面议或暂时无法识别格式的薪资不会单独触发过滤，会保留给 AI 结合岗位内容与个人条件综合判断。
+            </p>
             <Field label="排除关键词">
               <TagsInput value={config.profile?.deal_breakers || []} onChange={v => updateConfig('profile.deal_breakers', v)} placeholder="如：外包、996" />
             </Field>

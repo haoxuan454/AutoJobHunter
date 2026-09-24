@@ -390,8 +390,8 @@ class WebApiRouteTests(unittest.TestCase):
             (base_dir / "config.yaml").write_text(
                 yaml.safe_dump({
                     "profile": {"resume_path": str(resume_path)},
-                    "search": {"keywords": ["AI engineer"], "cities": ["Shanghai"]},
-                    "platforms": {"boss": {"enabled": True, "search": {"keywords": ["AI engineer"], "cities": ["Shanghai"]}}},
+                    "search": {"keywords": ["AI engineer"], "cities": ["上海"]},
+                    "platforms": {"boss": {"enabled": True, "search": {"keywords": ["AI engineer"], "cities": ["上海"]}}},
                     "ai": {"api_key": "private-agent-key"},
                 }, allow_unicode=True),
                 encoding="utf-8",
@@ -984,7 +984,7 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertIn("application/json", headers["Content-Type"])
         self.assertEqual([job["id"] for job in payload["pending_confirmation"]], ["ready-job"])
 
-    def test_workbench_excludes_collection_only_platforms_from_automatic_delivery(self):
+    def test_workbench_includes_zhilian_for_confirmed_manual_delivery(self):
         with tempfile.TemporaryDirectory() as tmp:
             base_dir = Path(tmp)
             db = get_db(base_dir / "data" / "bosshunter.db")
@@ -1002,7 +1002,10 @@ class WebApiRouteTests(unittest.TestCase):
 
         payload = json.loads(body)
         self.assertTrue(status.startswith("200"), body)
-        self.assertEqual(payload["pending_confirmation"], [])
+        self.assertEqual(
+            [job["id"] for job in payload["pending_confirmation"]],
+            ["zhilian-ready"],
+        )
 
     def test_web_api_workbench_reports_daily_send_quota(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1448,6 +1451,151 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertEqual(payload["invalid_ids"], ["pending-without-history"])
         self.assertEqual(payload["already_sent_ids"], [])
         self.assertEqual(payload["not_ready_ids"], ["pending-without-history"])
+
+    def test_web_api_deliver_requires_explicit_confirmation_for_low_score_and_zhilian(self):
+        runner = MagicMock()
+        runner.status.return_value = {"active": None}
+        runner._tasks = {}
+        runner.start.return_value = {"id": "isolated-delivery-task", "status": "queued"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("low-score"))
+                db.execute(
+                    "UPDATE jobs SET status = 'filtered', score = 42, quick_score = 100, score_reason = ? WHERE id = ?",
+                    ("匹配度偏低", "low-score"),
+                )
+                zhilian_job = _job("zhilian-first-contact")
+                zhilian_job["source_platform"] = "zhilian"
+                insert_job(db, zhilian_job)
+                update_job_status(db, "zhilian-first-contact", "ready")
+                db.commit()
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch.object(server, "task_runner", runner):
+                first_status, _, first_body = self._request(
+                    "/api/workbench/deliver",
+                    method="POST",
+                    json_body={"job_ids": ["low-score", "zhilian-first-contact"]},
+                )
+                verify_db = get_db(base_dir / "data" / "bosshunter.db")
+                try:
+                    unchanged = {
+                        row["id"]: row["status"]
+                        for row in verify_db.execute(
+                            "SELECT id, status FROM jobs WHERE id IN (?, ?)",
+                            ("low-score", "zhilian-first-contact"),
+                        )
+                    }
+                finally:
+                    verify_db.close()
+
+                second_status, _, second_body = self._request(
+                    "/api/workbench/deliver",
+                    method="POST",
+                    json_body={
+                        "job_ids": ["low-score", "zhilian-first-contact"],
+                        "confirm_low_score": True,
+                        "ack_zhilian_default_greeting": True,
+                    },
+                )
+
+            verify_db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                approved = {
+                    row["id"]: row["status"]
+                    for row in verify_db.execute(
+                        "SELECT id, status FROM jobs WHERE id IN (?, ?)",
+                        ("low-score", "zhilian-first-contact"),
+                    )
+                }
+            finally:
+                verify_db.close()
+
+        self.assertTrue(first_status.startswith("409"), first_body)
+        first_payload = json.loads(first_body)
+        self.assertEqual(first_payload["code"], "delivery_confirmation_required")
+        self.assertEqual(first_payload["confirmations_required"]["low_score_ids"], ["low-score"])
+        self.assertEqual(first_payload["confirmations_required"]["zhilian_default_greeting_ids"], ["zhilian-first-contact"])
+        self.assertEqual(unchanged, {"low-score": "filtered", "zhilian-first-contact": "ready"})
+        self.assertTrue(second_status.startswith("200"), second_body)
+        self.assertEqual(approved, {"low-score": "approved", "zhilian-first-contact": "approved"})
+        runner.start.assert_called_once()
+
+    def test_web_api_low_score_confirmation_cannot_bypass_hard_prefilter_or_ai_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                for job_id, quick_score, score, reason in (
+                    ("hard-prefilter", 0, 0, "预筛不通过:触发排除词"),
+                    ("ai-failed", 100, 0, "AI评分失败:服务不可用"),
+                    ("unscored", 100, 0, ""),
+                ):
+                    insert_job(db, _job(job_id))
+                    db.execute(
+                        "UPDATE jobs SET status = 'filtered', quick_score = ?, score = ?, score_reason = ? WHERE id = ?",
+                        (quick_score, score, reason, job_id),
+                    )
+                db.commit()
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            for job_id in ("hard-prefilter", "ai-failed", "unscored"):
+                with self.subTest(job_id=job_id):
+                    status, _, body = self._request(
+                        "/api/workbench/deliver",
+                        method="POST",
+                        json_body={"job_ids": [job_id], "confirm_low_score": True},
+                    )
+                    payload = json.loads(body)
+                    self.assertTrue(status.startswith("409"), body)
+                    self.assertNotEqual(payload.get("code"), "delivery_confirmation_required")
+                    self.assertEqual(payload["not_ready_ids"], [job_id])
+
+    def test_web_api_delivery_confirmation_requires_json_booleans(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                low_score = _job("low-score-string-confirm")
+                insert_job(db, low_score)
+                db.execute(
+                    "UPDATE jobs SET status = 'filtered', score = 42, quick_score = 100, score_reason = ? WHERE id = ?",
+                    ("匹配度偏低", low_score["id"]),
+                )
+                db.commit()
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            for invalid_confirmation in ("true", "false", 1):
+                with self.subTest(value=invalid_confirmation):
+                    status, _, body = self._request(
+                        "/api/workbench/deliver",
+                        method="POST",
+                        json_body={
+                            "job_ids": ["low-score-string-confirm"],
+                            "confirm_low_score": invalid_confirmation,
+                        },
+                    )
+                    payload = json.loads(body)
+                    self.assertTrue(status.startswith("409"), body)
+                    self.assertEqual(payload["code"], "delivery_confirmation_required")
+
+            verify_db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                status_after_attempts = verify_db.execute(
+                    "SELECT status FROM jobs WHERE id = ?", ("low-score-string-confirm",)
+                ).fetchone()["status"]
+            finally:
+                verify_db.close()
+            self.assertEqual(status_after_attempts, "filtered")
 
     def test_web_api_direct_send_requires_a_retryable_greeting(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3807,10 +3955,10 @@ class WebApiRouteTests(unittest.TestCase):
             "search": {"keywords": ["人力"], "cities": ["深圳"]},
             "profile": {"resume_path": "C:/resume.md"},
             "ai": {"api_key": "test-key"},
-            "collection": {"default_order": ["boss", "zhilian"]},
+            "collection": {"default_order": ["boss", "51job"]},
             "platforms": {
                 "boss": {"enabled": True, "search": {"keywords": ["人力"], "cities": ["深圳"]}},
-                "zhilian": {"enabled": True, "search": {"keywords": ["人力"], "cities": ["深圳"]}},
+                "51job": {"enabled": True, "search": {"keywords": ["人力"], "cities": ["深圳"]}},
             },
         }
         with patch.object(server, "load_config", return_value=config), patch.object(server, "_preflight_messages", return_value=[]), patch.object(
@@ -3819,7 +3967,7 @@ class WebApiRouteTests(unittest.TestCase):
             status, _, body = self._request("/api/workbench/task", method="POST", json_body={"mode": "full"})
 
         self.assertTrue(status.startswith("400"), body)
-        self.assertEqual(json.loads(body)["collection_only_platforms"], ["zhilian"])
+        self.assertEqual(json.loads(body)["collection_only_platforms"], ["51job"])
         start.assert_not_called()
 
     def test_full_task_rejects_collection_only_platform_from_dialog(self):
@@ -3829,14 +3977,14 @@ class WebApiRouteTests(unittest.TestCase):
             "collection": {"default_order": ["boss"]},
             "platforms": {
                 "boss": {"enabled": True, "search": {}},
-                "zhilian": {"enabled": False, "search": {}},
+                "51job": {"enabled": False, "search": {}},
             },
         }
         options = {
-            "platform_order": ["zhilian"],
+            "platform_order": ["51job"],
             "auto_score": False,
             "platforms": {
-                "zhilian": {
+                "51job": {
                     "keywords": ["人力"],
                     "cities": ["深圳"],
                     "city_codes": {"深圳": "765"},
@@ -3856,7 +4004,7 @@ class WebApiRouteTests(unittest.TestCase):
             )
 
         self.assertTrue(status.startswith("400"), body)
-        self.assertEqual(json.loads(body)["collection_only_platforms"], ["zhilian"])
+        self.assertEqual(json.loads(body)["collection_only_platforms"], ["51job"])
         start.assert_not_called()
         write_config.assert_not_called()
 

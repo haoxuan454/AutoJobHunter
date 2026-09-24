@@ -79,13 +79,41 @@ def _post_start_state(target_id: str) -> dict[str, Any]:
         const r = el.getBoundingClientRect(), s = getComputedStyle(el);
         return !!(r.width && r.height && s.display !== 'none' && s.visibility !== 'hidden');
       };
-      const hasChatInput = [...document.querySelectorAll('textarea,[contenteditable="true"]')].some(visible);
+      const hasChatInput = [...document.querySelectorAll(
+        '.im-sender__input,.im-sender textarea,.im-sender [contenteditable="true"]'
+      )].some(visible);
       const jobDetail = /\/jobdetail\//.test(location.pathname);
       const imRoute = location.hostname === 'i.zhaopin.com' && location.pathname === '/im';
       return JSON.stringify({success:true, url:location.href, modalVisible, jobDetail, hasChatInput,
         imRoute, conversationRoute:imRoute && /\u6d88\u606f|\u6c9f\u901a|\u4f1a\u8bdd/.test(text)});
     })()
     """, timeout=10))
+
+
+def _conversation_message_snapshot(target_id: str) -> list[dict[str, str]]:
+    """Read rendered chat messages only; composer text and page-wide text are excluded."""
+    result = parse_result(evaluate(target_id, r"""
+    (() => {
+      const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
+      const visible = el => {
+        const rects = el.getClientRects(), style = getComputedStyle(el);
+        return rects.length > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+      };
+      const messages = [...document.querySelectorAll('.chat-message,.message-item')]
+        .filter(visible)
+        .map(node => {
+          const classes = [node, ...node.querySelectorAll('[class]')]
+            .map(el => String(el.className || '').toLowerCase()).join(' ');
+          const sender = /(^|[\s_-])(item-myself|message-self|msg-self|is-self|my-message|message-mine|from-me|outgoing)([\s_-]|$)/.test(classes)
+            ? 'me' : 'unknown';
+          const textNode = node.querySelector('.msg-text,.text,.message-text');
+          return {sender, text:normalize(textNode ? textNode.innerText || textNode.textContent : node.innerText || node.textContent)};
+        }).filter(item => item.text);
+      return JSON.stringify({success:true,messages});
+    })()
+    """, timeout=10))
+    messages = result.get("messages")
+    return messages if isinstance(messages, list) else []
 
 
 def _open_zhilian_job(job: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
@@ -137,6 +165,11 @@ def _wait_for_conversation(target_id: str, timeout: float = 8.0) -> dict[str, An
 def _fill_and_send_zhilian_message(target_id: str, message: str) -> dict[str, Any]:
     if not message.strip():
         return {"success": False, "error": "message_empty"}
+    before_messages = _conversation_message_snapshot(target_id)
+    before_count = sum(
+        1 for item in before_messages
+        if item.get("sender") == "me" and " ".join(str(item.get("text") or "").split()) == " ".join(message.split())
+    )
     focused = parse_result(evaluate(target_id, """
     (() => {
       const input = document.querySelector('.im-sender__input');
@@ -152,11 +185,30 @@ def _fill_and_send_zhilian_message(target_id: str, message: str) -> dict[str, An
     send = _click_zhilian_selector(target_id, ["button.im-sender__send-btn"])
     if not send.get("success"):
         return {"success": False, "error": "message_send_button_missing"}
-    time.sleep(1.2)
-    sent = parse_result(evaluate(target_id, f"""
-    (() => JSON.stringify({{success:(document.body.innerText || '').includes({json.dumps(message, ensure_ascii=False)})}}))()
-    """, timeout=10))
-    return sent if sent.get("success") else {"success": False, "error": "message_sent_not_verified"}
+    expected = " ".join(message.split())
+    deadline = time.time() + 8
+    first_verified_snapshot: list[dict[str, str]] | None = None
+    while time.time() < deadline:
+        current_messages = _conversation_message_snapshot(target_id)
+        matching_outgoing = sum(
+            1 for item in current_messages
+            if item.get("sender") == "me" and " ".join(str(item.get("text") or "").split()) == expected
+        )
+        composer = parse_result(evaluate(target_id, """
+        (() => {
+          const input = document.querySelector('.im-sender__input,.im-sender textarea,.im-sender [contenteditable="true"]');
+          return JSON.stringify({success:!!input, empty:!!input && !(input.value || input.innerText || input.textContent || '').trim()});
+        })()
+        """, timeout=10))
+        if matching_outgoing > before_count and composer.get("empty"):
+            if first_verified_snapshot is not None:
+                return {"success": True, "verified": True, "verification": "new_outgoing_message_and_empty_composer"}
+            first_verified_snapshot = current_messages
+            time.sleep(0.8)
+            continue
+        first_verified_snapshot = None
+        time.sleep(0.4)
+    return {"success": False, "error": "message_sent_not_verified"}
 
 
 class ZhilianDeliveryAdapter:
@@ -207,7 +259,15 @@ class ZhilianDeliveryAdapter:
                 ):
                     close_tab(target_id)
                     return DeliveryResult(False, platform=self.platform, error="existing_conversation_not_verified", history_detail="智联继续沟通入口已点击，但未确认进入对应 HR 会话", target_id=target_id)
-                return DeliveryResult(True, True, self.platform, None, "智联已进入已有 HR 会话；未发送新的首条消息。", target_id=target_id)
+                greeting = str(context.metadata.get("greeting") or "").strip()
+                if not greeting:
+                    close_tab(target_id)
+                    return DeliveryResult(False, platform=self.platform, error="existing_conversation_greeting_missing", history_detail="智联已有 HR 会话已打开，但缺少可发送招呼语；未记为已发送", target_id=target_id)
+                sent = _fill_and_send_zhilian_message(target_id, greeting)
+                if not sent.get("success"):
+                    close_tab(target_id)
+                    return DeliveryResult(False, platform=self.platform, error=sent.get("error", "message_send_failed"), history_detail="智联已有 HR 会话的招呼语发送未完成或未验证", target_id=target_id)
+                return DeliveryResult(True, True, self.platform, None, "智联已有 HR 会话中的招呼语已发送并在页面验证。", target_id=target_id, delivery_kind="custom_message")
 
             before_confirm = _wait_for_default_greeting_modal(target_id)
             if not before_confirm.get("confirmation") or not (
@@ -223,11 +283,15 @@ class ZhilianDeliveryAdapter:
                 close_tab(target_id)
                 return DeliveryResult(False, platform=self.platform, error="default_greeting_confirmation_missing", history_detail="智联默认招呼弹框未找到可见的继续沟通按钮", target_id=target_id)
 
-            time.sleep(1.5)
-            verification = _post_start_state(target_id)
-            if verification.get("modalVisible"):
+            verification = _wait_for_conversation(target_id)
+            time.sleep(0.8)
+            stable_verification = _post_start_state(target_id)
+            if verification.get("modalVisible") or not (
+                verification.get("imRoute") and verification.get("hasChatInput") and
+                stable_verification.get("imRoute") and stable_verification.get("hasChatInput")
+            ):
                 close_tab(target_id)
-                return DeliveryResult(False, platform=self.platform, error="default_greeting_not_verified", history_detail="已点击继续沟通，但弹框仍可见，未确认流程完成", target_id=target_id)
+                return DeliveryResult(False, platform=self.platform, error="default_greeting_not_verified", history_detail="已点击继续沟通，但未稳定进入智联 HR 会话输入框；未记录为成功", target_id=target_id)
             return DeliveryResult(
                 True,
                 True,
@@ -235,6 +299,7 @@ class ZhilianDeliveryAdapter:
                 None,
                 "智联平台默认招呼已确认发送；这不代表 HR 已回复，后续需单独监测智联会话列表。",
                 target_id=target_id,
+                delivery_kind="platform_default_greeting",
             )
         except Exception as exc:
             close_tab(target_id)

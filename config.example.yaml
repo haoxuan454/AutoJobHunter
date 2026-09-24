@@ -13,7 +13,7 @@ profile:
   salary_min: 15  # K
   salary_max: 25  # K
   salary_ceil_ratio: 1.5  # 岗位薪资下限超过 salary_max × 该倍数时过滤
-  filter_unparsed_salary: true  # 过滤面议或无法解析薪资的岗位
+  filter_unparsed_salary: false  # 兼容旧配置；无法解析的薪资交由 AI 综合判断
   allow_internship: false
   deal_breakers: ["外包", "996"]
   jd_deal_breakers: []  # 示例：需要排除完整 JD 中的词时再填写

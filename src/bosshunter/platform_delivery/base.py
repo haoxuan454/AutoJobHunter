@@ -23,6 +23,7 @@ class DeliveryResult:
     history_detail: str = ""
     message_id: str | None = None
     target_id: str | None = None
+    delivery_kind: str | None = None
 
 
 class DeliveryAdapter(Protocol):

@@ -36,9 +36,23 @@ def parse_monthly_salary_k(salary: str) -> tuple[float, float] | None:
         return None
 
     number = r"(\d+(?:\.\d+)?)"
-    unit = r"(?P<unit>[kK万千]?)"
+    annual_salary = bool(re.search(r"(?:/\s*\u5e74|\u6bcf\u5e74|\u5e74\u85aa|\u5e74\u5305|\u5e74\u6536\u5165)", normalized))
+    annual_yuan_range = re.search(
+        r"(\d+(?:\.\d+)?)\s*[-~至到]\s*(\d+(?:\.\d+)?)\s*(?:\u5143|\u4eba\u6c11\u5e01)\s*/?\s*(?:\u6bcf\u5e74|\u5e74)",
+        normalized,
+    )
+    if annual_yuan_range:
+        low, high = (float(annual_yuan_range.group(i)) / 1000 / 12 for i in (1, 2))
+        return min(low, high), max(low, high)
+    annual_yuan_single = re.search(
+        r"(\d+(?:\.\d+)?)\s*(?:\u5143|\u4eba\u6c11\u5e01)\s*/?\s*(?:\u6bcf\u5e74|\u5e74)", normalized,
+    )
+    if annual_yuan_single:
+        value = float(annual_yuan_single.group(1)) / 1000 / 12
+        return value, value
+    unit = r"(?P<unit>[kKwW万千]?)"
     range_match = re.search(
-        rf"{number}\s*{unit}\s*[-~至到]\s*{number}\s*(?P<unit2>[kK万千]?)",
+        rf"{number}\s*{unit}\s*[-~至到]\s*{number}\s*(?P<unit2>[kKwW万千]?)",
         normalized,
     )
     if range_match:
@@ -48,12 +62,17 @@ def parse_monthly_salary_k(salary: str) -> tuple[float, float] | None:
         left_value = _salary_value_to_k(left, left_unit, normalized)
         right_value = _salary_value_to_k(right, right_unit, normalized)
         if left_value is not None and right_value is not None:
+            if annual_salary:
+                left_value /= 12
+                right_value /= 12
             return min(left_value, right_value), max(left_value, right_value)
 
-    single_match = re.search(rf"{number}\s*(?P<unit>[kK万千])", normalized)
+    single_match = re.search(rf"{number}\s*(?P<unit>[kKwW万千])", normalized)
     if single_match:
         value = _salary_value_to_k(float(single_match.group(1)), single_match.group("unit"), normalized)
         if value is not None:
+            if annual_salary:
+                value /= 12
             if re.search(r"(?:以上|起|底薪)", normalized):
                 return value, math.inf
             return value, value
@@ -73,7 +92,7 @@ def parse_monthly_salary_k(salary: str) -> tuple[float, float] | None:
 def _salary_value_to_k(value: float, unit: str, original: str) -> float | None:
     if unit in {"k", "K"}:
         return value
-    if unit == "万":
+    if unit in {"w", "W", "万"}:
         return value * 10
     if unit == "千":
         return value

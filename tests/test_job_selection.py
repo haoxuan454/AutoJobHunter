@@ -28,6 +28,7 @@ from bosshunter.executor.sender import _submit_chat_message_background
 from bosshunter.executor.sender import _submit_startchat_greeting
 from bosshunter.executor.sender import _wait_for_chat_page
 from bosshunter.platform_delivery.base import DeliveryResult
+from bosshunter.scoring_selection import select_scoring_jobs
 
 
 def _job(job_id: str, title: str = "Engineer") -> dict:
@@ -784,6 +785,39 @@ class JobSelectionTests(unittest.TestCase):
         self.assertEqual(rows["prefiltered"]["status"], "filtered")
         self.assertEqual(rows["ai-failed"]["status"], "filtered")
         self.assertEqual(rows["ai-failed-spaced"]["status"], "filtered")
+
+    def test_pending_scoring_includes_legacy_prefiltered_jobs_but_not_ai_filtered_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = get_db(Path(tmp) / "bosshunter.db")
+            try:
+                legacy_prefilter = _job("legacy-prefilter")
+                legacy_prefilter["salary"] = "8000-13000元"
+                insert_job(db, legacy_prefilter)
+                update_job_score(
+                    db,
+                    "legacy-prefilter",
+                    0,
+                    "预筛不通过: 薪资面议/无法解析，已过滤",
+                )
+                update_job_status(db, "legacy-prefilter", "filtered")
+
+                insert_job(db, _job("ai-filtered"))
+                update_job_score(db, "ai-filtered", 42, "经验匹配度不足")
+                update_job_status(db, "ai-filtered", "filtered")
+
+                insert_job(db, _job("pending"))
+
+                selected = select_scoring_jobs(db, scope="pending")
+                selected_legacy = select_scoring_jobs(
+                    db,
+                    scope="selected",
+                    job_ids=["legacy-prefilter"],
+                )
+            finally:
+                db.close()
+
+        self.assertEqual({job["id"] for job in selected}, {"legacy-prefilter", "pending"})
+        self.assertEqual([job["id"] for job in selected_legacy], ["legacy-prefilter"])
 
     def test_funnel_counts_ai_low_scores_but_excludes_prefilter_and_ai_failures(self):
         with tempfile.TemporaryDirectory() as tmp:

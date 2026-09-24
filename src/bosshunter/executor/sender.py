@@ -753,14 +753,18 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
     if str(job.get("source_platform") or "boss").strip().lower() == "zhilian":
         result = get_delivery_adapter("zhilian").start_conversation(
             job,
-            DeliveryContext(metadata={"workbench": True}),
+            DeliveryContext(metadata={"workbench": True, "greeting": greeting}),
         )
         return {
-            "success": result.success,
+            "success": result.success and result.verified,
             "verified": result.verified,
             "first_contact": True,
-            "error": result.error,
-            "history_detail": result.history_detail,
+            "error": result.error or ("delivery_not_verified" if result.success and not result.verified else None),
+            "history_detail": result.history_detail or (
+                "智联适配器未提供可验证的发送证据，未写入已发送状态"
+                if result.success and not result.verified else ""
+            ),
+            "delivery_kind": result.delivery_kind,
         }, result.target_id
 
     stop_event = throttle_config.get("_workbench_stop_event")
@@ -1236,7 +1240,9 @@ def send_greetings(config: dict, force: bool = False, db_path=None) -> int:
                     db,
                     job["id"],
                     "sent",
-                    greeting[:50] or result_data.get("history_detail", "智联平台默认招呼已确认"),
+                    result_data.get("history_detail", "智联平台默认招呼已确认")
+                    if result_data.get("delivery_kind") == "platform_default_greeting"
+                    else greeting[:50] or result_data.get("history_detail", "已发送招呼语"),
                 )
                 sent_count += 1
                 send_report["sent_count"] = sent_count

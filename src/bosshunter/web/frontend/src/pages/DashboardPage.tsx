@@ -48,6 +48,39 @@ type WorkbenchMode = 'full' | 'collect' | 'rescore' | 'monitor'
 type DashboardView = 'workbench' | 'jobs' | 'monitor'
 type StatsScope = 'today' | 'total'
 
+export async function submitDeliveryWithConfirmations(ids: string[], directSend = false) {
+  const send = async (confirmations: Record<string, boolean> = {}) => {
+    const response = await fetch('/api/workbench/deliver', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_ids: ids, direct_send: directSend, ...confirmations }),
+    })
+    const payload = await response.json().catch(() => ({}))
+    return { response, payload }
+  }
+
+  let { response, payload } = await send()
+  if (response.status === 409 && payload.code === 'delivery_confirmation_required') {
+    const required = payload.confirmations_required || {}
+    const lowScoreCount = Array.isArray(required.low_score_ids) ? required.low_score_ids.length : 0
+    const zhilianCount = Array.isArray(required.zhilian_default_greeting_ids) ? required.zhilian_default_greeting_ids.length : 0
+    const details = [
+      lowScoreCount ? `• ${lowScoreCount} 个岗位低于 AI 推荐分数，确认后仍会进入发送流程。` : '',
+      zhilianCount ? `• ${zhilianCount} 个智联岗位将按平台状态分流：首次联系使用平台默认招呼；已有会话则发送已确认的招呼语。` : '',
+    ].filter(Boolean)
+    if (!window.confirm(`请确认以下投递说明：\n${details.join('\n')}\n\n是否继续？`)) return null
+
+    const retried = await send({
+      confirm_low_score: lowScoreCount > 0,
+      ack_zhilian_default_greeting: zhilianCount > 0,
+    })
+    response = retried.response
+    payload = retried.payload
+  }
+  if (!response.ok) throw new Error(payload.error || '投递失败')
+  return payload
+}
+
 const TASK_STAGE_LABELS = [
   '开始采集岗位',
   '开始 AI 评分',
@@ -607,16 +640,8 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
     const count = ids.length
     if (!window.confirm(`是否投递以下 ${count} 个岗位？确认后将进入投递/打招呼流程。`)) return
     try {
-      const res = await fetch('/api/workbench/deliver', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ job_ids: ids }),
-      })
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}))
-        throw new Error(data.error || '投递失败')
-      }
-      const data = await res.json().catch(() => ({}))
+      const data = await submitDeliveryWithConfirmations(ids)
+      if (!data) return
       if (!ids.some(id => workbench.send_errors.some(job => job.id === id))) {
         setConfirmedDeliveryIds(prev => new Set([...prev, ...ids]))
       }
@@ -689,16 +714,8 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
     setSendingGreetingIds(prev => new Set([...prev, ...ids]))
     setNotice(`正在将 ${count} 个岗位加入发送队列...`)
     try {
-      const res = await fetch('/api/workbench/deliver', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ job_ids: ids, direct_send: true }),
-      })
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}))
-        throw new Error(data.error || '发送失败')
-      }
-      const data = await res.json().catch(() => ({}))
+      const data = await submitDeliveryWithConfirmations(ids, true)
+      if (!data) return
       await refresh()
       setNotice(
         data.already_queued_count === count
@@ -1712,32 +1729,13 @@ function JobsPoolView() {
     }
   }
 
-  const markManuallySent = async (job: Job) => {
-    if (job.source_platform !== 'zhilian' && job.source_platform !== '51job' && job.source_platform !== 'liepin') return
-    const platformLabel = PLATFORM_LABELS[job.source_platform]
-    if (!window.confirm(`请确认：你已经在${platformLabel}完成了这个岗位的投递。此操作只更新 BossHunter 本地记录，不会向平台发送任何内容。`)) return
-    try {
-      const result = await postJobAction('/api/jobs/manual-sent', {
-        job_ids: [job.id],
-        confirmed: true,
-      })
-      refreshJobs()
-      setNotice(
-        result.affected_count
-          ? `已将 ${platformLabel} 岗位标记为“已发送”。`
-          : `该岗位此前已经标记为“已发送”。`
-      )
-    } catch (cause) {
-      setNotice(cause instanceof Error ? cause.message : '标记已发送失败')
-    }
-  }
-
   const deliverSelectedJobs = async () => {
     if (!selectedIds.length) return
     const count = selectedIds.length
     if (!window.confirm(`确认投递已选择的 ${count} 个岗位吗？已验证的平台会进入对应发送队列，仍受发送时间窗口和每日额度限制。`)) return
     try {
-      const result = await postJobAction('/api/workbench/deliver', { job_ids: selectedIds })
+      const result = await submitDeliveryWithConfirmations(selectedIds)
+      if (!result) return
       setSelectedIds([])
       refreshJobs()
       setNotice(
@@ -1859,7 +1857,7 @@ function JobsPoolView() {
   }
 
   const startQuickScoring = async () => {
-    if (!window.confirm('将对岗位池中所有未评分或评分失败的岗位启动 AI 评分，可能产生模型费用，是否继续？')) return
+    if (!window.confirm('将对岗位池中所有未评分、评分失败，以及旧版预筛失败的岗位启动 AI 评分，可能产生模型费用，是否继续？')) return
     setQuickScoring(true)
     try {
       await startScoring({ scope: 'pending', limit: null, job_ids: [], force_rescore: false })
@@ -1934,7 +1932,7 @@ function JobsPoolView() {
           aria-label="按状态批量选择岗位"
         >
           <option value="">批量选择…</option>
-          <option value="filtered">全选已过滤</option>
+          <option value="filtered">全选不推荐</option>
           <option value="pending_confirmation">全选待确认</option>
           <option value="sent">全选已发送/已回复</option>
           <option value="all">全选全部有效岗位</option>
@@ -1980,7 +1978,6 @@ function JobsPoolView() {
         selectedIds={selectedIds}
         onToggleSelected={toggleSelected}
         onSoftDelete={job => void softDelete([job.id])}
-        onMarkManuallySent={job => void markManuallySent(job)}
         loading={loading}
         sortBy={sortBy}
         sortOrder={sortOrder}

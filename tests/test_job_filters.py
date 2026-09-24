@@ -114,8 +114,23 @@ class SalaryParseEdgeCaseTests(unittest.TestCase):
     def test_cross_platform_monthly_salary_formats(self):
         self.assertEqual(parse_monthly_salary_k("8000-12000元/月"), (8.0, 12.0))
         self.assertEqual(parse_monthly_salary_k("8千-12千"), (8.0, 12.0))
+        self.assertEqual(parse_monthly_salary_k("1-1.5万"), (10.0, 15.0))
+        self.assertEqual(parse_monthly_salary_k("1-1.5w"), (10.0, 15.0))
+        self.assertEqual(parse_monthly_salary_k("1-1.5W"), (10.0, 15.0))
         self.assertEqual(parse_monthly_salary_k("1.5-2.5万"), (15.0, 25.0))
         self.assertEqual(parse_monthly_salary_k("15K以上"), (15.0, float("inf")))
+        self.assertEqual(parse_monthly_salary_k("25-38万/年"), (25.0 * 10 / 12, 38.0 * 10 / 12))
+        self.assertEqual(parse_monthly_salary_k("1-1.5万"), (10.0, 15.0))
+        self.assertEqual(parse_monthly_salary_k("8-13K·13薪"), (8.0, 13.0))
+
+    def test_unknown_salary_is_not_hard_filtered_even_for_legacy_true_setting(self):
+        score, reason = quick_score(
+            {"title": "Java开发工程师", "company": "Example", "salary": "薪资面议"},
+            {"profile": {"salary_min": 10, "filter_unparsed_salary": True}},
+        )
+
+        self.assertGreater(score, 0)
+        self.assertIn("交由 AI 综合判断", reason)
 
     def test_daily_salary_is_not_treated_as_monthly(self):
         self.assertIsNone(parse_monthly_salary_k("150-200元/天"))

@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useState } from 'react'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
-import { CheckCircle2, ChevronDown, ChevronUp, ExternalLink, Trash2 } from 'lucide-react'
+import { ChevronDown, ChevronUp, ExternalLink, Trash2 } from 'lucide-react'
 import { getStatusLabel } from '@/lib/status'
 import { PLATFORM_SHORT_LABELS } from '@/lib/platforms'
 import type { Job } from '@/hooks/useDashboard'
@@ -16,7 +16,6 @@ interface JobsTableProps {
   selectedIds: string[]
   onToggleSelected: (id: string) => void
   onSoftDelete?: (job: Job) => void
-  onMarkManuallySent?: (job: Job) => void
   loading?: boolean
   sortBy: JobSortKey
   sortOrder: JobSortOrder
@@ -64,11 +63,11 @@ function statusVariant(status: string) {
   return variants.has(status) ? status : 'default'
 }
 
-export function JobsTable({ jobs, page, pageSize, total, onPageChange, selectedIds, onToggleSelected, onSoftDelete, onMarkManuallySent, loading = false, sortBy, sortOrder, onSortChange }: JobsTableProps) {
+export function JobsTable({ jobs, page, pageSize, total, onPageChange, selectedIds, onToggleSelected, onSoftDelete, loading = false, sortBy, sortOrder, onSortChange }: JobsTableProps) {
   const [expanded, setExpanded] = useState<string | null>(null)
   const [pageInput, setPageInput] = useState(String(page + 1))
   const totalPages = Math.ceil(total / pageSize)
-  const hasActions = Boolean(onSoftDelete || onMarkManuallySent)
+  const hasActions = Boolean(onSoftDelete)
 
   useEffect(() => {
     setPageInput(String(page + 1))
@@ -143,7 +142,6 @@ export function JobsTable({ jobs, page, pageSize, total, onPageChange, selectedI
                 const isExpanded = expanded === job.id
                 const isExternalPlatform = job.source_platform === 'zhilian' || job.source_platform === '51job' || job.source_platform === 'liepin'
                 const jobUrl = safeJobUrl(job)
-                const alreadySent = ['sent', 'replied', 'resume_sent', 'needs_resume', 'follow_up_sent'].includes(job.status)
                 return (
                   <Fragment key={job.id}>
                     <tr
@@ -205,16 +203,6 @@ export function JobsTable({ jobs, page, pageSize, total, onPageChange, selectedI
                               <a href={jobUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 rounded-lg border border-card-border px-2 py-1.5 text-[11px] font-bold text-primary hover:bg-[#FFF0E5]">
                                 <ExternalLink className="h-3.5 w-3.5" />跳转岗位
                               </a>
-                            )}
-                            {isExternalPlatform && onMarkManuallySent && (
-                              <button
-                                type="button"
-                                disabled={alreadySent}
-                                onClick={() => onMarkManuallySent(job)}
-                                className="inline-flex items-center gap-1 rounded-lg bg-primary px-2 py-1.5 text-[11px] font-bold text-white hover:opacity-90 disabled:bg-emerald-50 disabled:text-emerald-700 disabled:opacity-100"
-                              >
-                                <CheckCircle2 className="h-3.5 w-3.5" />{alreadySent ? '已发送' : '我已发送'}
-                              </button>
                             )}
                             {onSoftDelete && (
                               <button type="button" onClick={() => onSoftDelete(job)} className="rounded-lg p-2 text-muted hover:bg-red-50 hover:text-danger" aria-label={`将 ${job.company} ${job.title} 移入回收站`}>

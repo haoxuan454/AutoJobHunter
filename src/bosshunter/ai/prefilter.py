@@ -2,7 +2,7 @@
 
 import re
 
-from bosshunter.job_filters import matching_blocked_company, matching_deal_breaker
+from bosshunter.job_filters import matching_blocked_company, matching_deal_breaker, parse_monthly_salary_k
 
 
 _INTERNSHIP_KEYWORDS = ("实习", "intern", "internship", "管培")
@@ -41,11 +41,9 @@ def quick_score(job: dict, config: dict) -> tuple[int, str]:
 
     salary_min = _as_number(profile.get("salary_min", 0))
     salary_max = _as_number(profile.get("salary_max", 0))
-    parsed_salary = _parse_salary_range_k(job.get("salary") or "")
+    parsed_salary = parse_monthly_salary_k(job.get("salary") or "")
     if parsed_salary is None:
-        if _as_bool(profile.get("filter_unparsed_salary", True)):
-            return 0, "薪资面议/无法解析，已过滤"
-        return 100, "薪资面议/无法解析（已关闭过滤，交由 AI 判断）"
+        return 100, "薪资面议/无法解析，不据此过滤，交由 AI 综合判断"
 
     job_salary_min, job_salary_max = parsed_salary
     if salary_min > 0 and job_salary_max < salary_min:
@@ -67,18 +65,8 @@ def _contains_internship_signal(job: dict) -> bool:
 
 
 def _parse_salary_range_k(salary: str) -> tuple[float, float] | None:
-    range_match = re.search(r"(\d+(?:\.\d+)?)\s*[kK]?\s*-\s*(\d+(?:\.\d+)?)\s*[kK]", salary)
-    if range_match:
-        low = float(range_match.group(1))
-        high = float(range_match.group(2))
-        return low, max(low, high)
-
-    single_match = re.search(r"(\d+(?:\.\d+)?)\s*[kK]", salary)
-    if single_match:
-        value = float(single_match.group(1))
-        return value, value
-
-    return None
+    """Compatibility wrapper for the shared salary parser (K/month)."""
+    return parse_monthly_salary_k(salary)
 
 
 def _as_number(value: object) -> float:
@@ -86,16 +74,6 @@ def _as_number(value: object) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0
-
-
-def _as_bool(value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on", "是"}
-    return True
 
 
 def _format_k(value: float) -> str:

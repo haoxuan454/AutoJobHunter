@@ -72,8 +72,14 @@ def _query_jobs(conn: sqlite3.Connection, options: dict[str, Any]) -> list[dict[
 	where = ["deleted_at IS NULL", "status IN ('pending', 'scored', 'ready', 'filtered')"]
 	params: list[Any] = []
 	if scope in {"pending", "failed"}:
-		where.append("status = ?")
-		params.append("pending")
+		if scope == "pending":
+			# Legacy pre-filter failures are not AI-scored results. Include them in
+			# the normal pending run so fixed pre-filter rules can re-evaluate them.
+			where.append("(status = ? OR (status = 'filtered' AND score_reason LIKE ?))")
+			params.extend(("pending", f"{PREFILTER_PREFIXES[0]}%"))
+		else:
+			where.append("status = ?")
+			params.append("pending")
 	elif scope == "all_scored":
 		where.append("status IN ('scored', 'ready', 'filtered')")
 	elif scope == "selected":

@@ -1,7 +1,7 @@
 export const STATUS_LABELS: Record<string, string> = {
   pending: '待评分',
   scored: '已评分',
-  filtered: '已过滤',
+  filtered: '不推荐',
   ready: '待确认',
   approved: '已确认',
   skipped: '已跳过',
@@ -17,7 +17,7 @@ export const STATUS_LABELS: Record<string, string> = {
 export const ACTION_LABELS: Record<string, string> = {
   scrape: '采集',
   scored: '评分',
-  filtered: '过滤',
+  filtered: '不推荐',
   ready: '待确认',
   approved: '确认',
   skipped: '跳过',
