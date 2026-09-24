@@ -765,6 +765,7 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
                 if result.success and not result.verified else ""
             ),
             "delivery_kind": result.delivery_kind,
+            "metadata": result.metadata,
         }, result.target_id
 
     stop_event = throttle_config.get("_workbench_stop_event")

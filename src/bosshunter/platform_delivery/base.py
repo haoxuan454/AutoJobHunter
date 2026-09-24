@@ -24,6 +24,7 @@ class DeliveryResult:
     message_id: str | None = None
     target_id: str | None = None
     delivery_kind: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class DeliveryAdapter(Protocol):

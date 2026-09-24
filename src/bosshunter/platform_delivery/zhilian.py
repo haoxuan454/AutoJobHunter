@@ -5,7 +5,17 @@ from typing import Any
 
 import time
 
-from bosshunter.browser import click_at, close_tab, evaluate, get_page_info, navigate, new_tab, type_text, wait_for_load
+from bosshunter.browser import (
+    click_at,
+    close_tab,
+    evaluate,
+    get_page_info,
+    get_page_targets,
+    navigate,
+    new_tab,
+    type_text,
+    wait_for_load,
+)
 from .base import DeliveryContext, DeliveryResult, dry_run_result
 from .browser_helpers import inspect_page, parse_result
 
@@ -99,14 +109,16 @@ def _conversation_message_snapshot(target_id: str) -> list[dict[str, str]]:
         const rects = el.getClientRects(), style = getComputedStyle(el);
         return rects.length > 0 && style.display !== 'none' && style.visibility !== 'hidden';
       };
-      const messages = [...document.querySelectorAll('.chat-message,.message-item')]
+      const messages = [...document.querySelectorAll(
+        '.im-message,.chat-message,.message-item'
+      )]
         .filter(visible)
         .map(node => {
           const classes = [node, ...node.querySelectorAll('[class]')]
             .map(el => String(el.className || '').toLowerCase()).join(' ');
-          const sender = /(^|[\s_-])(item-myself|message-self|msg-self|is-self|my-message|message-mine|from-me|outgoing)([\s_-]|$)/.test(classes)
+          const sender = /(^|[\s_-])(im-message__bubble--me|item-myself|message-self|msg-self|is-self|my-message|message-mine|from-me|outgoing)([\s_-]|$)/.test(classes)
             ? 'me' : 'unknown';
-          const textNode = node.querySelector('.msg-text,.text,.message-text');
+          const textNode = node.querySelector('.im-msg-text,.msg-text,.text,.message-text');
           return {sender, text:normalize(textNode ? textNode.innerText || textNode.textContent : node.innerText || node.textContent)};
         }).filter(item => item.text);
       return JSON.stringify({success:true,messages});
@@ -114,6 +126,218 @@ def _conversation_message_snapshot(target_id: str) -> list[dict[str, str]]:
     """, timeout=10))
     messages = result.get("messages")
     return messages if isinstance(messages, list) else []
+
+
+def _zhilian_im_targets() -> list[dict[str, Any]]:
+    """Return existing Zhilian IM tabs without opening or navigating tabs."""
+    targets: list[dict[str, Any]] = []
+    try:
+        raw_targets = get_page_targets()
+    except Exception:
+        raw_targets = []
+    for target in raw_targets or []:
+        url = str(target.get("url") or "")
+        if "i.zhaopin.com" not in url or "/im" not in url:
+            continue
+        target_id = str(target.get("targetId") or target.get("id") or "").strip()
+        if target_id:
+            targets.append({"target_id": target_id, "url": url})
+    return targets
+
+
+def _zhilian_conversation_list_snapshot(target_id: str) -> dict[str, Any]:
+    """Read the rendered Zhilian conversation list; never clicks or scrolls it."""
+    result = parse_result(evaluate(target_id, r"""
+    (() => {
+      const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
+      const visible = el => {
+        const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+        return !!(r.width && r.height && s.display !== 'none' && s.visibility !== 'hidden');
+      };
+      const rows = [...document.querySelectorAll('.im-session-item')]
+        .filter(visible)
+        .map((row, index) => {
+          const text = selector => normalize(row.querySelector(selector)?.innerText || '');
+          const item = {
+            index,
+            hr_name: text('.im-session-item__name'),
+            company: text('.im-session-item__company-name'),
+            title: text('.im-session-item__job'),
+            preview: text('.im-session-item__preview'),
+            time: text('.im-session-item__time'),
+            unread: text('.im-session-item__badge'),
+            active: row.classList.contains('is-active')
+          };
+          item.signature = [item.hr_name, item.company, item.title, item.preview, item.time].join('|');
+          return item;
+        });
+      const panel = document.querySelector('.im-side-panel__list');
+      return JSON.stringify({
+        success: location.hostname === 'i.zhaopin.com' && location.pathname === '/im',
+        rows,
+        loaded_count: rows.length,
+        scroll_height: panel ? panel.scrollHeight : 0,
+        client_height: panel ? panel.clientHeight : 0
+      });
+    })()
+    """, timeout=10))
+    rows = result.get("rows")
+    return {
+        "success": bool(result.get("success")),
+        "rows": rows if isinstance(rows, list) else [],
+        "loaded_count": int(result.get("loaded_count") or 0),
+        "scroll_height": int(result.get("scroll_height") or 0),
+        "client_height": int(result.get("client_height") or 0),
+    }
+
+
+def _zhilian_text_equal(left: str, right: str) -> bool:
+    compact = lambda value: "".join(str(value or "").split()).casefold()
+    return compact(left) == compact(right)
+
+
+def _zhilian_company_equal(left: str, right: str) -> bool:
+    suffixes = ("有限公司", "有限责任公司", "股份有限公司", "集团有限公司")
+    suffixes = ("\u6709\u9650\u516c\u53f8", "\u6709\u9650\u8d23\u4efb\u516c\u53f8", "\u80a1\u4efd\u6709\u9650\u516c\u53f8", "\u96c6\u56e2\u6709\u9650\u516c\u53f8")
+    normalize = lambda value: "".join(str(value or "").split()).casefold()
+    left_value = normalize(left)
+    right_value = normalize(right)
+    if left_value == right_value:
+        return True
+    for suffix in suffixes:
+        compact_suffix = normalize(suffix)
+        left_base = left_value.removesuffix(compact_suffix)
+        right_base = right_value.removesuffix(compact_suffix)
+        if left_base and left_base == right_base:
+            return True
+    return False
+
+
+def _match_zhilian_conversation_row(row: dict[str, Any], job: dict[str, Any]) -> tuple[bool, str]:
+    """Match by HR/company/title, with company-only as an explicitly weak fallback."""
+    company = str(job.get("company") or "").strip()
+    title = str(job.get("title") or "").strip()
+    hr_name = str(job.get("hr_name") or "").strip()
+    row_company = str(row.get("company") or "").strip()
+    row_title = str(row.get("title") or "").strip()
+    row_hr = str(row.get("hr_name") or "").strip()
+    if not company or not row_company or not _zhilian_company_equal(company, row_company):
+        return False, "none"
+    compact_title = "".join(title.split()).casefold()
+    compact_row_title = "".join(row_title.split()).casefold()
+    title_match = bool(title and row_title and (
+        _zhilian_text_equal(title, row_title)
+        or compact_title in compact_row_title
+        or compact_row_title in compact_title
+    ))
+    hr_match = bool(hr_name and row_hr and _zhilian_text_equal(hr_name, row_hr))
+    if title_match and (not hr_name or hr_match):
+        return True, "company_title_hr" if hr_match else "company_title"
+    if hr_match:
+        return True, "company_hr"
+    return True, "company_only"
+
+
+def _active_zhilian_conversation_snapshot(target_id: str) -> dict[str, Any]:
+    """Read the currently rendered Zhilian chat header and message count."""
+    result = parse_result(evaluate(target_id, r"""
+    (() => {
+      const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
+      const visible = el => {
+        const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+        return !!(r.width && r.height && s.display !== 'none' && s.visibility !== 'hidden');
+      };
+      const chat = document.querySelector('.im-main-panel__chat');
+      if (!chat || !visible(chat)) return JSON.stringify({success:false});
+      const text = selector => normalize(chat.querySelector(selector)?.innerText || '');
+      const messages = [...chat.querySelectorAll('.im-message,.chat-message,.message-item')]
+        .filter(visible)
+        .map(node => normalize(node.querySelector('.im-msg-text,.msg-text,.text,.message-text')?.innerText || node.innerText || node.textContent))
+        .filter(Boolean);
+      return JSON.stringify({success:true, hr_name:text('.im-chat-header__name'), company:text('.im-chat-header__meta-text'), title:text('.im-chat-header__job-title'), message_count:messages.length, messages});
+    })()
+    """, timeout=10))
+    return result if isinstance(result, dict) else {"success": False}
+
+
+def _reconcile_zhilian_conversation(
+    job: dict[str, Any],
+    baseline: dict[str, str] | None = None,
+    timeout: float = 3.0,
+) -> dict[str, Any]:
+    """Find a matching rendered session after platform-managed first contact."""
+    deadline = time.time() + timeout
+    last: dict[str, Any] = {"status": "not_checked", "matched": False, "rows_loaded": 0}
+    targets = _zhilian_im_targets()
+    if not targets:
+        return {"status": "im_unavailable", "matched": False, "rows_loaded": 0}
+    while time.time() < deadline:
+        for target in targets:
+            try:
+                snapshot = _zhilian_conversation_list_snapshot(target["target_id"])
+            except Exception:
+                continue
+            rows = snapshot.get("rows") or []
+            last = {
+                "status": "checked",
+                "matched": False,
+                "rows_loaded": len(rows),
+                "list_scroll_height": snapshot.get("scroll_height", 0),
+                "list_client_height": snapshot.get("client_height", 0),
+                "target_id": target["target_id"],
+            }
+            weak_row: tuple[dict[str, Any], str] | None = None
+            for row in rows:
+                matched, quality = _match_zhilian_conversation_row(row, job)
+                if not matched:
+                    continue
+                if quality == "company_only":
+                    weak_row = (row, quality)
+                    continue
+                signature = str(row.get("signature") or "")
+                changed = not baseline or baseline.get(signature) != signature
+                last.update({
+                    "matched": True,
+                    "list_matched": True,
+                    "history_readable": False,
+                    "match_quality": quality,
+                    "changed_since_baseline": changed,
+                    "row": row,
+                    "status": "matched_changed" if changed else "matched_existing",
+                })
+                return last
+            active = _active_zhilian_conversation_snapshot(target["target_id"])
+            if active.get("success"):
+                active_row = {
+                    "hr_name": active.get("hr_name", ""),
+                    "company": active.get("company", ""),
+                    "title": active.get("title", ""),
+                    "preview": "",
+                    "time": "",
+                    "message_count": active.get("message_count", 0),
+                }
+                matched, quality = _match_zhilian_conversation_row(active_row, job)
+                if matched:
+                    last.update({
+                        "matched": True,
+                        "list_matched": False,
+                        "history_readable": bool(active.get("message_count")),
+                        "match_quality": quality,
+                        "status": "active_history_match",
+                        "row": active_row,
+                    })
+                    return last
+            if weak_row:
+                last.update({
+                    "status": "matched_company_only",
+                    "matched": False,
+                    "match_quality": weak_row[1],
+                    "row": weak_row[0],
+                })
+        time.sleep(0.4)
+    if last.get("status") == "not_checked":
+        last["status"] = "im_unavailable"
+    return last
 
 
 def _open_zhilian_job(job: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
@@ -226,6 +450,17 @@ class ZhilianDeliveryAdapter:
         """
         if context.dry_run:
             return dry_run_result(self.platform)
+        baseline: dict[str, str] = {}
+        for im_target in _zhilian_im_targets():
+            try:
+                snapshot = _zhilian_conversation_list_snapshot(im_target["target_id"])
+            except Exception:
+                continue
+            for row in snapshot.get("rows") or []:
+                signature = str(row.get("signature") or "")
+                if signature:
+                    baseline[signature] = signature
+
         target_id, failure = _open_zhilian_job(job)
         if failure:
             return DeliveryResult(False, platform=self.platform, error=failure["error"], history_detail=failure["history_detail"])
@@ -283,23 +518,31 @@ class ZhilianDeliveryAdapter:
                 close_tab(target_id)
                 return DeliveryResult(False, platform=self.platform, error="default_greeting_confirmation_missing", history_detail="智联默认招呼弹框未找到可见的继续沟通按钮", target_id=target_id)
 
-            verification = _wait_for_conversation(target_id)
-            time.sleep(0.8)
-            stable_verification = _post_start_state(target_id)
-            if verification.get("modalVisible") or not (
-                verification.get("imRoute") and verification.get("hasChatInput") and
-                stable_verification.get("imRoute") and stable_verification.get("hasChatInput")
-            ):
-                close_tab(target_id)
-                return DeliveryResult(False, platform=self.platform, error="default_greeting_not_verified", history_detail="已点击继续沟通，但未稳定进入智联 HR 会话输入框；未记录为成功", target_id=target_id)
+            # The modal is Zhilian's authoritative first-contact signal. The
+            # following list reconciliation is best-effort and must not turn a
+            # confirmed platform send into a false failure when the list is
+            # delayed or rendered in another already-open IM tab.
+            reconciliation = _reconcile_zhilian_conversation(job, baseline=baseline)
+            reconciliation_status = str(reconciliation.get("status") or "not_checked")
+            if reconciliation.get("matched"):
+                detail = "智联平台默认招呼已确认发送，会话列表已匹配目标 HR/公司/岗位。"
+            elif reconciliation_status in {"im_unavailable", "not_checked"}:
+                detail = "智联平台默认招呼已确认发送，会话列表暂未可读取，后续可继续同步核验。"
+            else:
+                detail = "智联平台默认招呼已确认发送，会话列表暂未匹配，不能据此判定发送失败。"
             return DeliveryResult(
                 True,
                 True,
                 self.platform,
                 None,
-                "智联平台默认招呼已确认发送；这不代表 HR 已回复，后续需单独监测智联会话列表。",
+                detail,
                 target_id=target_id,
                 delivery_kind="platform_default_greeting",
+                metadata={
+                    "platform_confirmed": True,
+                    "conversation_reconciled": bool(reconciliation.get("matched")),
+                    "conversation_reconciliation": reconciliation,
+                },
             )
         except Exception as exc:
             close_tab(target_id)

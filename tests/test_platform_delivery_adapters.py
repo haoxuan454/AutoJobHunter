@@ -66,6 +66,7 @@ class PlatformDeliveryAdapterTests(unittest.TestCase):
              patch("bosshunter.platform_delivery.zhilian._entry_state", return_value={"mode": "first_contact"}), \
              patch("bosshunter.platform_delivery.zhilian._wait_for_conversation", return_value=verified_chat), \
              patch("bosshunter.platform_delivery.zhilian._post_start_state", return_value=verified_chat), \
+             patch("bosshunter.platform_delivery.zhilian._zhilian_im_targets", return_value=[]), \
              patch("bosshunter.platform_delivery.zhilian._click_zhilian_selector", fake_click), \
              patch("bosshunter.platform_delivery.zhilian.evaluate", fake_eval), \
              patch("bosshunter.platform_delivery.zhilian.close_tab"):
@@ -86,14 +87,15 @@ class PlatformDeliveryAdapterTests(unittest.TestCase):
              patch("bosshunter.platform_delivery.zhilian._entry_state", return_value={"mode": "first_contact"}), \
              patch("bosshunter.platform_delivery.zhilian._click_zhilian_selector", return_value={"success": True}), \
              patch("bosshunter.platform_delivery.zhilian._wait_for_default_greeting_modal", return_value={"confirmation": True, "visible": True}), \
-             patch("bosshunter.platform_delivery.zhilian._wait_for_conversation", return_value={"imRoute": False, "hasChatInput": False}), \
-             patch("bosshunter.platform_delivery.zhilian._post_start_state", return_value={"imRoute": False, "hasChatInput": False}), \
+             patch("bosshunter.platform_delivery.zhilian._zhilian_im_targets", return_value=[]), \
              patch("bosshunter.platform_delivery.zhilian.close_tab"):
             result = ZhilianDeliveryAdapter().start_conversation({}, DeliveryContext())
 
-        self.assertFalse(result.success)
-        self.assertFalse(result.verified)
-        self.assertEqual(result.error, "default_greeting_not_verified")
+        self.assertTrue(result.success)
+        self.assertTrue(result.verified)
+        self.assertEqual(result.delivery_kind, "platform_default_greeting")
+        self.assertTrue(result.metadata["platform_confirmed"])
+        self.assertFalse(result.metadata["conversation_reconciled"])
 
     def test_sender_does_not_accept_zhilian_success_without_verification(self):
         from unittest.mock import patch
@@ -137,6 +139,38 @@ class PlatformDeliveryAdapterTests(unittest.TestCase):
 
         self.assertFalse(result["success"])
         self.assertEqual(result["error"], "message_sent_not_verified")
+
+    def test_zhilian_message_snapshot_reads_live_im_message_dom(self):
+        import json
+        from unittest.mock import patch
+        from bosshunter.platform_delivery.zhilian import _conversation_message_snapshot
+
+        def fake_evaluate(_target, expression, timeout=10):
+            self.assertIn(".im-message", expression)
+            return json.dumps({"success": True, "messages": [{"sender": "me", "text": "hello"}]})
+
+        with patch("bosshunter.platform_delivery.zhilian.evaluate", side_effect=fake_evaluate):
+            self.assertEqual(_conversation_message_snapshot("target"), [{"sender": "me", "text": "hello"}])
+
+    def test_zhilian_conversation_row_prefers_company_and_title(self):
+        from bosshunter.platform_delivery.zhilian import _match_zhilian_conversation_row
+
+        matched, quality = _match_zhilian_conversation_row(
+            {"company": "示例科技", "title": "Java 开发工程师", "hr_name": "李女士"},
+            {"company": "示例科技", "title": "Java开发工程师", "hr_name": "李女士"},
+        )
+        self.assertTrue(matched)
+        self.assertEqual(quality, "company_title_hr")
+
+    def test_zhilian_company_matching_accepts_platform_short_name(self):
+        from bosshunter.platform_delivery.zhilian import _match_zhilian_conversation_row
+
+        matched, quality = _match_zhilian_conversation_row(
+            {"company": "长沙沅麓启晟教育科技", "title": "Python软件开发工程师", "hr_name": "朱莹莹"},
+            {"company": "长沙沅麓启晟教育科技有限公司", "title": "Python软件开发工程师", "hr_name": "朱莹莹"},
+        )
+        self.assertTrue(matched)
+        self.assertEqual(quality, "company_title_hr")
 
     def test_zhilian_hidden_modal_template_is_accepted_after_entry_changes(self):
         from unittest.mock import patch
