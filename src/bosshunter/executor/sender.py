@@ -27,6 +27,7 @@ from bosshunter.collection.capabilities import platform_supports
 from bosshunter.throttle import RequestThrottle, SendWindowChecker, ProgressiveBackoff, should_take_day_off
 from bosshunter.platform_safety import PlatformAccessGuard, PlatformSafetyStop
 from bosshunter.platform_delivery import DeliveryContext, get_delivery_adapter
+from bosshunter.conversation_bridge import record_verified_delivery
 
 console = Console()
 
@@ -767,6 +768,7 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
             ),
             "delivery_kind": result.delivery_kind,
             "metadata": result.metadata,
+            "message_id": result.message_id,
         }, result.target_id
 
     if str(job.get("source_platform") or "boss").strip().lower() == "liepin":
@@ -786,6 +788,7 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
             ),
             "delivery_kind": result.delivery_kind,
             "metadata": result.metadata,
+            "message_id": result.message_id,
         }, result.target_id
 
     stop_event = throttle_config.get("_workbench_stop_event")
@@ -1267,6 +1270,24 @@ def send_greetings(config: dict, force: bool = False, db_path=None) -> int:
                     if result_data.get("delivery_kind") == "existing_conversation_reused"
                     else greeting[:50] or result_data.get("history_detail", "已发送招呼语"),
                 )
+                if result_data.get("verified"):
+                    conversation_db = None
+                    try:
+                        conversation_db = get_db(db_path)
+                        record_verified_delivery(
+                            conversation_db,
+                            job=job,
+                            platform=str(job.get("source_platform") or "boss").strip().lower(),
+                            greeting=greeting,
+                            delivery_kind=result_data.get("delivery_kind") or "custom_message",
+                            metadata=result_data.get("metadata") or {},
+                            message_id=result_data.get("message_id"),
+                        )
+                    except Exception as exc:
+                        console.print(f"[yellow]    ! 本地会话记录失败（平台发送已验证成功）: {exc}[/yellow]")
+                    finally:
+                        if conversation_db is not None:
+                            conversation_db.close()
                 sent_count += 1
                 send_report["sent_count"] = sent_count
                 backoff.record_success()

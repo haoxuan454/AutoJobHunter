@@ -76,7 +76,7 @@
     },
     {
       "key": "throttle",
-      "label": "发送节流与平台风控",
+      "label": "发送安全与平台采集风控",
       "icon": "Shield",
       "fields": [
         {"key": "daily_limit", "label": "每日发送上限", "type": "number", "min": 1, "max": 200, "default": 30, "description": "后端发送器按当天已发送量执行此硬上限"},

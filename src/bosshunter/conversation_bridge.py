@@ -18,9 +18,74 @@ from bosshunter.notification_service import process_hr_message
 def _stable_conversation_id(job: dict[str, Any], conversation: dict[str, Any] | None, platform: str) -> str:
     conversation = conversation or {}
     external = str(conversation.get("external_conversation_id") or conversation.get("hr_external_id") or "").strip()
-    identity = external or "|".join((str(job.get("id") or ""), str(conversation.get("hr_name") or job.get("hr_name") or ""), str(conversation.get("company") or job.get("company") or "")))
-    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    hr_name = str(conversation.get("hr_name") or job.get("hr_name") or "").strip()
+    company = str(conversation.get("company") or job.get("company") or "").strip()
+    job_id = str(job.get("id") or conversation.get("job_id") or "").strip()
+    identity = external or "|".join((hr_name, company, job_id))
+    digest = hashlib.sha256(f"{platform}|{identity}".encode("utf-8")).hexdigest()[:24]
     return f"{platform}:{digest}"
+
+
+def record_verified_delivery(
+    conn,
+    *,
+    job: dict[str, Any],
+    platform: str,
+    greeting: str = "",
+    delivery_kind: str = "custom_message",
+    metadata: dict[str, Any] | None = None,
+    message_id: str | None = None,
+) -> dict[str, Any]:
+    """Create/update a local conversation after a platform delivery was verified."""
+    metadata = metadata or {}
+    conversation = metadata.get("conversation") or metadata.get("conversation_row") or {}
+    if not isinstance(conversation, dict):
+        conversation = {}
+    external_id = str(
+        metadata.get("external_conversation_id")
+        or conversation.get("external_conversation_id")
+        or conversation.get("contact_id")
+        or ""
+    ).strip()
+    hr_external_id = str(metadata.get("hr_external_id") or conversation.get("hr_external_id") or "").strip()
+    normalized = {**conversation, "external_conversation_id": external_id, "hr_external_id": hr_external_id}
+    conversation_id = _stable_conversation_id(job, normalized, platform)
+    repo = ConversationRepository(conn)
+    if repo.is_deleted(conversation_id):
+        return {"conversation": None, "inserted": [], "deleted": True}
+
+    record = repo.upsert_conversation({
+        "id": conversation_id,
+        "user_id": "default",
+        "platform": platform,
+        "external_conversation_id": external_id,
+        "hr_external_id": hr_external_id,
+        "hr_name": str(normalized.get("hr_name") or job.get("hr_name") or ""),
+        "hr_title": str(normalized.get("hr_title") or job.get("title") or "") or None,
+        "company_id": str(normalized.get("company") or job.get("company") or "") or None,
+        "job_id": str(job.get("id") or "") or None,
+        "hr_profile_url": str(normalized.get("hr_profile_url") or "") or None,
+        "company_url": str(normalized.get("company_url") or "") or None,
+        "status": "active",
+    })
+    content = str(greeting or "").strip()
+    sender_type = "user"
+    if delivery_kind == "platform_default_greeting" and not content:
+        sender_type = "system"
+        content = "平台默认招呼已确认"
+    if content:
+        source_key = str(message_id or f"send:{job.get('id') or conversation_id}:{delivery_kind}")
+        inserted = repo.append_messages(conversation_id, [IncomingMessage(
+            sender_type=sender_type,
+            content=content,
+            platform_message_id=source_key,
+            source_url=str(normalized.get("source_url") or job.get("url") or ""),
+            raw_payload={"source": "verified_delivery", "delivery_kind": delivery_kind},
+            is_sent=sender_type == "user",
+        )])
+    else:
+        inserted = []
+    return {"conversation": record, "inserted": inserted, "deleted": False}
 
 
 def sync_extracted_messages(
@@ -73,6 +138,8 @@ def sync_extracted_messages(
             is_sent=sender == "me",
         ))
     inserted = repo.append_messages(conversation_id, incoming)
+    if not incoming:
+        return {"conversation": record, "inserted": inserted, "notification": None, "notifications": []}
     cursor = hashlib.sha256("\x1e".join(f"{item.sender_type}:{item.content}" for item in incoming).encode("utf-8")).hexdigest()
     repo.save_cursor(conversation_id, cursor)
 

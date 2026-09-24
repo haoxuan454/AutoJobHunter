@@ -683,55 +683,12 @@ export default function ConfigPage() {
         </SectionCard>
 
         {/* Anti-monitoring Section */}
-        <SectionCard title="发送节流与平台风控" sectionKey="throttle" expanded={expandedSections} toggle={toggleSection}>
+        <SectionCard title="反监测设置" sectionKey="throttle" expanded={expandedSections} toggle={toggleSection}>
           <div className="space-y-4">
-            <div className="grid gap-4 md:grid-cols-2">
-              <Field label="BOSS 单日搜索页上限">
-                <Input type="number" value={config.collection?.daily_search_page_limit ?? 60} onChange={e => updateConfig('collection.daily_search_page_limit', Number(e.target.value))} min={1} max={200} />
-                {bossTheoreticalPages > 0 && (
-                  <p className={`mt-1 text-xs ${bossTheoreticalExceedsLimit ? 'font-bold text-amber-700' : 'text-muted'}`}>
-                    当前搜索组合理论最多 {bossTheoreticalPages} 页；{bossTheoreticalExceedsLimit ? `超过本上限 ${bossDailySearchLimit} 页，会在设置处和执行时提示。` : '未超过本上限。'}
-                  </p>
-                )}
-              </Field>
-              <Field label="BOSS 单日详情页尝试上限">
-                <Input type="number" value={config.collection?.daily_detail_page_limit ?? 150} onChange={e => updateConfig('collection.daily_detail_page_limit', Number(e.target.value))} min={1} max={500} />
-              </Field>
-              <Field label="BOSS 连续页面失败停止阈值">
-                <Input type="number" value={config.collection?.max_consecutive_page_failures ?? 3} onChange={e => updateConfig('collection.max_consecutive_page_failures', Number(e.target.value))} min={1} max={10} />
-              </Field>
-              <NumberRangeField
-                label="BOSS 风险暂停范围（分钟）"
-                minValue={config.collection?.risk_pause_min_minutes ?? 5}
-                maxValue={config.collection?.risk_pause_max_minutes ?? 10}
-                onMinChange={value => updateConfig('collection.risk_pause_min_minutes', value)}
-                onMaxChange={value => updateConfig('collection.risk_pause_max_minutes', value)}
-                min={1}
-                max={60}
-              />
-              <Field label="BOSS 操作间隔倍率">
-                <Input type="number" value={config.collection?.collection_delay_multiplier ?? 1.5} onChange={e => updateConfig('collection.collection_delay_multiplier', Number(e.target.value))} min={1} max={5} step={0.1} />
-                <p className="mt-1 text-xs text-muted">同时作用于 BOSS 采集和监测的页面操作与每轮等待；数值越大，间隔越长。</p>
-              </Field>
-              <NumberRangeField
-                label="BOSS 采集后投递冷却范围（分钟）"
-                minValue={config.collection?.delivery_cooldown_min_minutes ?? 5}
-                maxValue={config.collection?.delivery_cooldown_max_minutes ?? 15}
-                onMinChange={value => updateConfig('collection.delivery_cooldown_min_minutes', value)}
-                onMaxChange={value => updateConfig('collection.delivery_cooldown_max_minutes', value)}
-                min={0}
-                max={240}
-              />
+            <div className="border-b border-card-border pb-3">
+              <h3 className="flex items-center gap-2 text-sm font-black text-foreground"><ShieldAlert className="h-4 w-4 text-primary" />通用发送安全</h3>
+              <p className="mt-1 text-xs text-muted">这些限制适用于所有支持发送的平台，优先保障人工确认、发送节奏和风险冷却。</p>
             </div>
-            <p className="text-xs text-muted">完成 BOSS 采集后，每次会在设定区间内随机等待一次再投递；默认为 5–15 分钟，单独采集不受影响。</p>
-            <Field label="BOSS 单日页面访问总上限">
-              <Input type="number" value={config.safety?.daily_platform_page_limit ?? 500} onChange={e => updateConfig('safety.daily_platform_page_limit', Number(e.target.value))} min={1} max={2000} />
-              <p className="mt-1 text-xs text-muted">只合计 BOSS 采集、自动投递和监测打开的页面；智联和 51job 不占用。</p>
-            </Field>
-            <Field label="触发平台风控后的冷却时长（分钟）">
-              <Input type="number" value={config.safety?.risk_lock_minutes ?? 10} onChange={e => updateConfig('safety.risk_lock_minutes', Number(e.target.value))} min={1} max={1440} />
-              <p className="mt-1 text-xs text-muted">触发平台安全锁后，发送与监测逻辑会按此时长暂停；不改变各平台的页面操作适配逻辑。</p>
-            </Field>
             <div className="grid gap-4 md:grid-cols-2">
               <Field label="每日发送上限">
                 <Input type="number" value={config.throttle?.daily_limit ?? 30} onChange={e => updateConfig('throttle.daily_limit', Number(e.target.value))} min={1} max={200} />
@@ -769,14 +726,44 @@ export default function ConfigPage() {
               </div>
               <Field label="发送时间窗口">
                 <TagsInput value={config.throttle?.send_windows ?? []} onChange={v => updateConfig('throttle.send_windows', v)} placeholder="HH:MM-HH:MM" disabled={!(config.throttle?.send_window_enabled ?? false)} />
-                <p className="mt-1 text-xs text-muted">关闭时间限制时仍保留这些时间段；开启后仅在时间段内发送和执行受窗口约束的后台任务。</p>
+                <p className="mt-1 text-xs text-muted">关闭时间限制时仍保留这些时间段；开启后仅在时间段内发送。</p>
               </Field>
             </div>
             <div className="grid gap-4 md:grid-cols-2">
               <Field label="随机休息概率">
                 <Input type="number" value={config.throttle?.day_off_probability ?? 0.05} onChange={e => updateConfig('throttle.day_off_probability', Number(e.target.value))} step={0.01} min={0} max={1} />
               </Field>
+              <Field label="触发平台风控后的冷却时长（分钟）">
+                <Input type="number" value={config.safety?.risk_lock_minutes ?? 10} onChange={e => updateConfig('safety.risk_lock_minutes', Number(e.target.value))} min={1} max={1440} />
+              </Field>
             </div>
+            <div className="border-b border-card-border pb-3 pt-4">
+              <h3 className="flex items-center gap-2 text-sm font-black text-foreground"><Activity className="h-4 w-4 text-primary" />BOSS 采集风控</h3>
+              <p className="mt-1 text-xs text-muted">仅影响 BOSS 页面采集、访问频率和采集后投递冷却，不改变智联或猎聘发送限制。</p>
+            </div>
+            <div className="grid gap-4 md:grid-cols-2">
+              <Field label="BOSS 单日搜索页上限">
+                <Input type="number" value={config.collection?.daily_search_page_limit ?? 60} onChange={e => updateConfig('collection.daily_search_page_limit', Number(e.target.value))} min={1} max={200} />
+                {bossTheoreticalPages > 0 && <p className={`mt-1 text-xs ${bossTheoreticalExceedsLimit ? 'font-bold text-amber-700' : 'text-muted'}`}>当前搜索组合理论最多 {bossTheoreticalPages} 页；{bossTheoreticalExceedsLimit ? `超过本上限 ${bossDailySearchLimit} 页，会在设置处和执行时提示。` : '未超过本上限。'}</p>}
+              </Field>
+              <Field label="BOSS 单日详情页尝试上限">
+                <Input type="number" value={config.collection?.daily_detail_page_limit ?? 150} onChange={e => updateConfig('collection.daily_detail_page_limit', Number(e.target.value))} min={1} max={500} />
+              </Field>
+              <Field label="BOSS 连续页面失败停止阈值">
+                <Input type="number" value={config.collection?.max_consecutive_page_failures ?? 3} onChange={e => updateConfig('collection.max_consecutive_page_failures', Number(e.target.value))} min={1} max={10} />
+              </Field>
+              <NumberRangeField label="BOSS 风险暂停范围（分钟）" minValue={config.collection?.risk_pause_min_minutes ?? 5} maxValue={config.collection?.risk_pause_max_minutes ?? 10} onMinChange={value => updateConfig('collection.risk_pause_min_minutes', value)} onMaxChange={value => updateConfig('collection.risk_pause_max_minutes', value)} min={1} max={60} />
+              <Field label="BOSS 操作间隔倍率">
+                <Input type="number" value={config.collection?.collection_delay_multiplier ?? 1.5} onChange={e => updateConfig('collection.collection_delay_multiplier', Number(e.target.value))} min={1} max={5} step={0.1} />
+                <p className="mt-1 text-xs text-muted">同时作用于 BOSS 采集和监测的页面操作与每轮等待；数值越大，间隔越长。</p>
+              </Field>
+              <NumberRangeField label="BOSS 采集后投递冷却范围（分钟）" minValue={config.collection?.delivery_cooldown_min_minutes ?? 5} maxValue={config.collection?.delivery_cooldown_max_minutes ?? 15} onMinChange={value => updateConfig('collection.delivery_cooldown_min_minutes', value)} onMaxChange={value => updateConfig('collection.delivery_cooldown_max_minutes', value)} min={0} max={240} />
+            </div>
+            <p className="text-xs text-muted">完成 BOSS 采集后，每次会在设定区间内随机等待一次再投递；默认为 5–15 分钟，单独采集不受影响。</p>
+            <Field label="BOSS 单日页面访问总上限">
+              <Input type="number" value={config.safety?.daily_platform_page_limit ?? 500} onChange={e => updateConfig('safety.daily_platform_page_limit', Number(e.target.value))} min={1} max={2000} />
+              <p className="mt-1 text-xs text-muted">只合计 BOSS 采集、自动投递和监测打开的页面；智联和 51job 不占用。</p>
+            </Field>
           </div>
         </SectionCard>
 
