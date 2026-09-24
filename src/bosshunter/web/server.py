@@ -1897,9 +1897,18 @@ def api_workbench_deliver():
 			invalid_ids = [job_id for job_id in job_ids if job_id not in active_ids]
 			if invalid_ids:
 				return _json_response({"error": "所选岗位不存在或已进入回收站", "invalid_ids": invalid_ids}, 409)
-			unsupported = [
+			manual_required_ids = [
 				str(row["id"])
 				for row in platform_rows
+				if str(row["source_platform"] or "boss") == "51job"
+			]
+			delivery_rows = [
+				row for row in platform_rows
+				if str(row["source_platform"] or "boss") != "51job"
+			]
+			unsupported = [
+				str(row["id"])
+				for row in delivery_rows
 				if not platform_supports(str(row["source_platform"] or "boss"), "deliver")
 			]
 			if unsupported:
@@ -1910,7 +1919,7 @@ def api_workbench_deliver():
 				}, 403)
 			pending_review_ids = [
 				str(row["id"])
-				for row in platform_rows
+				for row in delivery_rows
 				if direct_send and str(row["greeting_selection"] or "") == "pending"
 			]
 			if pending_review_ids:
@@ -1921,24 +1930,24 @@ def api_workbench_deliver():
 				}, 409)
 			low_score_ids = {
 				str(row["id"])
-				for row in platform_rows
+				for row in delivery_rows
 				if _is_user_confirmable_low_score(row, low_score_threshold)
 			}
 			zhilian_default_greeting_ids = [
 				str(row["id"])
-				for row in platform_rows
+				for row in delivery_rows
 				if str(row["source_platform"] or "boss") == "zhilian"
 			]
 			allowed_statuses = {"ready", "approved", "error"} if direct_send else {"ready", "approved"}
 			completed_statuses = {"sent", "replied", "resume_sent", "needs_resume", "follow_up_sent"}
 			already_sent_ids = {
 				str(row["id"])
-				for row in platform_rows
+				for row in delivery_rows
 				if str(row["status"] or "") in completed_statuses
 			}
 			missing_greeting_ids = {
 				str(row["id"])
-				for row in platform_rows
+				for row in delivery_rows
 				if direct_send
 				and str(row["source_platform"] or "boss") != "zhilian"
 				and (str(row["status"] or "") in allowed_statuses or str(row["id"]) in low_score_ids)
@@ -1946,7 +1955,7 @@ def api_workbench_deliver():
 			}
 			not_ready_ids = {
 				str(row["id"])
-				for row in platform_rows
+				for row in delivery_rows
 				if str(row["status"] or "") not in allowed_statuses
 				and str(row["id"]) not in low_score_ids
 				and str(row["status"] or "") not in completed_statuses
@@ -1983,6 +1992,26 @@ def api_workbench_deliver():
 					"code": "delivery_confirmation_required",
 					"confirmations_required": confirmations_required,
 				}, 409)
+			manual_payload = {
+				"manual_required_ids": manual_required_ids,
+				"manual_required_count": len(manual_required_ids),
+				"manual_required_message": "51job 暂不支持向岗位 HR 自动投递消息，请打开平台手动联系",
+			}
+			status_job_ids = [job_id for job_id in job_ids if job_id not in manual_required_ids]
+			if manual_required_ids:
+				manual_db = _get_web_db()
+				try:
+					for job_id in manual_required_ids:
+						current_row = next((row for row in platform_rows if str(row["id"]) == job_id), None)
+						if current_row and str(current_row["status"] or "") == "manual_required":
+							continue
+						update_job_status(manual_db, job_id, "manual_required")
+						update_job_last_error(manual_db, job_id, manual_payload["manual_required_message"], "manual_required")
+						add_history(manual_db, job_id, "manual_required", manual_payload["manual_required_message"])
+				finally:
+					manual_db.close()
+			if not status_job_ids:
+				return _json_response({"success": True, **manual_payload})
 
 			status = task_runner.status()
 			active_task = status.get("active") or {}
@@ -2018,11 +2047,10 @@ def api_workbench_deliver():
 				)
 
 			queued_payload = None
-			status_job_ids = job_ids
 			if delivery_task:
 				queued_payload, status_job_ids = _queue_active_delivery(
 					delivery_task,
-					job_ids,
+					status_job_ids,
 					direct_send=direct_send,
 				)
 
@@ -2040,10 +2068,10 @@ def api_workbench_deliver():
 				db.close()
 
 			if queued_payload is not None:
-				return _json_response(queued_payload)
+				return _json_response({**queued_payload, **manual_payload})
 
 			if waiting_task:
-				waiting_task.context["confirmed_job_ids"] = job_ids
+				waiting_task.context["confirmed_job_ids"] = status_job_ids
 				waiting_task.context["delivery_requested"] = True
 				confirmation_event = waiting_task.context.get("confirmation_event")
 				if isinstance(confirmation_event, Event):
@@ -2054,19 +2082,19 @@ def api_workbench_deliver():
 				return _json_response(
 					_queue_monitor_delivery(
 						monitoring_task,
-						job_ids,
+						status_job_ids,
 						direct_send=direct_send,
 					)
 				)
 
-			deliver_options = {"_workbench_job_ids": job_ids}
+			deliver_options = {"_workbench_job_ids": status_job_ids}
 			if direct_send:
 				# The greeting is already finalized on the review card. Keep direct
 				# send separate from generation so a click cannot replace the text or
 				# move the job back into greeting review.
 				deliver_options["_workbench_skip_greeting"] = True
 			task = task_runner.start("deliver", _task_config(deliver_options))
-			return _json_response(task)
+			return _json_response({**task, **manual_payload})
 	except TaskAlreadyRunningError as e:
 		return _json_response({"error": str(e)}, 409)
 	except Exception as e:

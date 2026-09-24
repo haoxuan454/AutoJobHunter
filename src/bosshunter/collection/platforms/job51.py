@@ -704,7 +704,7 @@ class Job51Collector:
 
         # 反检测前置：时间窗口 + 随机休息日（复用 BossHunter throttle 配置）
         throttle_cfg = self.config.get("throttle", {}) if isinstance(self.config.get("throttle"), dict) else {}
-        send_windows = throttle_cfg.get("send_windows", ["09:00-16:00"])
+        send_windows = throttle_cfg.get("send_windows", [])
         if not SendWindowChecker(send_windows).is_active():
             return PlatformCollectionResult(self.platform, "completed", "outside_window",
                                             f"当前不在采集时间窗口内（{send_windows}）")

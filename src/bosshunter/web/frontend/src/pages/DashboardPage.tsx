@@ -176,7 +176,7 @@ function taskErrorFeedback(error: string) {
   if (normalized.includes('zhipin') || normalized.includes('登录') || normalized.includes('login')) {
     return {
       title: '招聘平台页面或登录状态异常',
-      detail: '请在已连接的 Google Chrome 中打开 BOSS 直聘并确认账号仍处于登录状态。',
+      detail: '请在已连接的 Google Chrome 中打开并登录对应招聘平台（BOSS 直聘、智联招聘或猎聘），并确认 Chrome 调试连接可用。',
     }
   }
   return {
@@ -647,7 +647,9 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
       }
       await refresh()
       setNotice(
-        data.already_queued_count === count
+        data.manual_required_count
+          ? `${data.manual_required_count} 个 51job 岗位暂不支持自动 HR 投递，请打开平台手动联系${data.queued_count ? `；另有 ${data.queued_count} 个岗位已进入发送队列` : ''}`
+          : data.already_queued_count === count
           ? `所选 ${count} 个岗位已在当前发送队列中。`
           : data.queued_count
             ? `已将 ${data.queued_count} 个岗位追加到当前发送队列。`
@@ -877,7 +879,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <div className="text-sm font-black">任务运行状态</div>
-                <p className="mt-1 text-xs leading-5 text-muted">如果点击后浏览器没有反应，请先打开 BOSS 直聘并确认已登录；常见失败原因是 BOSS 未登录或 Chrome 调试连接不可用。</p>
+                <p className="mt-1 text-xs leading-5 text-muted">如果点击后浏览器没有反应，请先打开并登录对应招聘平台（BOSS 直聘、智联招聘或猎聘）；常见失败原因是平台未登录或 Chrome 调试连接不可用。</p>
               </div>
             <div className="flex flex-wrap items-center gap-2">
               <span className="rounded-full bg-[#FFF0E5] px-3 py-1 text-xs font-black text-primary">
@@ -1523,7 +1525,7 @@ function JobDetailModal({ job, onClose, onChanged }: { job: Job; onClose: () => 
           <InfoBlock label="HR" value={[job.hr_name, job.hr_title].filter(Boolean).join(' · ') || '-'} />
           <InfoBlock label="招聘者活跃" value={job.hr_active || '活跃度未知'} />
           <InfoBlock label="公司" value={[job.company_size, job.company_industry].filter(Boolean).join(' · ') || '-'} />
-          <InfoBlock label="来源平台" value={job.source_platform && job.source_platform !== 'boss' && PLATFORM_LABELS[job.source_platform] ? `${PLATFORM_LABELS[job.source_platform]}｜当前只开放采集` : 'BOSS 直聘'} />
+          <InfoBlock label="来源平台" value={job.source_platform && job.source_platform !== 'boss' && PLATFORM_LABELS[job.source_platform] ? `${PLATFORM_LABELS[job.source_platform]}｜${job.source_platform === '51job' ? '当前仅支持人工联系' : '使用平台专属沟通链路'}` : 'BOSS 直聘｜使用平台专属沟通链路'} />
           <InfoBlock label="匹配分" value={String(job.score || '-')} />
           <InfoBlock label="定制简历" value={job.resume_path || '未生成'} />
         </div>

@@ -11,7 +11,7 @@ class PlatformDeliveryAdapterTests(unittest.TestCase):
             self.assertEqual(adapter.platform, platform)
 
     def test_unverified_platforms_fail_closed_without_dom_reuse(self):
-        for platform in ("zhilian", "51job", "liepin"):
+        for platform in ("zhilian", "51job"):
             result = get_delivery_adapter(platform).send_greeting(
                 {"id": "fixture-job", "url": "https://fixture.invalid/job"},
                 "本地测试，不发送到外部平台",
@@ -24,8 +24,9 @@ class PlatformDeliveryAdapterTests(unittest.TestCase):
 
     def test_only_accepted_zhilian_adapter_is_marked_verified(self):
         self.assertTrue(get_delivery_adapter("zhilian").verified)
-        for platform in ("51job", "liepin"):
+        for platform in ("51job",):
             self.assertFalse(get_delivery_adapter(platform).verified)
+        self.assertTrue(get_delivery_adapter("liepin").verified)
 
     def test_boss_adapter_does_not_bypass_legacy_sender(self):
         result = get_delivery_adapter("boss").send_greeting(
@@ -307,6 +308,96 @@ class PlatformDeliveryAdapterTests(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertTrue(result.verified)
+
+    def test_liepin_live_contact_dom_is_read_with_platform_specific_selectors(self):
+        import json
+        from unittest.mock import patch
+        from bosshunter.platform_delivery.liepin import _liepin_conversation_list_snapshot, _liepin_chat_snapshot
+
+        def fake_evaluate(_target, expression, timeout=10):
+            if "im-ui-contact-info" in expression:
+                self.assertIn("im-ui-contact-title-name", expression)
+                return json.dumps({
+                    "success": True,
+                    "loaded_count": 1,
+                    "rows": [{
+                        "hr_name": "苏先生",
+                        "company_role": "招聘主管·湃泊科技",
+                        "last_message": "您可以修改打招呼语，去修改＞＞",
+                    }],
+                })
+            self.assertIn("im-ui-message-item", expression)
+            self.assertIn("im-ui-textarea", expression)
+            self.assertIn("im-ui-basic-send-btn", expression)
+            return json.dumps({
+                "success": True,
+                "has_input": True,
+                "has_send": True,
+                "messages": ["您好，正在积极寻找新的机会，对贵公司此职位尤为关注，期待合作。"],
+            })
+
+        with patch("bosshunter.platform_delivery.liepin.evaluate", side_effect=fake_evaluate):
+            rows = _liepin_conversation_list_snapshot("liepin-target")
+            chat = _liepin_chat_snapshot("liepin-target")
+
+        self.assertEqual(rows["loaded_count"], 1)
+        self.assertEqual(rows["rows"][0]["company_role"], "招聘主管·湃泊科技")
+        self.assertTrue(chat["has_input"])
+        self.assertTrue(chat["has_send"])
+
+    def test_liepin_targets_include_logged_in_contact_page(self):
+        from unittest.mock import patch
+        from bosshunter.platform_delivery.liepin import _liepin_im_targets
+
+        with patch("bosshunter.platform_delivery.liepin.get_page_targets", return_value=[
+            {"targetId": "contacts", "url": "https://c.liepin.com/?time=1"},
+            {"targetId": "other", "url": "https://example.invalid/"},
+        ]):
+            targets = _liepin_im_targets()
+
+        self.assertEqual(targets, [{"target_id": "contacts", "url": "https://c.liepin.com/?time=1"}])
+
+    def test_sender_uses_liepin_adapter_and_requires_verified_result(self):
+        from unittest.mock import patch
+        from bosshunter.executor.sender import _send_greeting_once
+        from bosshunter.platform_delivery.base import DeliveryResult
+
+        adapter = type("Adapter", (), {})()
+        adapter.send_greeting = lambda job, greeting, context: DeliveryResult(
+            success=True,
+            verified=True,
+            platform="liepin",
+            history_detail="live verified",
+            target_id="liepin-target",
+            delivery_kind="custom_message",
+        )
+        with patch("bosshunter.executor.sender.get_delivery_adapter", return_value=adapter) as get_adapter:
+            result, target_id = _send_greeting_once(
+                {"id": "liepin-job", "source_platform": "liepin"}, "你好", {}
+            )
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["verified"])
+        self.assertEqual(target_id, "liepin-target")
+        get_adapter.assert_called_once_with("liepin")
+
+    def test_liepin_adapter_exposes_loaded_contact_rows_without_navigation(self):
+        from unittest.mock import patch
+        from bosshunter.platform_delivery.liepin import LiepinDeliveryAdapter
+
+        with patch("bosshunter.platform_delivery.liepin._liepin_im_targets", return_value=[
+            {"target_id": "contacts", "url": "https://c.liepin.com/"},
+        ]), patch(
+            "bosshunter.platform_delivery.liepin._liepin_conversation_list_snapshot",
+            return_value={"rows": [{"hr_name": "苏先生"}]},
+        ):
+            rows = LiepinDeliveryAdapter().list_conversations()
+
+        self.assertEqual(rows, [{
+            "hr_name": "苏先生",
+            "target_id": "contacts",
+            "source_url": "https://c.liepin.com/",
+        }])
 
 
 if __name__ == "__main__":

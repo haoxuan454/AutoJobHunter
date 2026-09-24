@@ -40,7 +40,7 @@ class PlatformDeliveryGuardTests(TestCase):
         ).decode("utf-8")
         return result["status"], json.loads(payload)
 
-    def test_collection_only_platforms_reject_delivery_and_resume_routes(self):
+    def test_zhilian_rejects_unsupported_resume_route_but_51job_uses_manual_delivery_state(self):
         for platform, job_id, url in (
             ("zhilian", "zhilian:zl-1", "https://www.zhaopin.com/jobdetail/zl-1.htm"),
             ("51job", "51job:job-1", "https://jobs.51job.com/shanghai/job-1.html"),
@@ -69,6 +69,11 @@ class PlatformDeliveryGuardTests(TestCase):
                     )
                 resume_status, resume_payload = self._request(f"/api/jobs/{job_id}/mark-resume-sent")
 
-                self.assertTrue(deliver_status.startswith("403"), deliver_payload)
+                if platform == "zhilian":
+                    self.assertTrue(deliver_status.startswith("403"), deliver_payload)
+                else:
+                    self.assertTrue(deliver_status.startswith("200"), deliver_payload)
+                    self.assertEqual(deliver_payload["manual_required_count"], 1)
+                    self.assertEqual(deliver_payload["manual_required_ids"], [job_id])
                 self.assertTrue(resume_status.startswith("403"), resume_payload)
                 start.assert_not_called()

@@ -93,8 +93,7 @@ throttle:
   browse_before_greet: true
   browse_duration_min: 15
   browse_duration_max: 30
-  send_windows:
-    - "09:00-17:00"
+  send_windows: []  # 留空表示不限制发送时间；例如 ["09:00-22:00"]
   day_off_probability: 0.05
 
 ai:

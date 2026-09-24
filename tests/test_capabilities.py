@@ -16,7 +16,7 @@ class PlatformCapabilitiesTests(unittest.TestCase):
             self.assertTrue(platform_supports(platform, "collect"))
             self.assertTrue(platform_supports(platform, "score"))
             self.assertTrue(platform_supports(platform, "greet"))
-            self.assertEqual(platform_supports(platform, "deliver"), platform == "zhilian")
+            self.assertEqual(platform_supports(platform, "deliver"), platform in {"zhilian", "liepin"})
             self.assertFalse(platform_supports(platform, "monitor"))
 
     def test_unknown_platform_supports_nothing(self):

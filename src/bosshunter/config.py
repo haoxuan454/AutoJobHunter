@@ -156,7 +156,7 @@ DEFAULTS: dict[str, Any] = {
         "browse_before_greet": True,
         "browse_duration_min": 15,
         "browse_duration_max": 30,
-        "send_windows": ["09:00-16:00"],
+        "send_windows": [],
         "day_off_probability": 0.05,
     },
     "ai": {

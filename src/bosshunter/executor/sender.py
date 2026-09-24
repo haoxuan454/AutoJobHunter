@@ -768,6 +768,25 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
             "metadata": result.metadata,
         }, result.target_id
 
+    if str(job.get("source_platform") or "boss").strip().lower() == "liepin":
+        result = get_delivery_adapter("liepin").send_greeting(
+            job,
+            greeting,
+            DeliveryContext(metadata={"workbench": True, "greeting": greeting}),
+        )
+        return {
+            "success": result.success and result.verified,
+            "verified": result.verified,
+            "first_contact": True,
+            "error": result.error or ("delivery_not_verified" if result.success and not result.verified else None),
+            "history_detail": result.history_detail or (
+                "猎聘适配器未提供可验证的发送证据，未写入已发送状态"
+                if result.success and not result.verified else ""
+            ),
+            "delivery_kind": result.delivery_kind,
+            "metadata": result.metadata,
+        }, result.target_id
+
     stop_event = throttle_config.get("_workbench_stop_event")
     existing_target_ids = {
         str(target.get("targetId") or "")

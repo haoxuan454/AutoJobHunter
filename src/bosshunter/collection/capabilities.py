@@ -6,7 +6,7 @@ PLATFORM_CAPABILITIES: dict[str, frozenset[str]] = {
     #monitor 仍保持关闭，直到智联会话列表轮询与未读同步单独验收。
     "zhilian": frozenset({"collect", "score", "greet", "deliver"}),
     "51job": frozenset({"collect", "score", "greet"}),
-    "liepin": frozenset({"collect", "score", "greet"}),
+    "liepin": frozenset({"collect", "score", "greet", "deliver"}),
 }
 
 

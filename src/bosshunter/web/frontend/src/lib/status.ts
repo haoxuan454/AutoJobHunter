@@ -12,6 +12,7 @@ export const STATUS_LABELS: Record<string, string> = {
   follow_up_sent: '已跟进',
   rejected: '已拒绝',
   error: '发送失败',
+  manual_required: '不支持',
 }
 
 export const ACTION_LABELS: Record<string, string> = {
@@ -23,6 +24,7 @@ export const ACTION_LABELS: Record<string, string> = {
   skipped: '跳过',
   sent: '发送',
   manual_sent: '手动标记已发送',
+  manual_required: '不支持',
   replied: '回复',
   hr_reply_detected: 'HR 有新消息',
   reply_pending: '待确认回复',

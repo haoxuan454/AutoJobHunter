@@ -22,6 +22,7 @@ const badgeVariants = cva(
         auto_replied: 'bg-emerald-50 text-emerald-700 border-emerald-200',
         rejected: 'bg-red-50 text-red-700 border-red-200',
         error: 'bg-red-50 text-red-700 border-red-200',
+        manual_required: 'bg-green-50 text-green-700 border-green-200',
         filtered: 'bg-[#FFFCFA] text-muted border-card-border',
       },
     },

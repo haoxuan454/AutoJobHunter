@@ -2127,10 +2127,10 @@ def monitor_and_send_resumes(config: dict) -> dict:
     if stop_event and stop_event.is_set():
         return {"skipped": 0, "pending": 0, "replied": 0, "needs_resume": 0, "rejected": 0, "failed": 0}
 
-    # Time window check (09:00-16:00)
-    window_checker = SendWindowChecker(throttle_config.get("send_windows", ["09:00-16:00"]))
+    # An empty list means the optional send-time window is disabled.
+    window_checker = SendWindowChecker(throttle_config.get("send_windows", []))
     if not window_checker.is_active():
-        console.print("[yellow]当前不在工作时间窗口内 (09:00-16:00)[/yellow]")
+        console.print("[yellow]当前不在配置的发送时间窗口内[/yellow]")
         return {"skipped": 0, "pending": 0, "replied": 0, "needs_resume": 0, "rejected": 0, "failed": 0}
 
     operation_multiplier = get_boss_operation_interval_multiplier(config)

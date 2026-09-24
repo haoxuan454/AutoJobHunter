@@ -758,9 +758,9 @@ export default function ConfigPage() {
               />
             </div>
             <div className="grid gap-4 md:grid-cols-2">
-              <Field label="发送时间窗口">
-                <TagsInput value={config.throttle?.send_windows || ['09:00-16:00']} onChange={v => updateConfig('throttle.send_windows', v)} placeholder="HH:MM-HH:MM" />
-                <p className="mt-1 text-xs text-muted">当天最后一个窗口结束时自动停止。</p>
+              <Field label="发送时间窗口（可选）">
+                <TagsInput value={config.throttle?.send_windows ?? []} onChange={v => updateConfig('throttle.send_windows', v)} placeholder="HH:MM-HH:MM；留空表示关闭" />
+                <p className="mt-1 text-xs text-muted">留空表示不限制发送时间；填写时间段后，任务只在对应窗口内发送。</p>
               </Field>
               <Field label="随机休息概率">
                 <Input type="number" value={config.throttle?.day_off_probability || 0.05} onChange={e => updateConfig('throttle.day_off_probability', Number(e.target.value))} step={0.01} min={0} max={1} />

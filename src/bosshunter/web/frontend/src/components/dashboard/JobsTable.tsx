@@ -59,6 +59,7 @@ function statusVariant(status: string) {
     'follow_up_sent',
     'rejected',
     'error',
+    'manual_required',
   ])
   return variants.has(status) ? status : 'default'
 }
