@@ -340,6 +340,74 @@ def _reconcile_zhilian_conversation(
     return last
 
 
+def _find_existing_zhilian_conversation(
+    job: dict[str, Any],
+    timeout: float = 2.0,
+) -> dict[str, Any]:
+    """Find an existing Zhilian conversation without opening a job page."""
+    deadline = time.time() + timeout
+    last: dict[str, Any] = {"status": "not_found", "matched": False, "rows_loaded": 0}
+    targets = _zhilian_im_targets()
+    if not targets:
+        return {"status": "im_unavailable", "matched": False, "rows_loaded": 0}
+    while time.time() < deadline or timeout == 0:
+        for target in targets:
+            try:
+                snapshot = _zhilian_conversation_list_snapshot(target["target_id"])
+            except Exception:
+                continue
+            rows = snapshot.get("rows") or []
+            strong_rows: list[tuple[dict[str, Any], str]] = []
+            company_rows: list[dict[str, Any]] = []
+            for row in rows:
+                matched, quality = _match_zhilian_conversation_row(row, job)
+                if not matched:
+                    continue
+                if quality == "company_only":
+                    company_rows.append(row)
+                else:
+                    strong_rows.append((row, quality))
+            last = {
+                "status": "checked",
+                "matched": False,
+                "rows_loaded": len(rows),
+                "list_scroll_height": snapshot.get("scroll_height", 0),
+                "list_client_height": snapshot.get("client_height", 0),
+                "target_id": target["target_id"],
+            }
+            if strong_rows:
+                row, quality = strong_rows[0]
+                return {
+                    **last,
+                    "status": "matched_existing",
+                    "matched": True,
+                    "match_quality": quality,
+                    "row": row,
+                    "conversation_url": "https://i.zhaopin.com/im?refcode=4019",
+                }
+            if len(company_rows) == 1:
+                return {
+                    **last,
+                    "status": "matched_existing",
+                    "matched": True,
+                    "match_quality": "company_only_unique",
+                    "row": company_rows[0],
+                    "conversation_url": "https://i.zhaopin.com/im?refcode=4019",
+                }
+            if len(company_rows) > 1:
+                last.update({
+                    "status": "ambiguous_company_only",
+                    "match_quality": "company_only",
+                    "candidate_count": len(company_rows),
+                })
+        if timeout == 0:
+            break
+        time.sleep(0.3)
+    if last.get("status") == "checked":
+        last["status"] = "not_found"
+    return last
+
+
 def _open_zhilian_job(job: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
     """Open a Zhilian page and repair runtimes that create an about:blank tab."""
     url = str(job.get("url") or "")
@@ -450,6 +518,29 @@ class ZhilianDeliveryAdapter:
         """
         if context.dry_run:
             return dry_run_result(self.platform)
+        # Zhilian contact state is company-scoped. Reconcile the rendered IM
+        # list before opening the job page so an existing HR is not contacted
+        # through the first-contact flow a second time.
+        existing = _find_existing_zhilian_conversation(job)
+        if existing.get("matched"):
+            row = existing.get("row") or {}
+            detail = "智联已有 HR 会话，已复用现有会话；本次未重复发送平台招呼语。"
+            return DeliveryResult(
+                True,
+                True,
+                self.platform,
+                None,
+                detail,
+                delivery_kind="existing_conversation_reused",
+                metadata={
+                    "platform_confirmed": False,
+                    "conversation_reconciled": True,
+                    "existing_conversation": True,
+                    "conversation_url": existing.get("conversation_url"),
+                    "match_quality": existing.get("match_quality"),
+                    "conversation_row": row,
+                },
+            )
         baseline: dict[str, str] = {}
         for im_target in _zhilian_im_targets():
             try:

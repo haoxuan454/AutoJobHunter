@@ -79,6 +79,62 @@ class PlatformDeliveryAdapterTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertIn("deliver-greeting-modal", calls[1][1][0])
 
+    def test_zhilian_reuses_existing_conversation_before_opening_job(self):
+        from unittest.mock import patch
+
+        reconciliation = {
+            "status": "matched_existing",
+            "matched": True,
+            "match_quality": "company_title_hr",
+            "row": {"company": "湖南省国银新材料有限公司", "title": "python后端开发工程师", "hr_name": "HR"},
+            "conversation_url": "https://i.zhaopin.com/im?refcode=4019",
+        }
+        with patch("bosshunter.platform_delivery.zhilian._find_existing_zhilian_conversation", return_value=reconciliation), \
+             patch("bosshunter.platform_delivery.zhilian._open_zhilian_job") as open_job, \
+             patch("bosshunter.platform_delivery.zhilian._click_zhilian_selector") as click_selector:
+            result = ZhilianDeliveryAdapter().start_conversation(
+                {"company": "湖南省国银新材料有限公司", "title": "python后端开发工程师"},
+                DeliveryContext(metadata={"greeting": "不应重复发送"}),
+            )
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.verified)
+        self.assertEqual(result.delivery_kind, "existing_conversation_reused")
+        self.assertTrue(result.metadata["existing_conversation"])
+        open_job.assert_not_called()
+        click_selector.assert_not_called()
+
+    def test_zhilian_company_only_match_reuses_only_unique_loaded_row(self):
+        from bosshunter.platform_delivery.zhilian import _find_existing_zhilian_conversation
+        from unittest.mock import patch
+
+        rows = [{"company": "湖南省国银新材料有限公司", "title": "另一个岗位", "hr_name": ""}]
+        with patch("bosshunter.platform_delivery.zhilian._zhilian_im_targets", return_value=[{"target_id": "im"}]), \
+             patch("bosshunter.platform_delivery.zhilian._zhilian_conversation_list_snapshot", return_value={"rows": rows}):
+            result = _find_existing_zhilian_conversation(
+                {"company": "湖南省国银新材料有限公司", "title": "python后端开发工程师"}, timeout=0
+            )
+
+        self.assertTrue(result["matched"])
+        self.assertEqual(result["match_quality"], "company_only_unique")
+
+    def test_zhilian_company_only_match_is_ambiguous_for_multiple_rows(self):
+        from bosshunter.platform_delivery.zhilian import _find_existing_zhilian_conversation
+        from unittest.mock import patch
+
+        rows = [
+            {"company": "湖南省国银新材料有限公司", "title": "岗位一", "hr_name": ""},
+            {"company": "湖南省国银新材料有限公司", "title": "岗位二", "hr_name": ""},
+        ]
+        with patch("bosshunter.platform_delivery.zhilian._zhilian_im_targets", return_value=[{"target_id": "im"}]), \
+             patch("bosshunter.platform_delivery.zhilian._zhilian_conversation_list_snapshot", return_value={"rows": rows}):
+            result = _find_existing_zhilian_conversation(
+                {"company": "湖南省国银新材料有限公司", "title": "岗位三"}, timeout=0
+            )
+
+        self.assertFalse(result["matched"])
+        self.assertEqual(result["status"], "ambiguous_company_only")
+
     def test_zhilian_default_greeting_requires_im_conversation_after_confirmation(self):
         from unittest.mock import patch
 

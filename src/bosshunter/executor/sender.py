@@ -1243,6 +1243,8 @@ def send_greetings(config: dict, force: bool = False, db_path=None) -> int:
                     "sent",
                     result_data.get("history_detail", "智联平台默认招呼已确认")
                     if result_data.get("delivery_kind") == "platform_default_greeting"
+                    else result_data.get("history_detail", "智联已有 HR 会话已复用，未重复发送平台招呼语")
+                    if result_data.get("delivery_kind") == "existing_conversation_reused"
                     else greeting[:50] or result_data.get("history_detail", "已发送招呼语"),
                 )
                 sent_count += 1
