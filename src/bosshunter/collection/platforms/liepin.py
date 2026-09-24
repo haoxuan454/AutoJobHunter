@@ -45,6 +45,7 @@ from bosshunter.db import (
     upsert_page_progress,
 )
 from bosshunter.job_filters import matching_blocked_company, matching_deal_breaker
+from bosshunter.config import effective_send_windows
 from bosshunter.throttle import SendWindowChecker, should_take_day_off
 
 
@@ -337,7 +338,7 @@ class LiepinCollector:
             )
 
         throttle_cfg = self.config.get("throttle", {}) if isinstance(self.config.get("throttle"), dict) else {}
-        send_windows = throttle_cfg.get("send_windows", [])
+        send_windows = effective_send_windows(self.config)
         if not SendWindowChecker(send_windows).is_active():
             return PlatformCollectionResult(self.platform, "completed", "outside_window",
                                             f"当前不在采集时间窗口内（{send_windows}）")

@@ -61,6 +61,7 @@ export default function ConfigPage() {
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>(() => ({
     profile: true,
     search: true,
+    throttle: true,
     ...(requestedSection ? { [requestedSection]: true } : {}),
   }))
   const [aiTest, setAiTest] = useState<{ testing: boolean; ok?: boolean; message?: string }>({ testing: false })
@@ -682,7 +683,7 @@ export default function ConfigPage() {
         </SectionCard>
 
         {/* Anti-monitoring Section */}
-        <SectionCard title="反监测设置" sectionKey="collection" expanded={expandedSections} toggle={toggleSection}>
+        <SectionCard title="发送节流与平台风控" sectionKey="throttle" expanded={expandedSections} toggle={toggleSection}>
           <div className="space-y-4">
             <div className="grid gap-4 md:grid-cols-2">
               <Field label="BOSS 单日搜索页上限">
@@ -727,9 +728,13 @@ export default function ConfigPage() {
               <Input type="number" value={config.safety?.daily_platform_page_limit ?? 500} onChange={e => updateConfig('safety.daily_platform_page_limit', Number(e.target.value))} min={1} max={2000} />
               <p className="mt-1 text-xs text-muted">只合计 BOSS 采集、自动投递和监测打开的页面；智联和 51job 不占用。</p>
             </Field>
+            <Field label="触发平台风控后的冷却时长（分钟）">
+              <Input type="number" value={config.safety?.risk_lock_minutes ?? 10} onChange={e => updateConfig('safety.risk_lock_minutes', Number(e.target.value))} min={1} max={1440} />
+              <p className="mt-1 text-xs text-muted">触发平台安全锁后，发送与监测逻辑会按此时长暂停；不改变各平台的页面操作适配逻辑。</p>
+            </Field>
             <div className="grid gap-4 md:grid-cols-2">
               <Field label="每日发送上限">
-                <Input type="number" value={config.throttle?.daily_limit || 30} onChange={e => updateConfig('throttle.daily_limit', Number(e.target.value))} />
+                <Input type="number" value={config.throttle?.daily_limit ?? 30} onChange={e => updateConfig('throttle.daily_limit', Number(e.target.value))} min={1} max={200} />
               </Field>
               <NumberRangeField
                 label="发送间隔范围（秒）"
@@ -758,12 +763,18 @@ export default function ConfigPage() {
               />
             </div>
             <div className="grid gap-4 md:grid-cols-2">
-              <Field label="发送时间窗口（可选）">
-                <TagsInput value={config.throttle?.send_windows ?? []} onChange={v => updateConfig('throttle.send_windows', v)} placeholder="HH:MM-HH:MM；留空表示关闭" />
-                <p className="mt-1 text-xs text-muted">留空表示不限制发送时间；填写时间段后，任务只在对应窗口内发送。</p>
+              <div className="flex h-9 items-center justify-between rounded-md border border-card-border bg-[#FFFCFA] px-3">
+                <label className="text-xs text-foreground">启用发送时间限制</label>
+                <Switch checked={config.throttle?.send_window_enabled ?? false} onChange={v => updateConfig('throttle.send_window_enabled', v)} />
+              </div>
+              <Field label="发送时间窗口">
+                <TagsInput value={config.throttle?.send_windows ?? []} onChange={v => updateConfig('throttle.send_windows', v)} placeholder="HH:MM-HH:MM" disabled={!(config.throttle?.send_window_enabled ?? false)} />
+                <p className="mt-1 text-xs text-muted">关闭时间限制时仍保留这些时间段；开启后仅在时间段内发送和执行受窗口约束的后台任务。</p>
               </Field>
+            </div>
+            <div className="grid gap-4 md:grid-cols-2">
               <Field label="随机休息概率">
-                <Input type="number" value={config.throttle?.day_off_probability || 0.05} onChange={e => updateConfig('throttle.day_off_probability', Number(e.target.value))} step={0.01} min={0} max={1} />
+                <Input type="number" value={config.throttle?.day_off_probability ?? 0.05} onChange={e => updateConfig('throttle.day_off_probability', Number(e.target.value))} step={0.01} min={0} max={1} />
               </Field>
             </div>
           </div>
@@ -846,6 +857,7 @@ function SectionCard({ title, sectionKey, expanded, toggle, children }: {
     scoring: { description: '岗位匹配与筛选标准', icon: BrainCircuit, tone: 'bg-violet-50 text-violet-600' },
     ai: { description: '模型、接口与回复生成规则', icon: BrainCircuit, tone: 'bg-indigo-50 text-indigo-600' },
     collection: { description: '低频访问与平台安全边界', icon: ShieldAlert, tone: 'bg-amber-50 text-amber-700' },
+    throttle: { description: '发送时间、每日额度、间隔与风控冷却', icon: ShieldAlert, tone: 'bg-amber-50 text-amber-700' },
     monitor: { description: 'HR 会话监测与人工确认', icon: Activity, tone: 'bg-emerald-50 text-emerald-600' },
     follow_up: { description: '后续跟进节奏与时间窗口', icon: Repeat2, tone: 'bg-cyan-50 text-cyan-600' },
     dedup: { description: '历史岗位与投递记录去重', icon: Search, tone: 'bg-slate-100 text-slate-600' },

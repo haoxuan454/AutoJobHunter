@@ -8,6 +8,7 @@ from threading import Event, Lock, Thread, Timer
 from typing import Any, Callable
 from uuid import uuid4
 
+from bosshunter.config import effective_send_windows
 from bosshunter.throttle import SendWindowChecker
 
 
@@ -221,8 +222,4 @@ def _deadline_from_config(mode: str, config: dict) -> datetime | None:
     """Resolve the automatic stop deadline for long-running/send tasks."""
     if mode not in DEADLINE_MODES:
         return None
-    throttle = config.get("throttle", {}) if isinstance(config, dict) else {}
-    windows = throttle.get("send_windows", [])
-    if not isinstance(windows, list):
-        return None
-    return SendWindowChecker(windows).latest_end_datetime()
+    return SendWindowChecker(effective_send_windows(config)).latest_end_datetime()

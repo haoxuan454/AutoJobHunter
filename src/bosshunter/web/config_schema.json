@@ -60,8 +60,8 @@
       ]
     },
     {
-      "key": "collection",
-      "label": "反监测设置",
+      "key": "collection_safety",
+      "label": "采集反监测设置",
       "icon": "Shield",
       "fields": [
         {"key": "daily_search_page_limit", "label": "BOSS 单日搜索页上限", "type": "number", "min": 1, "max": 200, "default": 60},
@@ -76,17 +76,19 @@
     },
     {
       "key": "throttle",
-      "label": "反监测设置",
+      "label": "发送节流与平台风控",
       "icon": "Shield",
       "fields": [
-        {"key": "daily_limit", "label": "每日发送上限", "type": "number", "min": 1, "max": 200, "default": 30},
+        {"key": "daily_limit", "label": "每日发送上限", "type": "number", "min": 1, "max": 200, "default": 30, "description": "后端发送器按当天已发送量执行此硬上限"},
         {"key": "interval_min", "label": "最短间隔 (秒)", "type": "number", "min": 10, "max": 600, "default": 60},
         {"key": "interval_max", "label": "最长间隔 (秒)", "type": "number", "min": 10, "max": 600, "default": 180},
         {"key": "browse_before_greet", "label": "发送前模拟浏览", "type": "switch", "default": true},
         {"key": "browse_duration_min", "label": "浏览最短时长 (秒)", "type": "number", "min": 5, "max": 120, "default": 15},
         {"key": "browse_duration_max", "label": "浏览最长时长 (秒)", "type": "number", "min": 5, "max": 120, "default": 30},
-        {"key": "send_windows", "label": "发送时间窗口（可选）", "type": "tags", "default": [], "description": "留空表示不限制发送时间；填写如 09:00-22:00 后，仅在窗口内发送"},
-        {"key": "day_off_probability", "label": "随机休息概率", "type": "number", "min": 0, "max": 1, "step": 0.01, "default": 0.05}
+        {"key": "send_window_enabled", "label": "启用发送时间限制", "type": "switch", "default": false, "description": "关闭时不限制发送时间，但保留已配置的时间段；开启后仅在下方时间段内发送"},
+        {"key": "send_windows", "label": "发送时间窗口", "type": "tags", "default": [], "description": "例如 09:00-22:00；关闭上方开关时仍会保留这些配置"},
+        {"key": "day_off_probability", "label": "随机休息概率", "type": "number", "min": 0, "max": 1, "step": 0.01, "default": 0.05},
+        {"key": "risk_lock_minutes", "label": "平台风控冷却时长（分钟）", "type": "number", "min": 1, "max": 1440, "default": 10, "path": "safety.risk_lock_minutes", "description": "风险锁会由发送器与监测器读取"}
       ]
     },
     {

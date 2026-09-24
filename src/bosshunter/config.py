@@ -1,6 +1,8 @@
 """Configuration loader for BossHunter."""
 
+import math
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -156,6 +158,7 @@ DEFAULTS: dict[str, Any] = {
         "browse_before_greet": True,
         "browse_duration_min": 15,
         "browse_duration_max": 30,
+        "send_window_enabled": False,
         "send_windows": [],
         "day_off_probability": 0.05,
     },
@@ -261,6 +264,15 @@ def load_config(config_path: Path | None = None) -> dict[str, Any]:
 
     user_cfg = _load_yaml_mapping(config_path)
     if user_cfg:
+        user_throttle = user_cfg.get("throttle")
+        if (
+            isinstance(user_throttle, dict)
+            and "send_window_enabled" not in user_throttle
+            and isinstance(user_throttle.get("send_windows"), list)
+            and user_throttle["send_windows"]
+        ):
+            # Migrate legacy configs before defaults fill the new switch in.
+            user_throttle["send_window_enabled"] = True
         _deep_merge(cfg, user_cfg)
     _normalize_config_sections(cfg)
     _validate_ai_provider(cfg)
@@ -369,7 +381,141 @@ def _normalize_config_sections(config: dict[str, Any]) -> dict[str, Any]:
         if isinstance(defaults, dict) and not isinstance(config.get(section), dict):
             config[section] = _deep_copy_dict(defaults)
 
+    _normalize_throttle(config)
     return remove_retired_collection_settings(config)
+
+
+def _normalize_throttle(config: dict[str, Any]) -> None:
+    """Normalize optional send-window settings while preserving legacy configs."""
+    throttle = config.get("throttle")
+    if not isinstance(throttle, dict):
+        return
+
+    windows = throttle.get("send_windows")
+    if not isinstance(windows, list):
+        windows = []
+        throttle["send_windows"] = windows
+    else:
+        throttle["send_windows"] = [str(window).strip() for window in windows if str(window).strip()]
+
+    if "send_window_enabled" not in throttle:
+        # Legacy configurations used a non-empty window list as the switch.
+        throttle["send_window_enabled"] = bool(throttle["send_windows"])
+    else:
+        throttle["send_window_enabled"] = _coerce_bool(throttle["send_window_enabled"])
+
+
+def _coerce_bool(value: Any) -> bool:
+    """Parse common YAML/API boolean representations without truthy strings."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "on", "1"}:
+            return True
+        if normalized in {"false", "no", "off", "0", ""}:
+            return False
+    return bool(value)
+
+
+def effective_send_windows(config: dict[str, Any] | None) -> list[str]:
+    """Return configured windows only when the explicit window guard is enabled."""
+    throttle = config.get("throttle", {}) if isinstance(config, dict) else {}
+    if not isinstance(throttle, dict) or not throttle.get("send_window_enabled", False):
+        return []
+    windows = throttle.get("send_windows", [])
+    return list(windows) if isinstance(windows, list) else []
+
+
+def validate_runtime_settings(config: dict[str, Any]) -> None:
+    """Reject invalid throttle and platform-safety values before persistence."""
+    for section in ("throttle", "collection", "safety"):
+        if section in config and not isinstance(config[section], dict):
+            raise ValueError(f"{section} 必须是对象")
+
+    throttle = config.get("throttle")
+    if isinstance(throttle, dict):
+        if "send_window_enabled" in throttle and not isinstance(throttle["send_window_enabled"], bool):
+            raise ValueError("throttle.send_window_enabled 必须是布尔值")
+
+        windows = throttle.get("send_windows", [])
+        if not isinstance(windows, list):
+            raise ValueError("throttle.send_windows 必须是时间段数组")
+        for index, window in enumerate(windows):
+            if not isinstance(window, str):
+                raise ValueError(f"throttle.send_windows[{index}] 必须是 HH:MM-HH:MM 格式")
+            match = re.fullmatch(r"(\d{2}):(\d{2})-(\d{2}):(\d{2})", window.strip())
+            if not match:
+                raise ValueError(f"时间段“{window}”格式错误，请使用 HH:MM-HH:MM")
+            start_hour, start_minute, end_hour, end_minute = map(int, match.groups())
+            if start_hour > 23 or end_hour > 23 or start_minute > 59 or end_minute > 59:
+                raise ValueError(f"时间段“{window}”超出有效时间范围")
+            if start_hour * 60 + start_minute >= end_hour * 60 + end_minute:
+                raise ValueError(f"时间段“{window}”结束时间必须晚于开始时间")
+
+        windows_enabled = throttle.get("send_window_enabled")
+        if windows_enabled is None:
+            # Preserve legacy API clients: a non-empty windows list implied enabled.
+            windows_enabled = bool(windows)
+        if windows_enabled and not windows:
+            raise ValueError("启用发送时间限制时，至少需要配置一个有效时间段")
+
+        def validate_number(
+            key: str,
+            label: str,
+            minimum: float,
+            maximum: float,
+            *,
+            integer: bool = False,
+        ) -> float | None:
+            value = throttle.get(key)
+            if value is None:
+                return None
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"throttle.{key} 必须是有效数字")
+            if integer and not float(value).is_integer():
+                raise ValueError(f"throttle.{key} 必须是整数")
+            if not minimum <= value <= maximum:
+                raise ValueError(f"{label}必须在 {minimum:g} 到 {maximum:g} 之间")
+            return float(value)
+
+        validate_number("daily_limit", "每日发送上限", 1, 200, integer=True)
+        interval_min = validate_number("interval_min", "发送最短间隔", 10, 600, integer=True)
+        interval_max = validate_number("interval_max", "发送最长间隔", 10, 600, integer=True)
+        validate_number("day_off_probability", "随机休息概率", 0, 1)
+        browse_min = validate_number("browse_duration_min", "模拟浏览最短时长", 5, 120, integer=True)
+        browse_max = validate_number("browse_duration_max", "模拟浏览最长时长", 5, 120, integer=True)
+        if interval_min is not None and interval_max is not None and interval_min > interval_max:
+            raise ValueError("发送最短间隔不能大于发送最长间隔")
+        if browse_min is not None and browse_max is not None and browse_min > browse_max:
+            raise ValueError("模拟浏览最短时长不能大于最长时长")
+
+    collection = config.get("collection")
+    if isinstance(collection, dict):
+        risk_min = collection.get("risk_pause_min_minutes")
+        risk_max = collection.get("risk_pause_max_minutes")
+        for key, value in (("risk_pause_min_minutes", risk_min), ("risk_pause_max_minutes", risk_max)):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or not float(value).is_integer() or not 1 <= value <= 60
+            ):
+                raise ValueError(f"collection.{key} 必须在 1 到 60 分钟之间")
+        if risk_min is not None and risk_max is not None and risk_min > risk_max:
+            raise ValueError("BOSS 风险暂停最短时间不能大于最长时间")
+
+    safety = config.get("safety")
+    if isinstance(safety, dict):
+        for key, label, minimum, maximum in (
+            ("daily_platform_page_limit", "平台每日页面访问上限", 1, 2000),
+            ("risk_lock_minutes", "平台风控冷却时长", 1, 1440),
+        ):
+            value = safety.get(key)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or not float(value).is_integer() or not minimum <= value <= maximum
+            ):
+                raise ValueError(f"{label}必须在 {minimum} 到 {maximum} 之间")
+
 
 
 def remove_retired_collection_settings(config: dict[str, Any]) -> dict[str, Any]:

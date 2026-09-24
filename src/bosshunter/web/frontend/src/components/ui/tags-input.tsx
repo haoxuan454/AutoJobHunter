@@ -8,12 +8,14 @@ interface TagsInputProps {
   placeholder?: string
   className?: string
   onAdd?: (tag: string) => void
+  disabled?: boolean
 }
 
-export function TagsInput({ value, onChange, placeholder = '输入后按回车添加', className, onAdd }: TagsInputProps) {
+export function TagsInput({ value, onChange, placeholder = '输入后按回车添加', className, onAdd, disabled = false }: TagsInputProps) {
   const [input, setInput] = useState('')
 
   const commitInput = () => {
+    if (disabled) return
     const tags = input.split(/[,，、;；]/).map(tag => tag.trim()).filter(Boolean)
     if (!tags.length) return
     if (onAdd) {
@@ -41,18 +43,20 @@ export function TagsInput({ value, onChange, placeholder = '输入后按回车�
   return (
     <div className={cn(
       'flex flex-wrap gap-1.5 min-h-[36px] p-2 rounded-md border border-card-border bg-white focus-within:ring-2 focus-within:ring-primary/30 focus-within:border-primary',
+      disabled && 'cursor-not-allowed bg-slate-100 opacity-60',
       className
     )}>
       {value.map((tag, i) => (
         <span
-          key={i}
+            key={i}
           className="inline-flex items-center gap-1 rounded-md bg-[#FFF0E5] px-2 py-0.5 text-xs font-bold text-primary"
         >
           {tag}
           <button
             type="button"
             onClick={() => removeTag(i)}
-            className="text-primary/70 hover:text-primary"
+            className="text-primary/70 hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
+            disabled={disabled}
           >
             <X className="w-3 h-3" />
           </button>
@@ -63,6 +67,7 @@ export function TagsInput({ value, onChange, placeholder = '输入后按回车�
         onChange={e => setInput(e.target.value)}
         onKeyDown={handleKeyDown}
         onBlur={commitInput}
+        disabled={disabled}
         placeholder={value.length === 0 ? placeholder : ''}
         className="flex-1 min-w-[80px] bg-transparent text-sm text-foreground placeholder:text-muted/60 outline-none"
       />

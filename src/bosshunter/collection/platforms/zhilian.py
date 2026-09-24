@@ -30,6 +30,7 @@ from bosshunter.browser import (
     wait_for_load,
 )
 from bosshunter.collection.base import CollectionBlockedError, CollectionError, CollectorHooks
+from bosshunter.config import effective_send_windows
 from bosshunter.collection.models import JobCandidate, PlatformCollectionRequest, PlatformCollectionResult
 from bosshunter.db import (
     delete_page_progress,
@@ -1243,7 +1244,7 @@ class ZhilianCollector:
             return PlatformCollectionResult(self.platform, "failed", "no_valid_city", "智联城市编码未配置")
 
         throttle_cfg = self.config.get("throttle", {}) if isinstance(self.config.get("throttle"), dict) else {}
-        send_windows = throttle_cfg.get("send_windows", [])
+        send_windows = effective_send_windows(self.config)
         if not SendWindowChecker(send_windows).is_active():
             return PlatformCollectionResult(self.platform, "completed", "outside_window",
                                             f"当前不在采集时间窗口内（{send_windows}）")

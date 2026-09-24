@@ -22,6 +22,7 @@ from bosshunter.db import (
     get_db, get_jobs_ready_to_send, update_job_status, update_job_last_error,
     add_history, add_risk_event, set_platform_safety_lock,
 )
+from bosshunter.config import effective_send_windows
 from bosshunter.collection.capabilities import platform_supports
 from bosshunter.throttle import RequestThrottle, SendWindowChecker, ProgressiveBackoff, should_take_day_off
 from bosshunter.platform_safety import PlatformAccessGuard, PlatformSafetyStop
@@ -1116,7 +1117,7 @@ def send_greetings(config: dict, force: bool = False, db_path=None) -> int:
         return 0
 
     # Anti-ban: send window check (可通过 --force 跳过)
-    send_windows = throttle_config.get("send_windows", [])
+    send_windows = effective_send_windows(config)
     window_checker = SendWindowChecker(send_windows)
     if not force and not window_checker.is_active():
         info = window_checker.next_window_info()

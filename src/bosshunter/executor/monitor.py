@@ -18,6 +18,7 @@ from bosshunter.db import (
     get_db, get_jobs_by_status,
     update_job_status, add_history, add_risk_event, set_platform_safety_lock,
 )
+from bosshunter.config import effective_send_windows
 from bosshunter.throttle import RequestThrottle, SendWindowChecker
 from bosshunter.platform_safety import (
     PlatformAccessGuard,
@@ -2127,8 +2128,7 @@ def monitor_and_send_resumes(config: dict) -> dict:
     if stop_event and stop_event.is_set():
         return {"skipped": 0, "pending": 0, "replied": 0, "needs_resume": 0, "rejected": 0, "failed": 0}
 
-    # An empty list means the optional send-time window is disabled.
-    window_checker = SendWindowChecker(throttle_config.get("send_windows", []))
+    window_checker = SendWindowChecker(effective_send_windows(config))
     if not window_checker.is_active():
         console.print("[yellow]当前不在配置的发送时间窗口内[/yellow]")
         return {"skipped": 0, "pending": 0, "replied": 0, "needs_resume": 0, "rejected": 0, "failed": 0}

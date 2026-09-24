@@ -3,6 +3,7 @@ import json
 import tempfile
 import time
 import unittest
+from copy import deepcopy
 from socketserver import ThreadingMixIn
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -90,7 +91,14 @@ class WebApiRouteTests(unittest.TestCase):
         # Cleanup
         server.set_base_dir(self.original_base_dir)
 
-    def _request(self, path: str, method: str = "GET", json_body: dict | None = None, environ_overrides=None):
+    def _request(
+        self,
+        path: str,
+        method: str = "GET",
+        json_body: dict | None = None,
+        environ_overrides=None,
+        raw_body: bytes | None = None,
+    ):
         if "?" in path:
             path_info, query_string = path.split("?", 1)
         else:
@@ -102,7 +110,9 @@ class WebApiRouteTests(unittest.TestCase):
             status_headers["status"] = status
             status_headers["headers"] = dict(headers)
 
-        request_body = json.dumps(json_body).encode("utf-8") if json_body is not None else b""
+        request_body = raw_body if raw_body is not None else (
+            json.dumps(json_body).encode("utf-8") if json_body is not None else b""
+        )
         environ = {
             "REMOTE_ADDR": "127.0.0.1",
             "REQUEST_METHOD": method,
@@ -118,7 +128,7 @@ class WebApiRouteTests(unittest.TestCase):
             "wsgi.multiprocess": False,
             "wsgi.run_once": False,
         }
-        if json_body is not None:
+        if json_body is not None or raw_body is not None:
             environ["CONTENT_LENGTH"] = str(len(request_body))
             environ["CONTENT_TYPE"] = "application/json"
 
@@ -134,6 +144,133 @@ class WebApiRouteTests(unittest.TestCase):
             if close:
                 close()
         return status_headers["status"], status_headers["headers"], body
+
+    def _suppress_base_dir_recovery_side_effects(self):
+        # set_base_dir() normally repairs interrupted runs; API config tests must
+        # not mutate the live workspace database while switching to a temp folder.
+        for name in (
+            "mark_orphaned_scoring_runs_paused",
+            "mark_orphaned_collection_runs_stopped",
+        ):
+            patcher = patch.object(server, name)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_runtime_safety_config_round_trips_through_config_api(self):
+        self._suppress_base_dir_recovery_side_effects()
+        with tempfile.TemporaryDirectory() as tmp:
+            server.set_base_dir(Path(tmp))
+            payload = {
+                "throttle": {
+                    "daily_limit": 42,
+                    "interval_min": 45,
+                    "interval_max": 95,
+                    "day_off_probability": 0.12,
+                    "send_window_enabled": True,
+                    "send_windows": ["08:30-20:15"],
+                },
+                "collection": {"risk_pause_min_minutes": 6, "risk_pause_max_minutes": 14},
+                "safety": {"daily_platform_page_limit": 321, "risk_lock_minutes": 23},
+            }
+
+            status, _, body = self._request("/api/config", "POST", payload)
+
+            self.assertTrue(status.startswith("200"), body)
+            response = json.loads(body)["config"]
+            self.assertEqual(response["throttle"]["daily_limit"], 42)
+            self.assertEqual(response["throttle"]["interval_min"], 45)
+            self.assertEqual(response["throttle"]["interval_max"], 95)
+            self.assertEqual(response["throttle"]["day_off_probability"], 0.12)
+            self.assertTrue(response["throttle"]["send_window_enabled"])
+            self.assertEqual(response["throttle"]["send_windows"], ["08:30-20:15"])
+            self.assertEqual(response["safety"]["risk_lock_minutes"], 23)
+            self.assertEqual(response["safety"]["daily_platform_page_limit"], 321)
+            self.assertEqual(response["collection"]["risk_pause_min_minutes"], 6)
+            self.assertEqual(response["collection"]["risk_pause_max_minutes"], 14)
+
+            get_status, _, get_body = self._request("/api/config")
+            self.assertTrue(get_status.startswith("200"))
+            self.assertEqual(json.loads(get_body)["throttle"], response["throttle"])
+            self.assertEqual(server.load_config(server.CONFIG_PATH)["safety"]["risk_lock_minutes"], 23)
+
+            payload["throttle"].update(send_window_enabled=False, send_windows=["08:30-20:15"])
+            status, _, body = self._request("/api/config", "POST", payload)
+            self.assertTrue(status.startswith("200"), body)
+            disabled = json.loads(body)["config"]["throttle"]
+            self.assertFalse(disabled["send_window_enabled"])
+            self.assertEqual(disabled["send_windows"], ["08:30-20:15"])
+            self.assertEqual(server.load_config(server.CONFIG_PATH)["throttle"]["send_windows"], ["08:30-20:15"])
+
+    def test_invalid_runtime_safety_config_is_rejected_without_overwriting_file(self):
+        self._suppress_base_dir_recovery_side_effects()
+        with tempfile.TemporaryDirectory() as tmp:
+            server.set_base_dir(Path(tmp))
+            baseline = {
+                "throttle": {
+                    "daily_limit": 30,
+                    "interval_min": 60,
+                    "interval_max": 180,
+                    "day_off_probability": 0.05,
+                    "send_window_enabled": False,
+                    "send_windows": ["09:00-18:00"],
+                },
+                "collection": {"risk_pause_min_minutes": 5, "risk_pause_max_minutes": 10},
+                "safety": {"daily_platform_page_limit": 500, "risk_lock_minutes": 10},
+            }
+            server._write_config(baseline)
+            original_bytes = server.CONFIG_PATH.read_bytes()
+            invalid_cases = [
+                (
+                    "enabled without a window",
+                    lambda c: c["throttle"].update(send_window_enabled=True, send_windows=[]),
+                ),
+                ("string boolean", lambda c: c["throttle"].update(send_window_enabled="true")),
+                ("malformed time", lambda c: c["throttle"].update(send_windows=["09:00-18:00-extra"])),
+                (
+                    "unicode/path-like time",
+                    lambda c: c["throttle"].update(send_windows=["../\\u79d8\\u5bc6/24:00-25:00"]),
+                ),
+                ("cross-midnight time", lambda c: c["throttle"].update(send_windows=["22:00-06:00"])),
+                ("zero daily quota", lambda c: c["throttle"].update(daily_limit=0)),
+                ("fractional daily quota", lambda c: c["throttle"].update(daily_limit=2.5)),
+                ("reversed interval", lambda c: c["throttle"].update(interval_min=100, interval_max=20)),
+                ("non-finite probability", lambda c: c["throttle"].update(day_off_probability=float("nan"))),
+                ("wrong throttle shape", lambda c: c.update(throttle="ignore validation")),
+                (
+                    "reversed risk pause",
+                    lambda c: c["collection"].update(risk_pause_min_minutes=20, risk_pause_max_minutes=10),
+                ),
+                ("fractional risk lock", lambda c: c["safety"].update(risk_lock_minutes=1.5)),
+            ]
+
+            for label, mutate in invalid_cases:
+                with self.subTest(case=label):
+                    invalid = deepcopy(baseline)
+                    mutate(invalid)
+                    status, _, body = self._request("/api/config", "POST", invalid)
+                    self.assertTrue(status.startswith("400"), (label, status, body))
+                    self.assertEqual(server.CONFIG_PATH.read_bytes(), original_bytes, label)
+
+    def test_config_api_rejects_malformed_json_without_overwriting_file(self):
+        self._suppress_base_dir_recovery_side_effects()
+        with tempfile.TemporaryDirectory() as tmp:
+            server.set_base_dir(Path(tmp))
+            server._write_config({"throttle": {"daily_limit": 30}})
+            original_bytes = server.CONFIG_PATH.read_bytes()
+
+            for label, raw_body in (
+                ("malformed JSON", b'{"throttle": '),
+                ("invalid UTF-8", b'{"throttle":"\xff"}'),
+            ):
+                with self.subTest(case=label):
+                    status, _, body = self._request(
+                        "/api/config",
+                        "POST",
+                        raw_body=raw_body,
+                    )
+
+                    self.assertTrue(status.startswith("400"), body)
+                    self.assertEqual(server.CONFIG_PATH.read_bytes(), original_bytes)
 
     def test_model_list_uses_draft_settings_and_preserves_saved_config(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict("os.environ", {}, clear=True):

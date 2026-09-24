@@ -21,7 +21,7 @@ from uuid import uuid4
 from wsgiref.simple_server import WSGIServer
 
 import yaml
-from bottle import Bottle, HTTPResponse, request, response, static_file, abort
+from bottle import Bottle, HTTPError, HTTPResponse, request, response, static_file, abort
 
 from bosshunter.agent_api import (
 	AGENT_API_VERSION,
@@ -34,7 +34,13 @@ from bosshunter import __version__
 from bosshunter.ai.credentials import AIRequestError, call_anthropic_text, get_ai_api_key, list_ai_models
 from bosshunter.ai.scorer import sanitize_score_trace
 from bosshunter.cities import CityRefreshError, get_city_map, load_city_snapshot, refresh_city_cache
-from bosshunter.config import AI_SERVICE_PRESETS, load_config, remove_retired_collection_settings, save_config
+from bosshunter.config import (
+	AI_SERVICE_PRESETS,
+	load_config,
+	remove_retired_collection_settings,
+	save_config,
+	validate_runtime_settings,
+)
 from bosshunter.db import (
 	GREETING_ALLOWED_STATUSES,
 	REJECT_ALLOWED_STATUSES,
@@ -2664,12 +2670,23 @@ def api_config_get():
 def api_config_post():
 	try:
 		import yaml
-		data = request.json
+		try:
+			data = request.json
+		except (json.JSONDecodeError, UnicodeDecodeError):
+			return _json_response({"error": "Config body must contain valid JSON"}, 400)
+		except HTTPError as exc:
+			if exc.status_code != 400:
+				raise
+			return _json_response({"error": "Config body must contain valid JSON"}, 400)
 		if not data:
 			return _json_response({"error": "Empty body"}, 400)
 		if not isinstance(data, dict):
 			return _json_response({"error": "Config body must be an object"}, 400)
 		data = _sanitize_config_for_write(data)
+		try:
+			validate_runtime_settings(data)
+		except ValueError as exc:
+			return _json_response({"error": str(exc)}, 400)
 
 		# Basic validation
 		profile = data.get("profile", {})
