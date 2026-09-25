@@ -116,10 +116,12 @@ def _conversation_message_snapshot(target_id: str) -> list[dict[str, str]]:
         .map(node => {
           const classes = [node, ...node.querySelectorAll('[class]')]
             .map(el => String(el.className || '').toLowerCase()).join(' ');
-          const sender = /(^|[\s_-])(im-message__bubble--me|item-myself|message-self|msg-self|is-self|my-message|message-mine|from-me|outgoing)([\s_-]|$)/.test(classes)
-            ? 'me' : 'unknown';
           const textNode = node.querySelector('.im-msg-text,.msg-text,.text,.message-text');
-          return {sender, text:normalize(textNode ? textNode.innerText || textNode.textContent : node.innerText || node.textContent)};
+          const sender = /(^|[\s_-])(im-message__bubble--me|item-myself|message-self|msg-self|is-self|my-message|message-mine|from-me|outgoing)([\s_-]|$)/.test(classes)
+            ? 'me' : /(^|[\s_-])(item-other|message-other|message-receive|from-other|incoming)([\s_-]|$)/.test(classes) ? 'hr' : 'unknown';
+          const timeNode = node.querySelector('time,[datetime],.message-time,.msg-time');
+          const messageId = node.getAttribute('data-message-id') || node.getAttribute('data-msg-id') || node.getAttribute('data-id') || '';
+          return {sender, text:normalize(textNode ? textNode.innerText || textNode.textContent : node.innerText || node.textContent), message_time:normalize(timeNode?.innerText || timeNode?.getAttribute('datetime') || ''), message_id:messageId || null};
         }).filter(item => item.text);
       return JSON.stringify({success:true,messages});
     })()
@@ -158,16 +160,25 @@ def _zhilian_conversation_list_snapshot(target_id: str) -> dict[str, Any]:
         .filter(visible)
         .map((row, index) => {
           const text = selector => normalize(row.querySelector(selector)?.innerText || '');
-          const item = {
+           const item = {
             index,
             hr_name: text('.im-session-item__name'),
             company: text('.im-session-item__company-name'),
             title: text('.im-session-item__job'),
             preview: text('.im-session-item__preview'),
             time: text('.im-session-item__time'),
-            unread: text('.im-session-item__badge'),
-            active: row.classList.contains('is-active')
-          };
+             unread: text('.im-session-item__badge'),
+             session_id: row.getAttribute('data-session-id')
+               || row.dataset.sessionId
+               || row.querySelector('a[href*="sessionId"]')?.href
+                    ?.match(/[?&]sessionId=([^&#]+)/)?.[1]
+               || '',
+             active: row.classList.contains('is-active')
+           };
+           item.conversation_id = item.session_id || '';
+           item.conversation_url = item.session_id
+             ? `https://i.zhaopin.com/im?sessionId=${encodeURIComponent(item.session_id)}&refcode=4019`
+             : '';
           item.signature = [item.hr_name, item.company, item.title, item.preview, item.time].join('|');
           return item;
         });
@@ -254,7 +265,9 @@ def _active_zhilian_conversation_snapshot(target_id: str) -> dict[str, Any]:
         .filter(visible)
         .map(node => normalize(node.querySelector('.im-msg-text,.msg-text,.text,.message-text')?.innerText || node.innerText || node.textContent))
         .filter(Boolean);
-      return JSON.stringify({success:true, hr_name:text('.im-chat-header__name'), company:text('.im-chat-header__meta-text'), title:text('.im-chat-header__job-title'), message_count:messages.length, messages});
+      const params = new URL(location.href).searchParams;
+      const sessionId = params.get('sessionId') || '';
+      return JSON.stringify({success:true, url:location.href, external_conversation_id:sessionId || params.get('refcode') || '', session_id:sessionId, hr_name:text('.im-chat-header__name'), company:text('.im-chat-header__meta-text'), title:text('.im-chat-header__job-title'), message_count:messages.length, messages});
     })()
     """, timeout=10))
     return result if isinstance(result, dict) else {"success": False}
@@ -383,7 +396,7 @@ def _find_existing_zhilian_conversation(
                     "matched": True,
                     "match_quality": quality,
                     "row": row,
-                    "conversation_url": "https://i.zhaopin.com/im?refcode=4019",
+                    "conversation_url": (row.get("conversation_url") or ""),
                 }
             if len(company_rows) == 1:
                 return {
@@ -392,7 +405,7 @@ def _find_existing_zhilian_conversation(
                     "matched": True,
                     "match_quality": "company_only_unique",
                     "row": company_rows[0],
-                    "conversation_url": "https://i.zhaopin.com/im?refcode=4019",
+                    "conversation_url": (company_rows[0].get("conversation_url") or ""),
                 }
             if len(company_rows) > 1:
                 last.update({

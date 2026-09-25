@@ -18,6 +18,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
+from urllib.parse import parse_qs, urlsplit
 
 
 CONVERSATION_STATUSES = {
@@ -31,6 +32,85 @@ CONVERSATION_STATUSES = {
     "closed",
     "failed",
 }
+
+_PLATFORM_EXTERNAL_HOSTS = {
+    "boss": ("zhipin.com",),
+    "zhilian": ("zhaopin.com",),
+    "liepin": ("liepin.com",),
+}
+_LOCAL_EXTERNAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def normalize_platform_external_url(platform: str, url: Any, *, kind: str) -> str | None:
+    """Return only a real, platform-specific external URL.
+
+    Conversation and job links are intentionally validated separately. A
+    platform home page, local dashboard URL, generic chat-list entry, or a job
+    URL masquerading as a conversation URL must never become a clickable card
+    action.
+    """
+    raw = str(url or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return None
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme not in {"http", "https"} or not hostname or hostname in _LOCAL_EXTERNAL_HOSTS:
+        return None
+    allowed_hosts = _PLATFORM_EXTERNAL_HOSTS.get(str(platform or "").lower())
+    if allowed_hosts and not any(hostname == allowed or hostname.endswith("." + allowed) for allowed in allowed_hosts):
+        return None
+
+    path = (parsed.path or "/").lower()
+    query = parse_qs(parsed.query, keep_blank_values=False)
+    platform_name = str(platform or "").lower()
+    if kind == "conversation":
+        if platform_name == "zhilian":
+            # refcode=4019 is only the IM entry/list marker. A card requires
+            # the concrete sessionId belonging to one HR conversation.
+            if hostname != "i.zhaopin.com" or path != "/im" or not query.get("sessionId", [""])[0].strip():
+                return None
+        elif platform_name == "boss":
+            if "chat" not in path and "chat" not in parsed.fragment.lower():
+                return None
+        elif platform_name == "liepin":
+            if not any(marker in path for marker in ("/im", "/message", "/communicate", "/chat")):
+                return None
+        elif "/job" in path:
+            return None
+    elif kind == "job":
+        if platform_name == "zhilian" and "/job" not in path:
+            return None
+        if platform_name == "liepin" and "/job/" not in path:
+            return None
+        if platform_name == "boss" and "/job" not in path:
+            return None
+    else:
+        raise ValueError(f"unsupported external URL kind: {kind}")
+    return parsed.geturl()
+
+
+def _decorate_external_urls(row: dict[str, Any]) -> dict[str, Any]:
+    """Expose validated links and explicit reasons to the frontend."""
+    result = dict(row)
+    platform = str(result.get("platform") or result.get("job_platform") or "").lower()
+    raw_conversation_url = result.get("conversation_url")
+    raw_job_url = result.get("job_url")
+    conversation_url = normalize_platform_external_url(platform, raw_conversation_url, kind="conversation")
+    job_url = normalize_platform_external_url(platform, raw_job_url, kind="job")
+    result["conversation_url"] = conversation_url
+    result["job_url"] = job_url
+    result["conversation_url_available"] = bool(conversation_url)
+    result["job_url_available"] = bool(job_url)
+    result["conversation_url_reason"] = "可打开具体平台 HR 会话" if conversation_url else (
+        "平台尚未返回具体 HR 会话地址" if raw_conversation_url else "尚未保存具体 HR 会话地址"
+    )
+    result["job_url_reason"] = "可打开平台岗位详情" if job_url else (
+        "岗位详情地址不是对应招聘平台外链" if raw_job_url else "尚未保存平台岗位详情地址"
+    )
+    return result
 
 
 @dataclass(frozen=True)
@@ -80,6 +160,7 @@ def init_conversation_tables(conn: sqlite3.Connection) -> None:
             job_id TEXT,
             hr_profile_url TEXT,
             company_url TEXT,
+            conversation_url TEXT,
             status TEXT NOT NULL DEFAULT 'new',
             pause_reason TEXT,
             interest_score INTEGER,
@@ -90,7 +171,11 @@ def init_conversation_tables(conn: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_conv_external_identity
+        -- A recruiter/platform conversation may be shared by several delivered
+        -- jobs.  The local card identity is platform + job_id, so an external
+        -- conversation id is a lookup field, not a unique card identity.
+        DROP INDEX IF EXISTS uq_conv_external_identity;
+        CREATE INDEX IF NOT EXISTS idx_conv_external_identity
             ON conv_conversations(user_id, platform, external_conversation_id)
             WHERE external_conversation_id IS NOT NULL
               AND external_conversation_id != '';
@@ -161,12 +246,37 @@ def init_conversation_tables(conn: sqlite3.Connection) -> None:
             job_id TEXT,
             deleted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_conv_deleted_external_identity
+        DROP INDEX IF EXISTS uq_conv_deleted_external_identity;
+        CREATE INDEX IF NOT EXISTS idx_conv_deleted_external_identity
             ON conv_deleted_conversations(user_id, platform, external_conversation_id)
             WHERE external_conversation_id IS NOT NULL
               AND external_conversation_id != '';
         """
     )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(conv_conversations)").fetchall()}
+    if "conversation_url" not in columns:
+        conn.execute("ALTER TABLE conv_conversations ADD COLUMN conversation_url TEXT")
+    jobs_columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    if {"source_platform", "hr_name", "company", "deleted_at"}.issubset(jobs_columns):
+        candidates = conn.execute(
+            """SELECT id, platform, hr_name, company_id
+               FROM conv_conversations
+               WHERE (job_id IS NULL OR job_id = '' OR job_id LIKE 'sync:%')
+                 AND TRIM(hr_name) <> '' AND TRIM(COALESCE(company_id, '')) <> ''"""
+        ).fetchall()
+        for candidate in candidates:
+            matches = conn.execute(
+                """SELECT id FROM jobs
+                   WHERE deleted_at IS NULL AND source_platform = ?
+                     AND hr_name = ? AND company = ?
+                   ORDER BY score DESC, updated_at DESC""",
+                (candidate["platform"], candidate["hr_name"], candidate["company_id"]),
+            ).fetchall()
+            if len(matches) == 1:
+                conn.execute(
+                    "UPDATE conv_conversations SET job_id = ?, updated_at = ? WHERE id = ?",
+                    (str(matches[0]["id"]), utc_now(), candidate["id"]),
+                )
     conn.commit()
 
 
@@ -193,6 +303,7 @@ class ConversationRepository:
         if status not in CONVERSATION_STATUSES:
             raise ValueError(f"unsupported conversation status: {status}")
         now = utc_now()
+        raw_conversation_url = conversation.get("conversation_url")
         fields = {
             "user_id": str(conversation.get("user_id") or "default"),
             "platform": platform,
@@ -205,14 +316,34 @@ class ConversationRepository:
             "job_id": conversation.get("job_id"),
             "hr_profile_url": conversation.get("hr_profile_url"),
             "company_url": conversation.get("company_url"),
+            "conversation_url": normalize_platform_external_url(
+                platform, raw_conversation_url, kind="conversation"
+            ),
             "status": status,
             "pause_reason": conversation.get("pause_reason"),
             "interest_score": conversation.get("interest_score"),
             "updated_at": now,
         }
         existing = self.conn.execute(
-            "SELECT id FROM conv_conversations WHERE id = ?", (conversation_id,)
+            "SELECT * FROM conv_conversations WHERE id = ?", (conversation_id,)
         ).fetchone()
+        if existing:
+            # A partial platform snapshot must never erase trusted local/job context.
+            preserve_if_empty = {
+                "external_conversation_id", "hr_external_id", "hr_name", "hr_title",
+                "hr_avatar_url", "company_id", "job_id", "hr_profile_url", "company_url",
+                "conversation_url", "pause_reason", "interest_score",
+            }
+            for key in preserve_if_empty:
+                value = fields.get(key)
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    fields[key] = existing[key]
+            # An explicitly supplied invalid URL must clear the stale value;
+            # only an omitted/empty snapshot is allowed to preserve it.
+            if raw_conversation_url is not None and str(raw_conversation_url).strip():
+                fields["conversation_url"] = normalize_platform_external_url(
+                    platform, raw_conversation_url, kind="conversation"
+                )
         if existing:
             assignments = ", ".join(f"{key} = ?" for key in fields)
             self.conn.execute(
@@ -229,11 +360,26 @@ class ConversationRepository:
         self.conn.commit()
         return self.get_conversation(conversation_id) or {}
 
+    def _has_jobs_table(self) -> bool:
+        return bool(self.conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'").fetchone())
+
     def get_conversation(self, conversation_id: str) -> dict[str, Any] | None:
-        row = self.conn.execute(
-            "SELECT * FROM conv_conversations WHERE id = ?", (conversation_id,)
-        ).fetchone()
-        return dict(row) if row else None
+        if not self._has_jobs_table():
+            row = self.conn.execute(
+                "SELECT * FROM conv_conversations WHERE id = ?", (conversation_id,)
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                """SELECT c.*, j.title AS job_title, j.company AS job_company,
+                          j.hr_title AS job_hr_title, j.url AS job_url,
+                          j.source_platform AS job_platform, j.score AS job_score,
+                          j.score_reason AS job_score_reason, j.status AS job_status
+                   FROM conv_conversations c
+                   LEFT JOIN jobs j ON j.id = c.job_id
+                   WHERE c.id = ?""",
+                (conversation_id,),
+            ).fetchone()
+        return _decorate_external_urls(dict(row)) if row else None
 
     def is_deleted(self, conversation_id: str) -> bool:
         row = self.conn.execute(
@@ -333,7 +479,7 @@ class ConversationRepository:
             "SELECT * FROM conv_messages WHERE conversation_id = ? ORDER BY message_time, id",
             (conversation_id,),
         ).fetchall()
-        return [dict(row) for row in rows]
+        return [_decorate_external_urls(dict(row)) for row in rows]
 
     def list_drafts(self, conversation_id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute(
@@ -350,8 +496,14 @@ class ConversationRepository:
             "frequency": "round_count DESC, COALESCE(c.last_message_at, c.updated_at) DESC, c.id DESC",
             "created": "c.created_at DESC, c.id DESC",
         }[sort]
+        if self._has_jobs_table():
+            job_select = "j.title AS job_title, j.company AS job_company, j.hr_title AS job_hr_title, j.url AS job_url, j.source_platform AS job_platform, j.score AS job_score, j.status AS job_status"
+            job_join = "LEFT JOIN jobs j ON j.id = c.job_id"
+        else:
+            job_select = "NULL AS job_title, NULL AS job_company, NULL AS job_hr_title, NULL AS job_url, NULL AS job_platform, NULL AS job_score, NULL AS job_status"
+            job_join = ""
         rows = self.conn.execute(
-            f"""SELECT c.*,
+            f"""SELECT c.*, {job_select},
                        COUNT(m.id) AS message_count,
                        SUM(CASE WHEN m.sender_type = 'hr' THEN 1 ELSE 0 END) AS hr_message_count,
                        SUM(CASE WHEN m.sender_type IN ('user', 'ai') THEN 1 ELSE 0 END) AS user_message_count,
@@ -360,14 +512,19 @@ class ConversationRepository:
                           WHERE m2.conversation_id = c.id
                           ORDER BY COALESCE(m2.message_time, m2.created_at) DESC, m2.id DESC LIMIT 1) AS last_message_preview
                 FROM conv_conversations c
+                {job_join}
                 LEFT JOIN conv_messages m ON m.conversation_id = c.id
                 WHERE c.user_id = ?
+                  AND (
+                    (c.platform = 'assistant_lab' AND c.id = 'assistant-lab:assistant-lab:default')
+                    OR (c.job_id IS NOT NULL AND TRIM(c.job_id) <> '' AND c.job_id NOT LIKE 'sync:%')
+                  )
                   AND NOT (c.platform = 'assistant_lab' AND c.id <> 'assistant-lab:assistant-lab:default')
                 GROUP BY c.id
                 ORDER BY {order_by}""",
             (user_id,),
         ).fetchall()
-        return [dict(row) for row in rows]
+        return [_decorate_external_urls(dict(row)) for row in rows]
 
     def update_status(self, conversation_id: str, status: str, reason: str = "") -> dict[str, Any]:
         if status not in CONVERSATION_STATUSES:

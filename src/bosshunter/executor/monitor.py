@@ -82,7 +82,7 @@ def get_effective_monitor_interval_minutes(
         interval = float(raw_interval)
     except (TypeError, ValueError):
         interval = 30.0
-    return max(interval, 1.0)
+    return max(interval * get_boss_operation_interval_multiplier(config), 1.0)
 
 
 # JS: Extract chat list with full message context
@@ -115,6 +115,15 @@ JS_EXTRACT_CHAT_LIST = r"""
         const isSystemMessage = /正在与Boss.+沟通|近30天过滤了.+BOSS发来的消息|你与该职位竞争者PK情况|新岗位速递|VIP数据总结|根据你的历史开聊\/收藏岗位|根据你的开聊\/收藏岗位.+为你推荐\d+个新岗位|识别到以下新发布岗位你可能感兴趣|我是你的求职助手|感谢您使用VIP权益|(?:您的|VIP)权益已到期|点击续费vip|牛人vip怎么样|附件简历请求已发送|附件简历已发送给对方|附件简历.{0,80}已发送给Boss/i.test(lastMessage);
         const lastDirection = isOurMessage ? 'me' : (isHrMessage ? 'hr' : 'unknown');
         const hasReply = !!lastMsgEl && lastDirection !== 'me' && !isSystemMessage;
+        const className = String(item.className || '').toLowerCase();
+        const active = item.getAttribute('aria-selected') === 'true'
+            || item.classList.contains('active')
+            || item.classList.contains('selected')
+            || /(^|[\\s_-])(active|selected)([\\s_-]|$)/.test(className);
+        const conversationId = item.getAttribute('data-id')
+            || item.getAttribute('data-conversation-id')
+            || item.getAttribute('data-uid')
+            || '';
 
         results.push({
             hr_name: nameText.textContent.trim(),
@@ -125,6 +134,8 @@ JS_EXTRACT_CHAT_LIST = r"""
             has_unread: !!unreadEl,
             is_our_message: isOurMessage,
             last_direction: lastDirection,
+            active: active,
+            conversation_id: conversationId || null,
             element_index: results.length
         });
     });
@@ -1559,7 +1570,19 @@ def _handle_conversation(job: dict, config: dict, conversation: dict | None = No
             synced = {"conversation": {}, "inserted": [], "notification": None}
     finally:
         bridge_db.close()
-    if synced["conversation"].get("status") == "paused_salary":
+    sync_status = str(synced.get("status") or "")
+    conversation_record = synced.get("conversation") or {}
+    if synced.get("deleted"):
+        close_tab(target_id)
+        console.print("[yellow]    本地会话已删除，跳过后续自动处理[/yellow]")
+        return "deleted"
+    if sync_status == "empty_messages":
+        close_tab(target_id)
+        console.print("[yellow]    未读取到可持久化的聊天消息，跳过后续自动处理[/yellow]")
+        return "empty_messages"
+    if sync_status in {"unmatched", "ambiguous"} or not conversation_record:
+        console.print("[yellow]    会话未能写入本地岗位关联，继续使用已读取消息处理[/yellow]")
+    if conversation_record.get("status") == "paused_salary":
         close_tab(target_id)
         console.print("[yellow]    薪资话题已转人工接管，当前会话暂停自动处理[/yellow]")
         return "paused_salary"

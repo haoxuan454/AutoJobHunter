@@ -156,7 +156,24 @@ class ConversationWebFlowTests(unittest.TestCase):
         self.assertTrue(deleted["platform_untouched"])
         self.assertTrue(self.request("/api/conversations/c-delete")[0].startswith("404"))
 
-    def test_assistant_lab_history_is_projected_to_one_center_conversation(self):
+    def test_single_conversation_sync_rejects_ambiguous_identity(self):
+        from unittest.mock import patch
+        self.request("/api/conversations", "POST", {
+            "id": "ambiguous", "platform": "liepin", "external_conversation_id": "same",
+            "hr_name": "王HR", "company_id": "示例科技", "job_id": "job-1",
+        })
+        rows = [
+            {"hr_name": "王HR", "company_role": "示例科技", "title": "数据分析师", "conversation_id": "same"},
+            {"hr_name": "王HR", "company_role": "示例科技", "title": "数据分析师", "conversation_id": "same"},
+        ]
+        with patch.object(server, "_liepin_im_targets", return_value=[{"target_id": "im", "url": "https://c.liepin.com/im"}]), \
+             patch.object(server, "_liepin_conversation_list_snapshot", return_value={"rows": rows, "success": True}):
+            status, result = self.request("/api/conversations/ambiguous/sync", "POST")
+        self.assertTrue(status.startswith("200"), result)
+        self.assertEqual(result["status"], "ambiguous")
+        detail = self.request("/api/conversations/ambiguous")[1]
+        self.assertEqual(detail["messages"], [])
+
         status, first = self.request("/api/assistant-lab/session")
         self.assertTrue(status.startswith("200"), first)
         self.assertEqual(first["session"]["id"], "assistant-lab:default")
@@ -173,7 +190,21 @@ class ConversationWebFlowTests(unittest.TestCase):
         detail_status, detail = self.request("/api/conversations/assistant-lab%3Aassistant-lab%3Adefault")
         self.assertTrue(detail_status.startswith("200"), detail)
         self.assertEqual(len(detail["messages"]), 4)
+    def test_batch_sync_reports_loaded_contacts_without_active_chat(self):
+        from unittest.mock import patch
 
+        with patch.object(server, "_boss_im_targets", return_value=[{"target_id": "boss", "url": "https://www.zhipin.com/web/geek/chat"}]), \
+             patch.object(server, "evaluate", return_value=json.dumps([
+                 {"hr_name": "刘先生", "company": "示例公司", "active": False},
+                 {"hr_name": "另一位 HR", "company": "另一家公司", "active": False},
+             ])):
+            status, result = self.request(
+                "/api/conversations/sync", "POST", {"platforms": ["boss"]}
+            )
+        self.assertTrue(status.startswith("200"), result)
+        self.assertEqual(result["results"][0]["status"], "no_active_conversation")
+        self.assertEqual(result["results"][0]["updated"], 0)
+        self.assertEqual(self.request("/api/conversations")[1]["conversations"], [])
 
 if __name__ == "__main__":
     unittest.main()

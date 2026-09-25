@@ -22,11 +22,21 @@ class PlatformDeliveryAdapterTests(unittest.TestCase):
             self.assertEqual(result.error, "platform_delivery_not_verified")
             self.assertIn("不会复用 BOSS", result.history_detail)
 
-    def test_only_accepted_zhilian_adapter_is_marked_verified(self):
-        self.assertTrue(get_delivery_adapter("zhilian").verified)
-        for platform in ("51job",):
-            self.assertFalse(get_delivery_adapter(platform).verified)
-        self.assertTrue(get_delivery_adapter("liepin").verified)
+    def test_liepin_chat_snapshot_preserves_message_direction_and_metadata(self):
+        import json
+        from unittest.mock import patch
+        from bosshunter.platform_delivery.liepin import _liepin_chat_snapshot
+
+        payload = {"success": True, "has_input": True, "has_send": True, "messages": [
+            {"sender": "me", "text": "你好", "message_time": "10:00", "message_id": "m1", "index": 0},
+            {"sender": "hr", "text": "方便介绍经历吗？", "message_time": "10:01", "message_id": "m2", "index": 1},
+        ]}
+        with patch("bosshunter.platform_delivery.liepin.evaluate", return_value=json.dumps(payload)):
+            snapshot = _liepin_chat_snapshot("liepin-target")
+
+        self.assertEqual(snapshot["messages"][0]["sender"], "me")
+        self.assertEqual(snapshot["messages"][1]["sender"], "hr")
+        self.assertEqual(snapshot["messages"][1]["message_id"], "m2")
 
     def test_boss_adapter_does_not_bypass_legacy_sender(self):
         result = get_delivery_adapter("boss").send_greeting(
@@ -88,7 +98,7 @@ class PlatformDeliveryAdapterTests(unittest.TestCase):
             "matched": True,
             "match_quality": "company_title_hr",
             "row": {"company": "湖南省国银新材料有限公司", "title": "python后端开发工程师", "hr_name": "HR"},
-            "conversation_url": "https://i.zhaopin.com/im?refcode=4019",
+            "conversation_url": "https://i.zhaopin.com/im?sessionId=session-zhilian-1&refcode=4019",
         }
         with patch("bosshunter.platform_delivery.zhilian._find_existing_zhilian_conversation", return_value=reconciliation), \
              patch("bosshunter.platform_delivery.zhilian._open_zhilian_job") as open_job, \

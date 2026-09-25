@@ -97,10 +97,20 @@ def _liepin_chat_snapshot(target_id: str) -> dict[str, Any]:
       const sends = {json.dumps(list(LIEPIN_SEND_SELECTORS), ensure_ascii=False)};
       const input = inputs.flatMap(s => [...document.querySelectorAll(s)]).find(visible);
       const send = sends.flatMap(s => [...document.querySelectorAll(s)]).find(visible);
-      const messages = [...document.querySelectorAll('.im-ui-message-item .im-ui-txt-content,.im-ui-message-item .im-ui-system-tip,.chat-message,.message-item,.im-message,[class*="message"]')]
+      const messages = [...document.querySelectorAll('.im-ui-message-item,.chat-message,.message-item,.im-message')]
         .filter(visible)
-        .map(node => text(node.querySelector('.message-text,.msg-text,.text') || node))
-        .filter(Boolean);
+        .map((node, index) => {{
+          const classes = [node, ...node.querySelectorAll('[class]')]
+            .map(el => String(el.className || '').toLowerCase()).join(' ');
+          const sender = /(^|[\\s_-])(me|self|myself|from-me|outgoing|send|mine)([\\s_-]|$)/.test(classes)
+            ? 'me' : /(^|[\\s_-])(other|receive|received|from-other|incoming|hr)([\\s_-]|$)/.test(classes)
+              ? 'hr' : 'unknown';
+          const textNode = node.querySelector('.im-ui-txt-content,.message-text,.msg-text,.text');
+          const timeNode = node.querySelector('time,[datetime],.message-time,.msg-time,.im-ui-message-time');
+          const messageId = node.getAttribute('data-message-id') || node.getAttribute('data-msg-id') || node.getAttribute('data-id') || '';
+          return {{sender, text:text(textNode || node), message_time:text(timeNode), message_id:messageId || null, index}};
+        }})
+        .filter(item => item.text);
       return JSON.stringify({{success:true, url:location.href, has_input:!!input, has_send:!!send, messages}});
     }})()
     """, timeout=10))
@@ -200,6 +210,7 @@ def _liepin_conversation_list_snapshot(target_id: str) -> dict[str, Any]:
           index,
           text:text(row).slice(0,300),
           class_name:String(row.className || ''),
+          active:row.classList.contains('active') || row.classList.contains('is-active') || !!row.querySelector('[aria-selected="true"]'),
           hr_name:text(row.querySelector('.im-ui-contact-title-name,.contact-name,.user-name')),
           company_role:text(row.querySelector('.im-ui-contact-title-sub,.contact-company,.company-name')),
           last_message:text(row.querySelector('.im-ui-last-message,.last-message,.message-preview')),
