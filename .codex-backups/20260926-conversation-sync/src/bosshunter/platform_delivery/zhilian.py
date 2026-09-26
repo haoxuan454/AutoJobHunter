@@ -109,39 +109,19 @@ def _conversation_message_snapshot(target_id: str) -> list[dict[str, str]]:
         const rects = el.getClientRects(), style = getComputedStyle(el);
         return rects.length > 0 && style.display !== 'none' && style.visibility !== 'hidden';
       };
-      const nodes = [...document.querySelectorAll('.im-message,.chat-message,.message-item')]
+      const messages = [...document.querySelectorAll(
+        '.im-message,.chat-message,.message-item'
+      )]
         .filter(visible)
-        .filter(node => {
-          // Zhilian nests message elements. Only the outer message is a
-          // message record; reading both levels duplicates every message.
-          // `node.closest('.im-message') === node` is true for both the
-          // outer and inner node, so inspect the parent instead.
-          return !node.parentElement?.closest('.im-message');
-        });
-      const messages = nodes.map((node, index) => {
+        .map(node => {
           const classes = [node, ...node.querySelectorAll('[class]')]
             .map(el => String(el.className || '').toLowerCase()).join(' ');
-          // Interactive cards contain action labels ("同意/拒绝") in their
-          // wrapper text. Persist the semantic card title, not those controls.
-          const textNode = node.querySelector(
-            '.im-msg-309__title,.im-wechat-exchange-card__title,.im-msg-text,.msg-text,.text,.message-text'
-          );
-          const isMe = /(^|[\s_-])im-message__bubble--me([\s_-]|$)/.test(classes)
-            || /(^|[\s_-])(item-myself|message-self|msg-self|is-self|my-message|message-mine|from-me|outgoing)([\s_-]|$)/.test(classes);
-          const isTip = /(^|[\s_-])im-message--tip([\s_-]|$)/.test(classes);
-          const isZhilian = node.matches('.im-message') || !!node.querySelector('.im-message');
-          const hasZhilianBubble = node.matches('.im-message__bubble') || !!node.querySelector('.im-message__bubble');
-          const sender = isTip ? 'system' : (isMe ? 'me' : (isZhilian && hasZhilianBubble ? 'hr' : 'unknown'));
-          const timeNode = node.querySelector('time,[datetime],.im-message__time,.message-time,.msg-time');
+          const textNode = node.querySelector('.im-msg-text,.msg-text,.text,.message-text');
+          const sender = /(^|[\s_-])(im-message__bubble--me|item-myself|message-self|msg-self|is-self|my-message|message-mine|from-me|outgoing)([\s_-]|$)/.test(classes)
+            ? 'me' : /(^|[\s_-])(item-other|message-other|message-receive|from-other|incoming)([\s_-]|$)/.test(classes) ? 'hr' : 'unknown';
+          const timeNode = node.querySelector('time,[datetime],.message-time,.msg-time');
           const messageId = node.getAttribute('data-message-id') || node.getAttribute('data-msg-id') || node.getAttribute('data-id') || '';
-          const text = normalize(textNode ? textNode.innerText || textNode.textContent : node.innerText || node.textContent);
-          const messageTime = normalize(timeNode?.innerText || timeNode?.getAttribute('datetime') || '');
-          return {sender, text, message_time:messageTime,
-            message_id:messageId,
-            message_id_is_native:!!messageId,
-            // Older builds persisted DOM-position IDs. Keep the exact legacy
-            // key briefly so the bridge can migrate those rows in place.
-            legacy_message_id:`dom-${index}--${text}`};
+          return {sender, text:normalize(textNode ? textNode.innerText || textNode.textContent : node.innerText || node.textContent), message_time:normalize(timeNode?.innerText || timeNode?.getAttribute('datetime') || ''), message_id:messageId || null};
         }).filter(item => item.text);
       return JSON.stringify({success:true,messages});
     })()
@@ -180,11 +160,8 @@ def _zhilian_conversation_list_snapshot(target_id: str) -> dict[str, Any]:
         .filter(visible)
         .map((row, index) => {
           const text = selector => normalize(row.querySelector(selector)?.innerText || '');
-          const panel = document.querySelector('.im-side-panel__list');
-          const panelTop = panel ? panel.getBoundingClientRect().top : 0;
-          const item = {
+           const item = {
             index,
-            position: panel ? Math.round(row.getBoundingClientRect().top - panelTop + panel.scrollTop) : null,
             hr_name: text('.im-session-item__name'),
             company: text('.im-session-item__company-name'),
             title: text('.im-session-item__job'),
@@ -210,7 +187,6 @@ def _zhilian_conversation_list_snapshot(target_id: str) -> dict[str, Any]:
         success: location.hostname === 'i.zhaopin.com' && location.pathname === '/im',
         rows,
         loaded_count: rows.length,
-        scroll_top: panel ? panel.scrollTop : 0,
         scroll_height: panel ? panel.scrollHeight : 0,
         client_height: panel ? panel.clientHeight : 0
       });
@@ -221,173 +197,8 @@ def _zhilian_conversation_list_snapshot(target_id: str) -> dict[str, Any]:
         "success": bool(result.get("success")),
         "rows": rows if isinstance(rows, list) else [],
         "loaded_count": int(result.get("loaded_count") or 0),
-        "scroll_top": int(result.get("scroll_top") or 0),
         "scroll_height": int(result.get("scroll_height") or 0),
         "client_height": int(result.get("client_height") or 0),
-    }
-
-
-def _zhilian_list_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
-    rows = snapshot.get("rows") if isinstance(snapshot.get("rows"), list) else []
-    row_signature = tuple(sorted(
-        "|".join(str(row.get(key) or "") for key in (
-            "session_id", "signature", "hr_name", "company", "title", "preview", "time",
-        ))
-        for row in rows if isinstance(row, dict)
-    ))
-    return (
-        int(snapshot.get("scroll_height") or 0),
-        int(snapshot.get("client_height") or 0),
-        int(snapshot.get("scroll_top") or 0),
-        row_signature,
-    )
-
-
-def _wait_for_zhilian_list_stability(
-    target_id: str,
-    initial: dict[str, Any],
-    *,
-    settle_seconds: float = 0.25,
-    stable_rounds: int = 3,
-    max_checks: int = 6,
-) -> tuple[dict[str, Any], bool]:
-    """Wait boundedly for asynchronous sidebar rows/heights to settle."""
-    snapshot = initial
-    previous = _zhilian_list_signature(initial)
-    stable = 1
-    for _ in range(max(0, max_checks)):
-        if stable >= max(1, stable_rounds):
-            return snapshot, True
-        time.sleep(max(0.0, min(float(settle_seconds), 1.0)))
-        current = _zhilian_conversation_list_snapshot(target_id)
-        if not current.get("success"):
-            return snapshot, False
-        signature = _zhilian_list_signature(current)
-        stable = stable + 1 if signature == previous else 1
-        previous = signature
-        snapshot = current
-    return snapshot, stable >= max(1, stable_rounds)
-
-
-def _scan_zhilian_conversation_list(
-    target_id: str,
-    *,
-    max_scrolls: int = 8,
-    settle_seconds: float = 0.25,
-) -> dict[str, Any]:
-    """Boundedly reveal lazy-loaded sidebar rows without opening any chat.
-
-    The target platform virtualizes/loads older rows as the sidebar scrolls.
-    A card sync therefore needs more than one passive DOM snapshot. Keep this
-    scan capped, deduplicate snapshots, and restore the user's prior sidebar
-    position before returning. A later caller may open only a uniquely
-    matched row through ``_open_zhilian_conversation_row``.
-    """
-    first = _zhilian_conversation_list_snapshot(target_id)
-    if not first.get("success"):
-        return {"success": False, "rows": [], "complete": False, "scroll_rounds": 0}
-
-    original_top = int(first.get("scroll_top") or 0)
-    rows_by_key: dict[str, dict[str, Any]] = {}
-
-    def collect(snapshot: dict[str, Any]) -> None:
-        for row in snapshot.get("rows") or []:
-            if not isinstance(row, dict):
-                continue
-            session_id = str(row.get("session_id") or "").strip()
-            signature = str(row.get("signature") or "").strip()
-            position = row.get("position")
-            if session_id:
-                key = f"session:{session_id}"
-            elif signature and position is not None:
-                key = f"signature:{signature}|position:{position}"
-            else:
-                key = f"signature:{signature}|index:{row.get('index', '')}"
-            if key:
-                rows_by_key[key] = row
-
-    collect(first)
-    snapshot = first
-    rounds = 0
-    complete = False
-    for _ in range(max(0, min(int(max_scrolls), 12))):
-        top = int(snapshot.get("scroll_top") or 0)
-        height = int(snapshot.get("scroll_height") or 0)
-        client = int(snapshot.get("client_height") or 0)
-        max_top = max(0, height - client)
-        if max_top <= top + 2:
-            snapshot, complete = _wait_for_zhilian_list_stability(
-                target_id, snapshot, settle_seconds=settle_seconds,
-            )
-            collect(snapshot)
-            if complete:
-                break
-            new_max_top = max(
-                0,
-                int(snapshot.get("scroll_height") or 0) - int(snapshot.get("client_height") or 0),
-            )
-            if new_max_top > int(snapshot.get("scroll_top") or 0) + 2:
-                continue
-            break
-
-        result = parse_result(evaluate(target_id, r"""
-        (() => {
-          const panel = document.querySelector('.im-side-panel__list');
-          if (!panel) return JSON.stringify({success:false, status:'scroll_container_missing'});
-          const before = panel.scrollTop;
-          const step = Math.max(180, Math.floor(panel.clientHeight * 0.72));
-          panel.scrollTop = Math.min(panel.scrollTop + step, panel.scrollHeight - panel.clientHeight);
-          return JSON.stringify({success:true, before, scroll_top:panel.scrollTop,
-            scroll_height:panel.scrollHeight, client_height:panel.clientHeight});
-        })()
-        """, timeout=10))
-        if not result.get("success"):
-            break
-        rounds += 1
-        time.sleep(max(0.0, min(float(settle_seconds), 1.0)))
-        snapshot = _zhilian_conversation_list_snapshot(target_id)
-        if not snapshot.get("success"):
-            break
-        collect(snapshot)
-    else:
-        top = int(snapshot.get("scroll_top") or 0)
-        at_bottom = max(0, int(snapshot.get("scroll_height") or 0) - int(snapshot.get("client_height") or 0)) <= top + 2
-        if at_bottom:
-            snapshot, complete = _wait_for_zhilian_list_stability(
-                target_id, snapshot, settle_seconds=settle_seconds,
-            )
-            collect(snapshot)
-
-    # Scanning is observational; leave the sidebar where the user had it.
-    if int(snapshot.get("scroll_top") or 0) != original_top:
-        evaluate(target_id, f"""
-        (() => {{
-          const panel = document.querySelector('.im-side-panel__list');
-          if (!panel) return JSON.stringify({{success:false}});
-          panel.scrollTop = {original_top};
-          return JSON.stringify({{success:true}});
-        }})()
-        """, timeout=10)
-
-    signature_counts: dict[str, int] = {}
-    for row in rows_by_key.values():
-        if not row.get("session_id"):
-            signature = str(row.get("signature") or "")
-            signature_counts[signature] = signature_counts.get(signature, 0) + 1
-    rows = []
-    for row in rows_by_key.values():
-        row = dict(row)
-        if not row.get("session_id") and signature_counts.get(str(row.get("signature") or ""), 0) > 1:
-            row["identity_ambiguous"] = True
-        rows.append(row)
-
-    return {
-        "success": True,
-        "rows": rows,
-        "complete": complete,
-        "scroll_rounds": rounds,
-        "original_scroll_top": original_top,
-        "loaded_count": len(rows_by_key),
     }
 
 
@@ -438,36 +249,6 @@ def _match_zhilian_conversation_row(row: dict[str, Any], job: dict[str, Any]) ->
     return True, "company_only"
 
 
-def _match_zhilian_sync_identity(row: dict[str, Any], expected: dict[str, Any]) -> tuple[bool, str]:
-    """Require job-specific identity when opening a sidebar row for sync.
-
-    Delivery/first-contact matching has separate company-scoped rules. This
-    stricter helper is only for reading an existing conversation into a local
-    job card, where a same-HR/same-company but different-title row is unsafe.
-    """
-    company = str(expected.get("company") or "").strip()
-    actual_company = str(row.get("company") or "").strip()
-    title = str(expected.get("title") or "").strip()
-    actual_title = str(row.get("title") or "").strip()
-    hr_name = str(expected.get("hr_name") or "").strip()
-    actual_hr = str(row.get("hr_name") or "").strip()
-    if not company or not actual_company or not _zhilian_company_equal(company, actual_company):
-        return False, "none"
-    if not title or not actual_title:
-        return False, "job_title_missing"
-    compact_title = "".join(title.split()).casefold()
-    compact_actual_title = "".join(actual_title.split()).casefold()
-    if not (
-        _zhilian_text_equal(title, actual_title)
-        or compact_title in compact_actual_title
-        or compact_actual_title in compact_title
-    ):
-        return False, "job_title_mismatch"
-    if hr_name and (not actual_hr or not _zhilian_text_equal(hr_name, actual_hr)):
-        return False, "hr_mismatch"
-    return True, "company_title_hr" if hr_name else "company_title"
-
-
 def _active_zhilian_conversation_snapshot(target_id: str) -> dict[str, Any]:
     """Read the currently rendered Zhilian chat header and message count."""
     result = parse_result(evaluate(target_id, r"""
@@ -480,263 +261,16 @@ def _active_zhilian_conversation_snapshot(target_id: str) -> dict[str, Any]:
       const chat = document.querySelector('.im-main-panel__chat');
       if (!chat || !visible(chat)) return JSON.stringify({success:false});
       const text = selector => normalize(chat.querySelector(selector)?.innerText || '');
-      const nodes = [...chat.querySelectorAll('.im-message,.chat-message,.message-item')]
+      const messages = [...chat.querySelectorAll('.im-message,.chat-message,.message-item')]
         .filter(visible)
-        // The rendered Zhilian message has an outer `.im-message` wrapper
-        // and an inner `.im-message` text node. Only retain the outer node.
-        .filter(node => !node.parentElement?.closest('.im-message'));
-      const messages = nodes.map((node, index) => {
-        const classes = [node, ...node.querySelectorAll('[class]')]
-          .map(el => String(el.className || '').toLowerCase()).join(' ');
-        // Use the actual text/card title. Wrapper innerText also includes
-        // consent buttons and caused old snapshots to produce several IDs
-        // for the same rendered HR card.
-        const textNode = node.querySelector(
-          '.im-msg-309__title,.im-wechat-exchange-card__title,.im-msg-text,.msg-text,.text,.message-text'
-        );
-        const timeNode = node.querySelector('time,[datetime],.im-message__time,.message-time,.msg-time');
-        const textValue = normalize(textNode?.innerText || textNode?.textContent || node.innerText || node.textContent);
-        const messageTime = normalize(timeNode?.innerText || timeNode?.getAttribute('datetime') || '');
-        const isMe = /(^|[\s_-])im-message__bubble--me([\s_-]|$)/.test(classes)
-          || /(^|[\s_-])(item-myself|message-self|msg-self|is-self|my-message|message-mine|from-me|outgoing)([\s_-]|$)/.test(classes);
-        const isTip = /(^|[\s_-])im-message--tip([\s_-]|$)/.test(classes);
-        const isZhilian = node.matches('.im-message') || !!node.querySelector('.im-message');
-        const hasZhilianBubble = node.matches('.im-message__bubble') || !!node.querySelector('.im-message__bubble');
-        const sender = isTip ? 'system' : (isMe ? 'me' : (isZhilian && hasZhilianBubble ? 'hr' : 'unknown'));
-        const nativeMessageId = node.getAttribute('data-message-id') || node.getAttribute('data-msg-id') || node.getAttribute('data-id') || '';
-        return {sender, text:textValue, message_time:messageTime,
-          message_id:nativeMessageId, message_id_is_native:!!nativeMessageId,
-          legacy_message_id:`dom-${index}--${textValue}`};
-      }).filter(item => item.text);
-      const timeline = chat.querySelector('.im-main-panel__timeline');
-      const historyEnding = !!chat.querySelector('.im-main-panel__history-tip.is-ending');
-      const historyLabel = normalize(chat.querySelector('.im-main-panel__history-tip')?.innerText || '');
+        .map(node => normalize(node.querySelector('.im-msg-text,.msg-text,.text,.message-text')?.innerText || node.innerText || node.textContent))
+        .filter(Boolean);
       const params = new URL(location.href).searchParams;
       const sessionId = params.get('sessionId') || '';
-      return JSON.stringify({success:true, url:location.href, external_conversation_id:sessionId, session_id:sessionId, hr_name:text('.im-chat-header__name'), company:text('.im-chat-header__meta-text'), title:text('.im-chat-header__job-title'), message_count:messages.length, messages, history_complete:historyEnding, history_label:historyLabel, history_scroll_top:timeline?.scrollTop ?? null, history_scroll_height:timeline?.scrollHeight ?? null});
+      return JSON.stringify({success:true, url:location.href, external_conversation_id:sessionId || params.get('refcode') || '', session_id:sessionId, hr_name:text('.im-chat-header__name'), company:text('.im-chat-header__meta-text'), title:text('.im-chat-header__job-title'), message_count:messages.length, messages});
     })()
     """, timeout=10))
     return result if isinstance(result, dict) else {"success": False}
-
-
-def _load_zhilian_chat_history(
-    target_id: str,
-    *,
-    max_rounds: int = 10,
-    stable_rounds: int = 2,
-    interval: float = 0.35,
-) -> dict[str, Any]:
-    """Load rendered history up to the platform's visible history boundary.
-
-    Zhilian lazily fetches older messages when the timeline is scrolled to its
-    top. This is a bounded, read-only UI action: it never touches the composer
-    or send controls. If the platform does not expose its ending marker, the
-    result is explicitly marked incomplete instead of assuming completeness.
-    """
-    last: dict[str, Any] = {"success": False, "messages": [], "history_complete": False}
-    previous_signature: tuple[Any, ...] | None = None
-    stable = 0
-    rounds = 0
-    for rounds in range(1, max(1, max_rounds) + 1):
-        evaluate(target_id, r"""
-        (() => {
-          const timeline = document.querySelector('.im-main-panel__timeline');
-          if (timeline && timeline.scrollTop > 0) {
-            timeline.scrollTop = 0;
-            timeline.dispatchEvent(new Event('scroll', {bubbles:true}));
-          }
-          return JSON.stringify({success:!!timeline});
-        })()
-        """, timeout=10)
-        if interval > 0:
-            time.sleep(interval)
-        last = _active_zhilian_conversation_snapshot(target_id)
-        if not last.get("success"):
-            continue
-        messages = last.get("messages") if isinstance(last.get("messages"), list) else []
-        signature = (
-            last.get("session_id"),
-            len(messages),
-            last.get("history_scroll_height"),
-            tuple(str(item.get("message_id") or "") for item in messages),
-        )
-        if last.get("history_complete"):
-            break
-        if signature == previous_signature and (last.get("history_scroll_top") in (0, 0.0, None)):
-            stable += 1
-        else:
-            stable = 0
-        if stable >= max(1, stable_rounds):
-            break
-        previous_signature = signature
-    return {**last, "history_rounds": rounds}
-
-
-def _open_zhilian_conversation_row(
-    target_id: str,
-    row: dict[str, Any],
-    *,
-    timeout: float = 8.0,
-) -> dict[str, Any]:
-    """Open one already-rendered Zhilian list row and verify its chat header.
-
-    Rows can be outside the sidebar's visible scroll window even though they
-    are already rendered. Locate by stable session id or a unique full-row
-    signature, scroll that row into the sidebar viewport, then click it. Never
-    fall back to a stale list index: a reordered list could open another HR.
-    """
-    signature = str(row.get("signature") or "")
-    session_id = str(row.get("session_id") or row.get("conversation_id") or "")
-    if not session_id and bool(row.get("identity_ambiguous")):
-        return {"status": "row_ambiguous", "opened": False, "reason": "missing_session_id_and_duplicate_identity"}
-    if not session_id and not signature:
-        return {"status": "row_identity_missing", "opened": False}
-    locate_script = f"""
-    (() => {{
-      const normalize = value => (value || '').replace(/\\s+/g, ' ').trim();
-      const visible = el => {{
-        const r = el.getBoundingClientRect(), s = getComputedStyle(el);
-        return !!(r.width && r.height && s.display !== 'none' && s.visibility !== 'hidden');
-      }};
-      const rows = [...document.querySelectorAll('.im-session-item')].filter(visible);
-      const make = row => [
-        row.querySelector('.im-session-item__name')?.innerText || '',
-        row.querySelector('.im-session-item__company-name')?.innerText || '',
-        row.querySelector('.im-session-item__job')?.innerText || '',
-        row.querySelector('.im-session-item__preview')?.innerText || '',
-        row.querySelector('.im-session-item__time')?.innerText || ''
-      ].map(normalize).join('|');
-      const wanted = {json.dumps(signature, ensure_ascii=False)};
-      const wantedSession = {json.dumps(session_id, ensure_ascii=False)};
-      let matches = wantedSession
-        ? rows.filter(item => (item.getAttribute('data-session-id') || item.dataset.sessionId ||
-            item.querySelector('a[href*="sessionId"]')?.href?.match(/[?&]sessionId=([^&#]+)/)?.[1] || '') === wantedSession)
-        : [];
-      if (!matches.length && wanted) matches = rows.filter(item => make(item) === wanted);
-      if (!matches.length) return JSON.stringify({{success:false, status:'row_not_found'}});
-      if (matches.length !== 1) return JSON.stringify({{success:false, status:'row_ambiguous', count:matches.length}});
-      const row = matches[0];
-      const panel = document.querySelector('.im-side-panel__list');
-      if (!panel || !panel.contains(row)) return JSON.stringify({{success:false, status:'scroll_container_missing'}});
-      const before = row.getBoundingClientRect();
-      const panelRect = panel.getBoundingClientRect();
-      if (before.top < panelRect.top + 8 || before.bottom > panelRect.bottom - 8) {{
-        panel.scrollTop += before.top - panelRect.top - (panel.clientHeight - before.height) / 2;
-      }}
-      const rect = row.getBoundingClientRect();
-      const visibleTop = Math.max(panel.getBoundingClientRect().top, 0);
-      const visibleBottom = Math.min(panel.getBoundingClientRect().bottom, window.innerHeight);
-      if (rect.bottom <= visibleTop || rect.top >= visibleBottom || rect.width <= 0 || rect.height <= 0)
-        return JSON.stringify({{success:false, status:'row_not_visible'}});
-      return JSON.stringify({{success:true, x:rect.left + rect.width / 2, y:rect.top + rect.height / 2,
-        signature:make(row), session_id:wantedSession, scroll_top:panel.scrollTop}});
-    }})()
-    """
-    located: dict[str, Any] = {}
-    scroll_rounds = 0
-    reset_to_top = False
-    max_open_scrolls = 12
-    for _ in range(max_open_scrolls + 1):
-        located = parse_result(evaluate(target_id, locate_script, timeout=10))
-        if located.get("success") or located.get("status") != "row_not_found":
-            break
-        sidebar = _zhilian_conversation_list_snapshot(target_id)
-        top = int(sidebar.get("scroll_top") or 0)
-        max_top = max(0, int(sidebar.get("scroll_height") or 0) - int(sidebar.get("client_height") or 0))
-        if not sidebar.get("success"):
-            break
-        if top >= max_top - 2:
-            if reset_to_top or top <= 2:
-                break
-            result = parse_result(evaluate(target_id, r"""
-            (() => {
-              const panel = document.querySelector('.im-side-panel__list');
-              if (!panel) return JSON.stringify({success:false});
-              panel.scrollTop = 0;
-              panel.dispatchEvent(new Event('scroll', {bubbles:true}));
-              return JSON.stringify({success:true});
-            })()
-            """, timeout=10))
-            if not result.get("success"):
-                break
-            reset_to_top = True
-        else:
-            result = parse_result(evaluate(target_id, r"""
-            (() => {
-              const panel = document.querySelector('.im-side-panel__list');
-              if (!panel) return JSON.stringify({success:false});
-              const before = panel.scrollTop;
-              panel.scrollTop = Math.min(before + Math.max(180, Math.floor(panel.clientHeight * 0.72)),
-                panel.scrollHeight - panel.clientHeight);
-              panel.dispatchEvent(new Event('scroll', {bubbles:true}));
-              return JSON.stringify({success:panel.scrollTop > before});
-            })()
-            """, timeout=10))
-            if not result.get("success"):
-                break
-            scroll_rounds += 1
-        time.sleep(0.25)
-    if not located.get("success"):
-        status = str(located.get("status") or "row_not_found")
-        if status == "row_not_found" and scroll_rounds >= max_open_scrolls:
-            status = "row_scan_incomplete"
-        return {"status": status, "opened": False, "scroll_rounds": scroll_rounds}
-    clicked = click_at(target_id, f"{located.get('x')},{located.get('y')}")
-    if not clicked:
-        return {"status": "click_failed", "opened": False}
-    deadline = time.time() + timeout
-    last: dict[str, Any] = {"status": "chat_not_loaded", "opened": True}
-    while time.time() < deadline:
-        active = _active_zhilian_conversation_snapshot(target_id)
-        if active.get("success"):
-            active_row = {
-                "hr_name": active.get("hr_name") or "",
-                "company": active.get("company") or "",
-                "title": active.get("title") or "",
-            }
-            expected_row = {
-                "hr_name": row.get("hr_name") or "",
-                "company": row.get("company") or "",
-                "title": row.get("title") or "",
-            }
-            expected_session = str(row.get("session_id") or row.get("conversation_id") or "").strip()
-            active_session = str(active.get("session_id") or "").strip()
-            if expected_session and active_session != expected_session:
-                last = {
-                    **active,
-                    "status": "active_session_mismatch" if active_session else "active_session_id_missing",
-                    "opened": True,
-                }
-                time.sleep(0.25)
-                continue
-            # A row and active header must agree on the strongest available
-            # identity. Do not persist a different active conversation.
-            matched, quality = _match_zhilian_sync_identity(active_row, expected_row)
-            last = {
-                **active,
-                "status": "active_identity_mismatch" if not matched else "chat_header_matched",
-                "opened": True,
-                "match_quality": quality,
-            }
-            if matched:
-                history = _load_zhilian_chat_history(target_id)
-                history_session_matches = (
-                    history.get("session_id") == expected_session
-                    if expected_session
-                    else not (active_session and history.get("session_id") and active_session != history.get("session_id"))
-                )
-                if history.get("success") and history_session_matches:
-                    history_row = {
-                        "hr_name": history.get("hr_name") or "",
-                        "company": history.get("company") or "",
-                        "title": history.get("title") or "",
-                    }
-                    history_matches, history_quality = _match_zhilian_sync_identity(history_row, expected_row)
-                    if history_matches:
-                        return {"status": "matched_chat_loaded", **history, "opened": True, "match_quality": history_quality}
-                last = {**history, "status": "history_identity_mismatch", "opened": True}
-        time.sleep(0.25)
-    return last
 
 
 def _reconcile_zhilian_conversation(

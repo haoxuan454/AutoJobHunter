@@ -8,7 +8,6 @@ state. It never opens a page, clicks a button, or sends a message.
 from __future__ import annotations
 
 import hashlib
-import json
 from pathlib import Path
 from typing import Any
 
@@ -181,52 +180,9 @@ def _message_snapshot_items(messages: list[dict[str, Any]]) -> list[dict[str, An
         if not content:
             continue
         sender = str(item.get("sender") or item.get("sender_type") or "system").lower()
-        sender = {"me": "me", "user": "me", "hr": "hr", "other": "hr", "ai": "ai", "system": "system", "unknown": "unknown"}.get(sender, "unknown")
+        sender = {"me": "me", "user": "me", "hr": "hr", "other": "hr", "ai": "ai", "system": "system"}.get(sender, "system")
         normalized.append({**item, "text": content, "sender": sender})
     return normalized
-
-
-def _zhilian_semantic_content(value: Any) -> str:
-    """Strip action labels accidentally captured from interactive Zhilian cards."""
-    content = " ".join(str(value or "").split())
-    for prefix, canonical in (
-        ("我想与您电话沟通职位", "我想与您电话沟通职位，期待回复"),
-        ("我想与你交换微信", "我想与你交换微信，方便沟通"),
-    ):
-        if content.startswith(prefix):
-            return canonical
-    return content
-
-
-def _prepare_zhilian_snapshot(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Give no-native-ID messages stable, occurrence-aware snapshot identities."""
-    occurrences: dict[str, int] = {}
-    prepared: list[dict[str, Any]] = []
-    for item in messages:
-        content = _zhilian_semantic_content(item.get("text"))
-        sender = str(item.get("sender") or "system")
-        message_time = str(item.get("message_time") or item.get("timestamp") or "").strip()
-        current_id = str(item.get("message_id") or item.get("id") or "").strip()
-        native = item.get("message_id_is_native")
-        if content != item.get("text"):
-            item = {**item, "text": content}
-        # The active Zhilian DOM usually has no platform message ID. A supplied
-        # ID remains authoritative unless the adapter explicitly marks it as
-        # synthetic. Older persisted DOM-position IDs must remain addressable
-        # so a later stable snapshot can migrate them in place.
-        needs_stable_id = not current_id or native is False
-        if needs_stable_id:
-            identity = "\x1f".join((sender, message_time, content))
-            ordinal = occurrences.get(identity, 0)
-            occurrences[identity] = ordinal + 1
-            digest = hashlib.sha256(f"{identity}\x1f{ordinal}".encode("utf-8")).hexdigest()[:32]
-            item = {
-                **item,
-                "message_id": f"zhilian-snapshot:{digest}",
-                "legacy_message_id": str(item.get("legacy_message_id") or current_id),
-            }
-        prepared.append(item)
-    return prepared
 def record_verified_delivery(
     conn,
     *,
@@ -294,93 +250,6 @@ def record_verified_delivery(
     return {"conversation": record, "inserted": inserted, "deleted": False}
 
 
-def _migrate_zhilian_legacy_message_ids(conn, conversation_id: str, messages: list[dict[str, Any]]) -> None:
-    for item in messages:
-        legacy_id = str(item.get("legacy_message_id") or "").strip()
-        stable_id = str(item.get("message_id") or item.get("id") or "").strip()
-        content = _zhilian_semantic_content(item.get("text") or item.get("content"))
-        sender = {"me": "user", "hr": "hr", "system": "system", "unknown": "unknown"}.get(str(item.get("sender") or "system"), "unknown")
-        message_time = str(item.get("message_time") or item.get("timestamp") or "").strip()
-        if not stable_id or not content:
-            continue
-        new = conn.execute(
-            "SELECT 1 FROM conv_messages WHERE conversation_id = ? AND platform_message_id = ?",
-            (conversation_id, stable_id),
-        ).fetchone()
-        if new:
-            continue
-        old = None
-        if legacy_id and legacy_id != stable_id:
-            old = conn.execute(
-                "SELECT id, sender_type, content, message_time FROM conv_messages WHERE conversation_id = ? AND platform_message_id = ?",
-                (conversation_id, legacy_id),
-            ).fetchone()
-            if old and (old["sender_type"] != sender or _zhilian_semantic_content(old["content"]) != content):
-                old = None
-        if old is None:
-            # Older releases used `zhilian-<time>-<sender>-<content>` IDs and
-            # persisted interactive-card buttons as part of the content. Match
-            # one row at a time by sender and canonical text, preferring an
-            # unchanged timestamp; this also tolerates relative dates rolling
-            # across midnight without duplicating a message.
-            candidates = conn.execute(
-                """SELECT id, sender_type, content, message_time FROM conv_messages
-                   WHERE conversation_id = ? AND sender_type = ?
-                     AND platform_message_id LIKE 'zhilian-%'
-                     AND platform_message_id NOT LIKE 'zhilian-snapshot:%'
-                   ORDER BY CASE WHEN message_time = ? THEN 0 ELSE 1 END, id""",
-                (conversation_id, sender, message_time),
-            ).fetchall()
-            old = next((row for row in candidates if _zhilian_semantic_content(row["content"]) == content), None)
-        if old and old["sender_type"] == sender and _zhilian_semantic_content(old["content"]) == content:
-            conn.execute(
-                """UPDATE conv_messages
-                   SET platform_message_id = ?, content = ?, content_hash = ?,
-                       message_time = COALESCE(NULLIF(?, ''), NULLIF(message_time, '')),
-                       raw_payload_json = ?, is_sent = ?
-                   WHERE id = ?""",
-                (
-                    stable_id,
-                    content,
-                    hashlib.sha256(content.encode("utf-8")).hexdigest(),
-                    message_time,
-                    json.dumps(item, ensure_ascii=False, separators=(",", ":")),
-                    int(sender == "user"),
-                    old["id"],
-                ),
-            )
-
-
-def _canonicalize_zhilian_generated_messages(conn, conversation_id: str, messages: list[dict[str, Any]]) -> int:
-    """Normalize legacy synthetic rows without deleting snapshot-absent history."""
-    expected: dict[tuple[str, str], int] = {}
-    for item in messages:
-        content = _zhilian_semantic_content(item.get("text") or item.get("content"))
-        sender = {"me": "user", "hr": "hr", "system": "system", "unknown": "unknown"}.get(
-            str(item.get("sender") or item.get("sender_type") or "system"), "unknown"
-        )
-        if content:
-            key = (sender, content)
-            expected[key] = expected.get(key, 0) + 1
-    rows = conn.execute(
-        "SELECT id, platform_message_id, sender_type, content FROM conv_messages WHERE conversation_id = ? ORDER BY id",
-        (conversation_id,),
-    ).fetchall()
-    for row in rows:
-        content = _zhilian_semantic_content(row["content"])
-        if content != row["content"] and str(row["platform_message_id"] or "").startswith(("dom-", "zhilian-snapshot:")):
-            if (row["sender_type"], content) in expected:
-                conn.execute(
-                    "UPDATE conv_messages SET content = ?, content_hash = ? WHERE id = ?",
-                    (content, hashlib.sha256(content.encode("utf-8")).hexdigest(), row["id"]),
-                )
-    # A platform history boundary only proves that this browser reached its
-    # current retention edge. It does not prove the local DB has no older
-    # messages (or that every platform row was rendered in this snapshot).
-    # Preserve all persisted rows; stable IDs already make replay idempotent.
-    return 0
-
-
 def sync_extracted_messages(
     conn,
     *,
@@ -391,7 +260,6 @@ def sync_extracted_messages(
     base_dir: Path | None = None,
     config: dict[str, Any] | None = None,
     local_conversation_id: str | None = None,
-    history_complete: bool | None = None,
 ) -> dict[str, Any]:
     """Persist one extracted snapshot and return the local conversation state."""
     conversation = conversation or {}
@@ -406,8 +274,6 @@ def sync_extracted_messages(
             "job_candidates": job.get("_job_candidates", []),
         }
     messages = _message_snapshot_items(messages)
-    if platform == "zhilian":
-        messages = _prepare_zhilian_snapshot(messages)
     if not messages:
         return {
             "conversation": None,
@@ -424,33 +290,12 @@ def sync_extracted_messages(
     conversation_id = str(local_conversation_id or _stable_conversation_id(job, conversation, platform)).strip()
     if repo.is_deleted(conversation_id):
         return {"conversation": None, "inserted": [], "notification": None, "notifications": [], "deleted": True}
-    external_id = str(conversation.get("external_conversation_id") or "").strip()
-    if platform == "zhilian" and external_id:
-        user_id = str(conversation.get("user_id") or "default")
-        linked = conn.execute(
-            """SELECT id, job_id FROM conv_conversations
-               WHERE user_id = ? AND platform = ? AND external_conversation_id = ? AND id != ?""",
-            (user_id, platform, external_id, conversation_id),
-        ).fetchall()
-        if linked:
-            # One external Zhilian thread can represent a recruiter who owns
-            # multiple jobs. Until the UI models a shared thread explicitly,
-            # do not duplicate its history into a second job-specific card.
-            return {
-                "conversation": None,
-                "inserted": [],
-                "notification": None,
-                "notifications": [],
-                "status": "external_conversation_already_linked",
-                "linked_conversation_id": str(linked[0]["id"]),
-                "linked_job_id": str(linked[0]["job_id"] or ""),
-            }
     existing = repo.get_conversation(conversation_id)
     record = repo.upsert_conversation({
         "id": conversation_id,
         "user_id": "default",
         "platform": platform,
-        "external_conversation_id": external_id,
+        "external_conversation_id": str(conversation.get("external_conversation_id") or ""),
         "hr_external_id": str(conversation.get("hr_external_id") or ""),
         "hr_name": str(conversation.get("hr_name") or job.get("hr_name") or ""),
         "hr_title": conversation.get("hr_title") or job.get("hr_title"),
@@ -469,7 +314,7 @@ def sync_extracted_messages(
         if not content:
             continue
         sender = str(item.get("sender") or "system")
-        sender_type = {"me": "user", "hr": "hr", "system": "system", "unknown": "unknown"}.get(sender, "unknown")
+        sender_type = {"me": "user", "hr": "hr", "system": "system"}.get(sender, "system")
         incoming.append(IncomingMessage(
             sender_type=sender_type,
             content=content,
@@ -480,22 +325,9 @@ def sync_extracted_messages(
             is_ai_generated=False,
             is_sent=sender == "me",
         ))
-    if platform == "zhilian":
-        _migrate_zhilian_legacy_message_ids(conn, conversation_id, messages)
     inserted = repo.append_messages(conversation_id, incoming)
-    duplicates_removed = 0
-    if platform == "zhilian" and history_complete is True:
-        _canonicalize_zhilian_generated_messages(conn, conversation_id, messages)
     if not incoming:
-        return {
-            "conversation": record,
-            "inserted": inserted,
-            "notification": None,
-            "notifications": [],
-            "status": "synced",
-            "history_complete": history_complete if platform == "zhilian" else None,
-            "duplicates_removed": duplicates_removed,
-        }
+        return {"conversation": record, "inserted": inserted, "notification": None, "notifications": []}
     cursor = hashlib.sha256("\x1e".join(f"{item.sender_type}:{item.content}" for item in incoming).encode("utf-8")).hexdigest()
     repo.save_cursor(conversation_id, cursor)
 
@@ -516,12 +348,4 @@ def sync_extracted_messages(
         if result.get("notification"):
             notifications.append(result["notification"])
         record = result.get("conversation") or record
-    return {
-        "conversation": record,
-        "inserted": inserted,
-        "notification": notifications[-1] if notifications else None,
-        "notifications": notifications,
-        "status": "synced",
-        "history_complete": history_complete if platform == "zhilian" else None,
-        "duplicates_removed": duplicates_removed,
-    }
+    return {"conversation": record, "inserted": inserted, "notification": notifications[-1] if notifications else None, "notifications": notifications, "status": "synced"}

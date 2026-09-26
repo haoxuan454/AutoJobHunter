@@ -112,30 +112,6 @@ class ConversationWebFlowTests(unittest.TestCase):
         status, blocked = self.request("/api/conversations/c1/draft", "POST", {})
         self.assertTrue(status.startswith("409"), blocked)
 
-    def test_conversation_detail_clears_unread_after_hr_message_sync(self):
-        status, created = self.request("/api/conversations", "POST", {
-            "id": "zhilian:delivery:job-unread", "platform": "zhilian",
-            "job_id": "zhilian:job-unread", "hr_name": "刘先生", "company_id": "Example Co",
-        })
-        self.assertTrue(status.startswith("201"), created)
-
-        status, added = self.request("/api/conversations/zhilian:delivery:job-unread/messages", "POST", {
-            "sender_type": "hr", "content": "New HR message", "platform_message_id": "zhilian-message-1",
-        })
-        self.assertTrue(status.startswith("200"), added)
-        self.assertEqual(len(added["inserted"]), 1)
-
-        listed = self.request("/api/conversations")[1]
-        card = next(item for item in listed["conversations"] if item["id"] == "zhilian:delivery:job-unread")
-        self.assertEqual(card["unread_count"], 1)
-        self.assertTrue(card["has_unread"])
-
-        detail_status, detail = self.request("/api/conversations/zhilian:delivery:job-unread")
-        self.assertTrue(detail_status.startswith("200"), detail)
-        self.assertEqual(len(detail["messages"]), 1)
-        self.assertEqual(detail["conversation"]["unread_count"], 0)
-        self.assertFalse(detail["conversation"]["has_unread"])
-
     def test_notification_settings_scheduler_and_analytics_http_flow(self):
         status, saved = self.request(
             "/api/notifications/email", "POST",

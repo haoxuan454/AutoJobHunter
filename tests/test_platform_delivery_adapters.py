@@ -1,10 +1,369 @@
 import unittest
+from unittest.mock import patch
 
 from bosshunter.platform_delivery import DeliveryContext, get_delivery_adapter
 from bosshunter.platform_delivery.zhilian import ZhilianDeliveryAdapter
 
 
 class PlatformDeliveryAdapterTests(unittest.TestCase):
+    def test_zhilian_sync_locator_scrolls_unique_target_without_index_fallback(self):
+        import json
+        from bosshunter.platform_delivery import zhilian
+
+        row = {
+            "index": 15,
+            "signature": "刘娜|湖南省国银新材料|python后端开发工程师|预览|昨天",
+            "session_id": "session-15",
+            "hr_name": "刘娜",
+            "company": "湖南省国银新材料",
+            "title": "python后端开发工程师",
+        }
+        with patch.object(
+            zhilian,
+            "evaluate",
+            return_value=json.dumps({"success": True, "x": 120, "y": 420, "session_id": "session-15"}),
+        ) as evaluate, patch.object(zhilian, "click_at", return_value=True) as click, patch.object(
+            zhilian,
+            "_active_zhilian_conversation_snapshot",
+            return_value={
+                "success": True,
+                "session_id": "session-15",
+                "url": "https://i.zhaopin.com/im?sessionId=session-15",
+                "hr_name": "刘娜",
+                "company": "湖南省国银新材料",
+                "title": "python后端开发工程师",
+                "messages": [{"sender": "hr", "text": "你好"}],
+            },
+        ):
+            result = zhilian._open_zhilian_conversation_row("target", row, timeout=0.1)
+
+        self.assertEqual(result["status"], "matched_chat_loaded")
+        self.assertEqual(result["session_id"], "session-15")
+        script = evaluate.call_args_list[0].args[1]
+        self.assertIn("panel.scrollTop +=", script)
+        self.assertIn("row_ambiguous", script)
+        self.assertNotIn("rows[15]", script)
+        click.assert_called_once_with("target", "120,420")
+
+    def test_zhilian_sync_locator_fails_closed_when_target_row_is_ambiguous(self):
+        import json
+        from bosshunter.platform_delivery import zhilian
+
+        row = {"index": 4, "signature": "duplicate", "hr_name": "刘先生"}
+        with patch.object(
+            zhilian, "evaluate", return_value=json.dumps({"success": False, "status": "row_ambiguous"})
+        ), patch.object(zhilian, "click_at") as click:
+            result = zhilian._open_zhilian_conversation_row("target", row, timeout=0.01)
+
+        self.assertEqual(result["status"], "row_ambiguous")
+        self.assertFalse(result["opened"])
+        click.assert_not_called()
+
+    def test_zhilian_sync_refuses_ambiguous_row_without_native_session_id(self):
+        from bosshunter.platform_delivery import zhilian
+
+        row = {"signature": "Masked|Example Co|Python Engineer|hello|today", "identity_ambiguous": True}
+        with patch.object(zhilian, "evaluate") as evaluate, patch.object(zhilian, "click_at") as click:
+            result = zhilian._open_zhilian_conversation_row("target", row, timeout=0.01)
+
+        self.assertEqual(result["status"], "row_ambiguous")
+        self.assertFalse(result["opened"])
+        evaluate.assert_not_called()
+        click.assert_not_called()
+
+    def test_zhilian_sync_can_read_unique_masked_row_without_native_session_id(self):
+        import json
+        from bosshunter.platform_delivery import zhilian
+
+        row = {
+            "signature": "刘先生|Example Co|Python Engineer|hello|today",
+            "hr_name": "刘先生", "company": "Example Co", "title": "Python Engineer",
+        }
+        active = {
+            "success": True, "url": "https://i.zhaopin.com/im?refcode=4019",
+            "hr_name": "刘先生", "company": "Example Co", "title": "Python Engineer",
+            "messages": [],
+        }
+        history = {
+            **active, "history_complete": True,
+            "messages": [{"sender": "hr", "text": "你好", "message_id": "m1"}],
+        }
+        with patch.object(zhilian, "evaluate", return_value=json.dumps({
+            "success": True, "x": 140, "y": 320, "signature": row["signature"], "session_id": "",
+        })), patch.object(zhilian, "click_at", return_value=True) as click, \
+             patch.object(zhilian, "_active_zhilian_conversation_snapshot", return_value=active), \
+             patch.object(zhilian, "_load_zhilian_chat_history", return_value=history):
+            result = zhilian._open_zhilian_conversation_row("target", row, timeout=0.01)
+
+        self.assertEqual(result["status"], "matched_chat_loaded")
+        self.assertEqual(result["messages"][0]["text"], "你好")
+        self.assertTrue(result["history_complete"])
+        click.assert_called_once_with("target", "140,320")
+
+    def test_zhilian_sync_does_not_read_same_hr_company_wrong_job(self):
+        import json
+        from bosshunter.platform_delivery import zhilian
+
+        row = {
+            "signature": "刘先生|Example Co|Python Engineer|hello|today",
+            "hr_name": "刘先生", "company": "Example Co", "title": "Python Engineer",
+        }
+        active = {
+            "success": True, "session_id": "session-1", "hr_name": "刘先生",
+            "company": "Example Co", "title": "Java Engineer", "messages": [],
+        }
+        with patch.object(zhilian, "evaluate", return_value=json.dumps({"success": True, "x": 100, "y": 100})), \
+             patch.object(zhilian, "click_at", return_value=True), \
+             patch.object(zhilian, "_active_zhilian_conversation_snapshot", return_value=active), \
+             patch.object(zhilian, "_load_zhilian_chat_history") as load_history:
+            result = zhilian._open_zhilian_conversation_row("target", row, timeout=0.01)
+
+        self.assertNotEqual(result.get("status"), "matched_chat_loaded")
+        load_history.assert_not_called()
+
+    def test_zhilian_sync_locator_scrolls_until_virtualized_target_is_rendered(self):
+        import json
+        from bosshunter.platform_delivery import zhilian
+
+        row = {"signature": "masked|Example Co|Python Engineer|preview|today", "session_id": "session-target",
+               "hr_name": "Masked HR", "company": "Example Co", "title": "Python Engineer"}
+        evaluate_results = iter([
+            json.dumps({"success": False, "status": "row_not_found"}),
+            json.dumps({"success": True}),
+            json.dumps({"success": True, "x": 150, "y": 220, "session_id": "session-target"}),
+        ])
+        active = {"success": True, "session_id": "session-target", "url": "https://i.zhaopin.com/im?sessionId=session-target",
+                  "hr_name": "Masked HR", "company": "Example Co", "title": "Python Engineer",
+                  "messages": [{"sender": "hr", "text": "Hello", "message_id": "m1"}]}
+        with patch.object(zhilian, "evaluate", side_effect=lambda *_args, **_kwargs: next(evaluate_results)) as evaluate, \
+             patch.object(zhilian, "_zhilian_conversation_list_snapshot", return_value={
+                 "success": True, "scroll_top": 0, "scroll_height": 900, "client_height": 300,
+             }), patch.object(zhilian, "click_at", return_value=True) as click, \
+             patch.object(zhilian, "_active_zhilian_conversation_snapshot", return_value=active), \
+             patch.object(zhilian, "_load_zhilian_chat_history", return_value={**active, "history_complete": True}), \
+             patch.object(zhilian.time, "sleep"):
+            result = zhilian._open_zhilian_conversation_row("target", row, timeout=0.01)
+
+        self.assertEqual(result["status"], "matched_chat_loaded")
+        self.assertEqual(result["session_id"], "session-target")
+        self.assertIn("panel.scrollTop", evaluate.call_args_list[1].args[1])
+        click.assert_called_once_with("target", "150,220")
+
+    def test_zhilian_sync_rejects_active_session_id_mismatch(self):
+        import json
+        from bosshunter.platform_delivery import zhilian
+
+        row = {
+            "signature": "刘娜|湖南省国银新材料|python后端开发工程师|预览|昨天",
+            "session_id": "expected-session",
+            "hr_name": "刘娜",
+            "company": "湖南省国银新材料",
+            "title": "python后端开发工程师",
+        }
+        with patch.object(
+            zhilian,
+            "evaluate",
+            return_value=json.dumps({"success": True, "x": 10, "y": 20}),
+        ), patch.object(zhilian, "click_at", return_value=True), patch.object(
+            zhilian,
+            "_active_zhilian_conversation_snapshot",
+            return_value={
+                "success": True,
+                "session_id": "other-session",
+                "hr_name": "刘娜",
+                "company": "湖南省国银新材料",
+                "title": "python后端开发工程师",
+            },
+        ), patch.object(zhilian.time, "sleep"):
+            result = zhilian._open_zhilian_conversation_row("target", row, timeout=0.001)
+
+        self.assertEqual(result["status"], "active_session_mismatch")
+
+    def test_zhilian_sync_requires_job_title_when_local_hr_is_missing(self):
+        from bosshunter.web.server import _zhilian_identity_score
+
+        local_without_hr = {
+            "hr_name": "",
+            "job_company": "东莞市信维教育科技有限公司",
+            "job_title": "新开工厂没有产量要求!26一小时坐班长白班+包吃住",
+        }
+        rendered_row = {
+            "hr_name": "刘先生",
+            "company": "东莞市信维教育科技",
+            "title": "米家工厂！福利待遇超好27/小时+公寓式宿舍楼包吃住",
+        }
+        self.assertEqual(_zhilian_identity_score(local_without_hr, rendered_row), 0)
+        matching_role = {**rendered_row, "title": local_without_hr["job_title"]}
+        self.assertEqual(_zhilian_identity_score(local_without_hr, matching_role), 80)
+        self.assertEqual(
+            _zhilian_identity_score({**local_without_hr, "hr_name": "其他 HR"}, rendered_row),
+            0,
+        )
+
+    def test_zhilian_message_extractors_ignore_nested_message_wrappers(self):
+        import inspect
+        from bosshunter.platform_delivery import zhilian
+
+        list_source = inspect.getsource(zhilian._conversation_message_snapshot)
+        active_source = inspect.getsource(zhilian._active_zhilian_conversation_snapshot)
+
+        for source in (list_source, active_source):
+            self.assertIn("node.parentElement?.closest('.im-message')", source)
+            self.assertNotIn("owner === node", source)
+            self.assertIn("legacy_message_id:`dom-${index}--", source)
+
+    def test_zhilian_history_loader_stops_at_platform_history_boundary(self):
+        import json
+        from bosshunter.platform_delivery import zhilian
+
+        snapshot = {
+            "success": True,
+            "session_id": "session-15",
+            "messages": [{"sender": "me", "text": "hello", "message_id": "stable-1"}],
+            "history_complete": True,
+            "history_label": "以下是90天内的聊天消息",
+            "history_scroll_top": 0,
+            "history_scroll_height": 453,
+        }
+        with patch.object(zhilian, "evaluate", return_value=json.dumps({"success": True})) as evaluate, patch.object(
+            zhilian, "_active_zhilian_conversation_snapshot", return_value=snapshot
+        ), patch.object(zhilian.time, "sleep"):
+            result = zhilian._load_zhilian_chat_history("target")
+
+        self.assertTrue(result["history_complete"])
+        self.assertEqual(result["history_rounds"], 1)
+        self.assertIn("timeline.scrollTop = 0", evaluate.call_args.args[1])
+
+    def test_zhilian_history_loader_marks_missing_boundary_incomplete(self):
+        import json
+        from bosshunter.platform_delivery import zhilian
+
+        snapshot = {
+            "success": True,
+            "session_id": "session-15",
+            "messages": [{"sender": "hr", "text": "hello", "message_id": "stable-1"}],
+            "history_complete": False,
+            "history_scroll_top": 0,
+            "history_scroll_height": 453,
+        }
+        with patch.object(zhilian, "evaluate", return_value=json.dumps({"success": True})), patch.object(
+            zhilian, "_active_zhilian_conversation_snapshot", return_value=snapshot
+        ) as active, patch.object(zhilian.time, "sleep"):
+            result = zhilian._load_zhilian_chat_history("target", max_rounds=5, stable_rounds=2)
+
+        self.assertFalse(result["history_complete"])
+        self.assertEqual(result["history_rounds"], 3)
+        self.assertEqual(active.call_count, 3)
+
+    def test_zhilian_sidebar_scan_collects_lazy_rows_and_restores_scroll(self):
+        import json
+        from bosshunter.platform_delivery import zhilian
+
+        snapshots = [
+            {"success": True, "rows": [{"session_id": "s1", "signature": "row-1"}],
+             "scroll_top": 40, "scroll_height": 500, "client_height": 100},
+            {"success": True, "rows": [{"session_id": "s1", "signature": "row-1"},
+                                         {"session_id": "s2", "signature": "row-2"}],
+             "scroll_top": 300, "scroll_height": 500, "client_height": 100},
+            {"success": True, "rows": [{"session_id": "s2", "signature": "row-2"},
+                                         {"session_id": "s3", "signature": "row-3"}],
+             "scroll_top": 400, "scroll_height": 500, "client_height": 100},
+            {"success": True, "rows": [{"session_id": "s2", "signature": "row-2"},
+                                         {"session_id": "s3", "signature": "row-3"}],
+             "scroll_top": 400, "scroll_height": 500, "client_height": 100},
+            {"success": True, "rows": [{"session_id": "s2", "signature": "row-2"},
+                                         {"session_id": "s3", "signature": "row-3"}],
+             "scroll_top": 400, "scroll_height": 500, "client_height": 100},
+        ]
+        scroll_results = iter([
+            json.dumps({"success": True, "before": 40, "scroll_top": 300}),
+            json.dumps({"success": True, "before": 300, "scroll_top": 400}),
+            json.dumps({"success": True}),
+        ])
+        with patch.object(zhilian, "_zhilian_conversation_list_snapshot", side_effect=snapshots), \
+             patch.object(zhilian, "evaluate", side_effect=lambda *_args, **_kwargs: next(scroll_results)) as evaluate, \
+             patch.object(zhilian.time, "sleep"):
+            result = zhilian._scan_zhilian_conversation_list("target", max_scrolls=5)
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["loaded_count"], 3)
+        self.assertEqual({row["session_id"] for row in result["rows"]}, {"s1", "s2", "s3"})
+        self.assertEqual(result["original_scroll_top"], 40)
+        self.assertIn("panel.scrollTop = 40", evaluate.call_args.args[1])
+
+    def test_zhilian_sidebar_bottom_waits_for_delayed_rows_before_complete(self):
+        from unittest.mock import patch
+        from bosshunter.platform_delivery import zhilian
+
+        snapshots = iter([
+            {"success": True, "rows": [{"session_id": "s1"}], "scroll_top": 0,
+             "scroll_height": 100, "client_height": 100},
+            {"success": True, "rows": [{"session_id": "s1"}, {"session_id": "s2"}],
+             "scroll_top": 0, "scroll_height": 220, "client_height": 100},
+            {"success": True, "rows": [{"session_id": "s1"}, {"session_id": "s2"}],
+             "scroll_top": 0, "scroll_height": 220, "client_height": 100},
+            {"success": True, "rows": [{"session_id": "s1"}, {"session_id": "s2"}],
+             "scroll_top": 0, "scroll_height": 220, "client_height": 100},
+        ])
+        with patch.object(zhilian, "_zhilian_conversation_list_snapshot", side_effect=snapshots), \
+             patch.object(zhilian.time, "sleep"):
+            snapshot, stable = zhilian._wait_for_zhilian_list_stability(
+                "target", next(snapshots), settle_seconds=0.01, stable_rounds=3, max_checks=5,
+            )
+
+        self.assertTrue(stable)
+        self.assertEqual(snapshot["scroll_height"], 220)
+        self.assertEqual(len(snapshot["rows"]), 2)
+
+    def test_zhilian_sidebar_instability_times_out_as_incomplete(self):
+        from unittest.mock import patch
+        from bosshunter.platform_delivery import zhilian
+
+        snapshots = iter([
+            {"success": True, "rows": [], "scroll_top": 0, "scroll_height": 100, "client_height": 100},
+            {"success": True, "rows": [{"session_id": "s1"}], "scroll_top": 0, "scroll_height": 140, "client_height": 100},
+            {"success": True, "rows": [{"session_id": "s1"}, {"session_id": "s2"}], "scroll_top": 0, "scroll_height": 180, "client_height": 100},
+        ])
+        with patch.object(zhilian, "_zhilian_conversation_list_snapshot", side_effect=snapshots), \
+             patch.object(zhilian.time, "sleep"):
+            snapshot, stable = zhilian._wait_for_zhilian_list_stability(
+                "target", next(snapshots), settle_seconds=0.01, stable_rounds=3, max_checks=2,
+            )
+
+        self.assertFalse(stable)
+        self.assertEqual(len(snapshot["rows"]), 2)
+
+    def test_zhilian_sidebar_signature_detects_preview_change_for_same_session(self):
+        from bosshunter.platform_delivery.zhilian import _zhilian_list_signature
+
+        before = {"scroll_top": 0, "scroll_height": 200, "client_height": 100,
+                  "rows": [{"session_id": "s1", "preview": "old"}]}
+        after = {**before, "rows": [{"session_id": "s1", "preview": "new"}]}
+        self.assertNotEqual(_zhilian_list_signature(before), _zhilian_list_signature(after))
+
+    def test_zhilian_sidebar_scan_reports_cap_without_claiming_complete(self):
+        import json
+        from bosshunter.platform_delivery import zhilian
+
+        snapshots = [
+            {"success": True, "rows": [], "scroll_top": 0, "scroll_height": 5000, "client_height": 100},
+            {"success": True, "rows": [{"session_id": "s1"}], "scroll_top": 300, "scroll_height": 5000, "client_height": 100},
+            {"success": True, "rows": [{"session_id": "s2"}], "scroll_top": 600, "scroll_height": 5000, "client_height": 100},
+        ]
+        scroll_results = iter([
+            json.dumps({"success": True, "before": 0, "scroll_top": 300}),
+            json.dumps({"success": True, "before": 300, "scroll_top": 600}),
+            json.dumps({"success": True}),
+        ])
+        with patch.object(zhilian, "_zhilian_conversation_list_snapshot", side_effect=snapshots), \
+             patch.object(zhilian, "evaluate", side_effect=lambda *_args, **_kwargs: next(scroll_results)), \
+             patch.object(zhilian.time, "sleep"):
+            result = zhilian._scan_zhilian_conversation_list("target", max_scrolls=2)
+
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["scroll_rounds"], 2)
+        self.assertEqual(result["loaded_count"], 2)
+
     def test_every_supported_platform_has_an_explicit_adapter(self):
         for platform in ("boss", "zhilian", "51job", "liepin"):
             adapter = get_delivery_adapter(platform)

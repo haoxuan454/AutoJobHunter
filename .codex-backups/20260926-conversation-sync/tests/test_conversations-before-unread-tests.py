@@ -36,49 +36,6 @@ class ConversationRepositoryTests(unittest.TestCase):
         self.assertEqual(len(self.repo.append_messages("conv-1", [first, second])), 2)
         self.assertEqual(len(self.repo.list_messages("conv-1")), 2)
 
-    def test_new_hr_message_sets_unread_and_duplicate_does_not_increment(self):
-        message = IncomingMessage("hr", "New inbound message", "2026-09-19T01:03:00+08:00", "hr-new-1")
-
-        self.assertEqual(len(self.repo.append_messages("conv-1", [message])), 1)
-        self.assertEqual(len(self.repo.append_messages("conv-1", [message])), 0)
-
-        conversation = self.repo.get_conversation("conv-1")
-        self.assertEqual(conversation["unread_count"], 1)
-        self.assertEqual(conversation["has_unread"], 1)
-
-    def test_user_message_does_not_set_unread(self):
-        message = IncomingMessage(
-            "user", "Previously sent greeting", "2026-09-19T01:04:00+08:00", "user-1", is_sent=True,
-        )
-
-        self.repo.append_messages("conv-1", [message])
-
-        conversation = self.repo.get_conversation("conv-1")
-        self.assertEqual(conversation["unread_count"], 0)
-        self.assertEqual(conversation["has_unread"], 0)
-
-    def test_empty_hr_message_is_rejected_without_setting_unread(self):
-        with self.assertRaises(ValueError):
-            self.repo.append_messages("conv-1", [IncomingMessage("hr", "   ", platform_message_id="empty-1")])
-
-        conversation = self.repo.get_conversation("conv-1")
-        self.assertEqual(conversation["unread_count"], 0)
-        self.assertEqual(conversation["has_unread"], 0)
-        self.assertEqual(self.repo.list_messages("conv-1"), [])
-
-    def test_opening_conversation_clears_unread_marker(self):
-        self.repo.append_messages("conv-1", [
-            IncomingMessage("hr", "Unread one", "2026-09-19T01:05:00+08:00", "hr-2"),
-            IncomingMessage("hr", "Unread two", "2026-09-19T01:06:00+08:00", "hr-3"),
-        ])
-        self.assertEqual(self.repo.get_conversation("conv-1")["unread_count"], 2)
-
-        conversation = self.repo.mark_conversation_read("conv-1")
-
-        self.assertEqual(conversation["unread_count"], 0)
-        self.assertEqual(conversation["has_unread"], 0)
-        self.assertIsNotNone(conversation["last_read_at"])
-
     def test_cursor_is_saved_and_updated_on_conversation(self):
         self.assertIsNone(self.repo.get_cursor("conv-1"))
         self.repo.save_cursor("conv-1", "cursor-10")

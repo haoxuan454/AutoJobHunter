@@ -256,14 +256,6 @@ def init_conversation_tables(conn: sqlite3.Connection) -> None:
     columns = {row[1] for row in conn.execute("PRAGMA table_info(conv_conversations)").fetchall()}
     if "conversation_url" not in columns:
         conn.execute("ALTER TABLE conv_conversations ADD COLUMN conversation_url TEXT")
-    for column, definition in {
-        "unread_count": "INTEGER NOT NULL DEFAULT 0",
-        "has_unread": "INTEGER NOT NULL DEFAULT 0",
-        "last_hr_message_at": "TEXT",
-        "last_read_at": "TEXT",
-    }.items():
-        if column not in columns:
-            conn.execute(f"ALTER TABLE conv_conversations ADD COLUMN {column} {definition}")
     jobs_columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
     if {"source_platform", "hr_name", "company", "deleted_at"}.issubset(jobs_columns):
         candidates = conn.execute(
@@ -405,7 +397,7 @@ class ConversationRepository:
             sender = str(message.sender_type or "").strip()
             if not content:
                 raise ValueError("message content is required")
-            if sender not in {"hr", "user", "ai", "system", "unknown"}:
+            if sender not in {"hr", "user", "ai", "system"}:
                 raise ValueError(f"unsupported sender type: {sender}")
             msg_hash = message_content_hash(message)
             existing = None
@@ -452,23 +444,10 @@ class ConversationRepository:
             inserted.append(dict(row))
         if inserted:
             last_time = max((row["message_time"] or row["created_at"] for row in inserted), default=utc_now())
-            hr_rows = [row for row in inserted if row["sender_type"] == "hr"]
-            if hr_rows:
-                last_hr_time = max((row["message_time"] or row["created_at"] for row in hr_rows), default=last_time)
-                self.conn.execute(
-                    """UPDATE conv_conversations
-                       SET last_message_at = ?, updated_at = ?,
-                           last_hr_message_at = ?,
-                           unread_count = COALESCE(unread_count, 0) + ?,
-                           has_unread = 1
-                       WHERE id = ?""",
-                    (last_time, utc_now(), last_hr_time, len(hr_rows), conversation_id),
-                )
-            else:
-                self.conn.execute(
-                    "UPDATE conv_conversations SET last_message_at = ?, updated_at = ? WHERE id = ?",
-                    (last_time, utc_now(), conversation_id),
-                )
+            self.conn.execute(
+                "UPDATE conv_conversations SET last_message_at = ?, updated_at = ? WHERE id = ?",
+                (last_time, utc_now(), conversation_id),
+            )
         self.conn.commit()
         return inserted
 
@@ -501,17 +480,6 @@ class ConversationRepository:
             (conversation_id,),
         ).fetchall()
         return [_decorate_external_urls(dict(row)) for row in rows]
-
-    def mark_conversation_read(self, conversation_id: str) -> dict[str, Any] | None:
-        """Clear the local unread marker after the user opens a conversation."""
-        self.conn.execute(
-            """UPDATE conv_conversations
-               SET unread_count = 0, has_unread = 0, last_read_at = ?, updated_at = ?
-               WHERE id = ?""",
-            (utc_now(), utc_now(), conversation_id),
-        )
-        self.conn.commit()
-        return self.get_conversation(conversation_id)
 
     def list_drafts(self, conversation_id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute(

@@ -124,15 +124,7 @@ from bosshunter.conversations import ConversationRepository, IncomingMessage, no
 from bosshunter.conversation_bridge import reconcile_verified_deliveries, sync_extracted_messages
 from bosshunter.conversation_scheduler import SerialConversationScheduler, init_scheduler_tables
 from bosshunter.platform_delivery import DeliveryContext, get_delivery_adapter
-from bosshunter.platform_delivery.zhilian import (
-    _active_zhilian_conversation_snapshot,
-    _conversation_message_snapshot,
-    _match_zhilian_conversation_row,
-    _open_zhilian_conversation_row,
-    _scan_zhilian_conversation_list,
-    _zhilian_conversation_list_snapshot,
-    _zhilian_im_targets,
-)
+from bosshunter.platform_delivery.zhilian import _zhilian_im_targets, _zhilian_conversation_list_snapshot, _active_zhilian_conversation_snapshot, _conversation_message_snapshot
 from bosshunter.platform_delivery.liepin import _liepin_im_targets, _liepin_conversation_list_snapshot, _liepin_chat_snapshot
 from bosshunter.browser import evaluate, get_page_targets
 from bosshunter.platform_delivery.browser_helpers import parse_result
@@ -3271,7 +3263,7 @@ def _parse_browser_json(raw: Any) -> Any:
 
 
 def _sync_platform_target(conn, *, platform: str, target: dict, row: dict, base_dir: Path, config: dict) -> dict:
-    """Open/read one already-rendered conversation and persist its snapshot."""
+    """Read and persist one already-rendered conversation without browser actions."""
     conversation_url = normalize_platform_external_url(
         platform,
         row.get("conversation_url") or target.get("url") or row.get("source_url") or "",
@@ -3296,23 +3288,17 @@ def _sync_platform_target(conn, *, platform: str, target: dict, row: dict, base_
             raise RuntimeError("conversation_dom_unreadable")
         messages = parsed
     elif platform == "zhilian":
-        opened = _open_zhilian_conversation_row(target["target_id"], row)
-        if opened.get("status") != "matched_chat_loaded":
-            raise RuntimeError(str(opened.get("status") or "zhilian_chat_not_loaded"))
-        active = opened
+        active = _active_zhilian_conversation_snapshot(target["target_id"])
         if not active.get("success"):
             raise RuntimeError("active_conversation_not_loaded")
         for key in ("hr_name", "company", "title"):
             if str(active.get(key) or "").strip():
                 conversation[key] = str(active[key]).strip()
-        conversation["external_conversation_id"] = str(
-            active.get("external_conversation_id") or active.get("session_id") or ""
-        ).strip()
         conversation["conversation_url"] = normalize_platform_external_url(
             platform, active.get("url") or conversation_url, kind="conversation"
         ) or ""
         conversation["source_url"] = conversation["conversation_url"]
-        messages = active.get("messages") or _conversation_message_snapshot(target["target_id"])
+        messages = _conversation_message_snapshot(target["target_id"])
     elif platform == "liepin":
         snapshot = _liepin_chat_snapshot(target["target_id"])
         if not snapshot.get("success"):
@@ -3335,7 +3321,6 @@ def _sync_platform_target(conn, *, platform: str, target: dict, row: dict, base_
         conn, job=job, messages=messages, conversation=conversation,
         platform=platform, base_dir=base_dir, config=config,
         local_conversation_id=str(row.get("local_conversation_id") or "").strip() or None,
-        history_complete=bool(active.get("history_complete")) if platform == "zhilian" else None,
     )
     status = synced.get("status") or ("synced" if synced.get("conversation") else "error")
     return {
@@ -3343,9 +3328,6 @@ def _sync_platform_target(conn, *, platform: str, target: dict, row: dict, base_
         "status": status,
         "message_count": len(messages),
         "message_readable": bool(messages),
-        "history_complete": bool(active.get("history_complete")) if platform == "zhilian" else None,
-        "history_label": str(active.get("history_label") or "") if platform == "zhilian" else "",
-        "duplicates_removed": int(synced.get("duplicates_removed") or 0),
         "source_url": conversation["conversation_url"],
         "job_url": job_url,
     }
@@ -3376,36 +3358,6 @@ def _conversation_identity_score(local: dict, row: dict) -> int:
     return 40
 
 
-def _zhilian_identity_score(local: dict, row: dict) -> int:
-    """Score a Zhilian sidebar row with the platform's company suffix rules."""
-    external = str(row.get("conversation_id") or row.get("contact_id") or "").strip()
-    local_external = str(local.get("external_conversation_id") or "").strip()
-    if external and local_external and external == local_external:
-        return 100
-    local_title = "".join(str(local.get("job_title") or "").split()).casefold()
-    row_title = "".join(str(row.get("title") or row.get("job_title") or "").split()).casefold()
-    # A recruiter may own several roles under the same company. HR + company
-    # is not enough to attach one external thread to a different job card.
-    if not local_title or not row_title or not (local_title == row_title or local_title in row_title or row_title in local_title):
-        return 0
-    matched, quality = _match_zhilian_conversation_row(row, {
-        "hr_name": local.get("hr_name") or "",
-        "company": local.get("job_company") or local.get("company_id") or "",
-        "title": local.get("job_title") or "",
-    })
-    if not matched:
-        return 0
-    return {
-        "company_title_hr": 90,
-        "company_title": 80,
-        "company_hr": 70,
-        # Some local delivery cards predate persistence of the HR name. If
-        # exactly one rendered row belongs to that company, the caller can
-        # safely select it; multiple same-company rows remain ambiguous.
-        "company_only": 30 if not str(local.get("hr_name") or "").strip() else 0,
-    }.get(quality, 0)
-
-
 def _opened_platform_rows(platform: str) -> tuple[list[dict], list[dict]]:
     """Read only active chat rows from already-open tabs; never navigate."""
     if platform == "boss":
@@ -3421,9 +3373,17 @@ def _opened_platform_rows(platform: str) -> tuple[list[dict], list[dict]]:
             parsed = _parse_browser_json(evaluate(target_id, JS_EXTRACT_CHAT_LIST, timeout=10))
             source_rows = parsed if isinstance(parsed, list) else []
         elif platform == "zhilian":
-            # The sidebar is the source of truth for target selection. The
-            # selected row is opened later by _sync_platform_target.
-            source_rows = (_zhilian_conversation_list_snapshot(target_id).get("rows") or [])
+            active = _active_zhilian_conversation_snapshot(target_id)
+            source_rows = []
+            if active.get("success"):
+                source_rows = [{
+                    "hr_name": active.get("hr_name") or "",
+                    "company": active.get("company") or "",
+                    "title": active.get("title") or "",
+                    "conversation_id": active.get("external_conversation_id") or "",
+                    "conversation_url": active.get("url") or target["url"],
+                    "active": True,
+                }]
         else:
             snapshot = _liepin_conversation_list_snapshot(target_id)
             source_rows = snapshot.get("rows") or [] if snapshot.get("success") else []
@@ -3510,8 +3470,6 @@ def api_conversations_sync():
                     "message_count": synced.get("message_count", 0),
                     "inserted": len(synced["synced"].get("inserted") or []),
                     "conversation": synced["synced"].get("conversation"),
-                    "history_complete": synced.get("history_complete"),
-                    "history_label": synced.get("history_label") or "",
                     "diagnostics": [],
                 })
         return _json_response({"success": all(item.get("status") != "error" for item in results), "results": results})
@@ -3558,10 +3516,6 @@ def api_conversation_sync(conversation_id):
 
         candidate_rows = []
         ambiguous = False
-        scan_incomplete = False
-        scan_failed = False
-        scan_rounds = 0
-        scanned_rows = 0
         for target in targets:
             if platform == "boss":
                 rows = _parse_browser_json(
@@ -3570,38 +3524,46 @@ def api_conversation_sync(conversation_id):
                 if not isinstance(rows, list):
                     rows = []
             elif platform == "zhilian":
-                scan = _scan_zhilian_conversation_list(target["target_id"])
-                scan_rounds += int(scan.get("scroll_rounds") or 0)
-                scanned_rows += int(scan.get("loaded_count") or 0)
-                scan_incomplete = scan_incomplete or not bool(scan.get("complete"))
-                scan_failed = scan_failed or not bool(scan.get("success"))
-                rows = scan.get("rows") or []
+                active = _active_zhilian_conversation_snapshot(target["target_id"])
+                if active.get("success"):
+                    rows = [{
+                        "hr_name": active.get("hr_name") or "",
+                        "company": active.get("company") or "",
+                        "title": active.get("title") or "",
+                        "conversation_url": active.get("url") or target["url"],
+                        "source_url": active.get("url") or target["url"],
+                        "active": True,
+                    }]
+                else:
+                    rows = (_zhilian_conversation_list_snapshot(target["target_id"]).get("rows") or [])
             else:
                 rows = (_liepin_conversation_list_snapshot(target["target_id"]).get("rows") or [])
             for row in rows:
                 if not isinstance(row, dict):
                     continue
-                score = (_zhilian_identity_score(local, row)
-                    if platform == "zhilian" else _conversation_identity_score(local, row))
-                if score:
+                external = str(row.get("conversation_id") or row.get("contact_id") or "").strip()
+                local_external = str(local.get("external_conversation_id") or "").strip()
+                if external and local_external and external == local_external:
+                    candidate_rows.append({**row, "source_url": target["url"], "target_id": target["target_id"], "job_id": local.get("job_id") or "", "local_conversation_id": conversation_id})
+                    continue
+                row_hr = str(row.get("hr_name") or row.get("name") or "").strip()
+                row_company = str(row.get("company") or row.get("company_role") or "").strip()
+                row_title = str(row.get("title") or row.get("job_title") or "").strip()
+                local_hr = str(local.get("hr_name") or "").strip()
+                local_company = str(local.get("company_id") or "").strip()
+                local_title = str(local.get("job_title") or "").strip()
+                # HR and company alone are a weak identity. Require the job as
+                # well, and reject all collisions instead of picking first.
+                if (row_hr and row_company and row_title and local_hr and local_company and local_title
+                    and row_hr == local_hr and row_company == local_company and row_title == local_title):
                     candidate_rows.append({**row, "source_url": target["url"], "target_id": target["target_id"], "job_id": local.get("job_id") or "", "local_conversation_id": conversation_id})
         if len(candidate_rows) > 1:
             ambiguous = True
         if ambiguous:
-            return _json_response({"status": "ambiguous", "platform": platform, "conversation_id": conversation_id,
-                "scan_complete": not scan_incomplete and not scan_failed, "scan_rounds": scan_rounds,
-                "scanned_rows": scanned_rows})
+            return _json_response({"status": "ambiguous", "platform": platform, "conversation_id": conversation_id})
         candidate = candidate_rows[0] if candidate_rows else None
-        if platform == "zhilian" and (scan_incomplete or scan_failed):
-            return _json_response({"status": "scan_incomplete", "platform": platform,
-                "conversation_id": conversation_id, "scan_complete": False,
-                "scan_rounds": scan_rounds, "scanned_rows": scanned_rows,
-                "candidate_found": bool(candidate)})
         if not candidate:
-            return _json_response({"status": "not_loaded", "platform": platform, "conversation_id": conversation_id,
-                "scan_complete": True if platform == "zhilian" else None,
-                "scan_rounds": scan_rounds if platform == "zhilian" else None,
-                "scanned_rows": scanned_rows if platform == "zhilian" else None})
+            return _json_response({"status": "not_loaded", "platform": platform, "conversation_id": conversation_id})
         synced = _sync_platform_target(
             conn,
             platform=platform,
@@ -3613,13 +3575,11 @@ def api_conversation_sync(conversation_id):
         sync_status = synced.get("status") or synced["synced"].get("status") or "error"
         if synced["synced"].get("deleted"):
             return _json_response({"status": "deleted", "conversation_id": conversation_id})
-        if sync_status in {"unmatched", "ambiguous", "external_conversation_already_linked"}:
+        if sync_status in {"unmatched", "ambiguous"}:
             return _json_response({
                 "status": sync_status,
                 "conversation_id": conversation_id,
                 "job_candidates": synced["synced"].get("job_candidates", []),
-                "linked_conversation_id": synced["synced"].get("linked_conversation_id"),
-                "linked_job_id": synced["synced"].get("linked_job_id"),
             })
         if sync_status == "empty_messages":
             return _json_response({
@@ -3634,11 +3594,6 @@ def api_conversation_sync(conversation_id):
             "message_count": synced["message_count"],
             "inserted": synced["synced"].get("inserted", []),
             "conversation": synced["synced"].get("conversation"),
-            "history_complete": synced.get("history_complete"),
-            "history_label": synced.get("history_label") or "",
-            "scan_complete": True if platform == "zhilian" else None,
-            "scan_rounds": scan_rounds if platform == "zhilian" else None,
-            "scanned_rows": scanned_rows if platform == "zhilian" else None,
         })
     except json.JSONDecodeError:
         return _json_response({"status": "error", "error": "conversation_dom_unreadable"}, 502)
@@ -3676,7 +3631,7 @@ def api_conversation_detail(conversation_id):
     conversation_id = _decoded_conversation_id(conversation_id)
     repo = _conversation_repo()
     try:
-        conversation = repo.mark_conversation_read(conversation_id)
+        conversation = repo.get_conversation(conversation_id)
         if not conversation:
             return _json_response({"error": "会话不存在"}, 404)
         return _json_response({
