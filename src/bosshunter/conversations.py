@@ -37,6 +37,7 @@ _PLATFORM_EXTERNAL_HOSTS = {
     "boss": ("zhipin.com",),
     "zhilian": ("zhaopin.com",),
     "liepin": ("liepin.com",),
+    "51job": ("51job.com",),
 }
 _LOCAL_EXTERNAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
@@ -60,7 +61,7 @@ def normalize_platform_external_url(platform: str, url: Any, *, kind: str) -> st
     if parsed.scheme not in {"http", "https"} or not hostname or hostname in _LOCAL_EXTERNAL_HOSTS:
         return None
     allowed_hosts = _PLATFORM_EXTERNAL_HOSTS.get(str(platform or "").lower())
-    if allowed_hosts and not any(hostname == allowed or hostname.endswith("." + allowed) for allowed in allowed_hosts):
+    if not allowed_hosts or not any(hostname == allowed or hostname.endswith("." + allowed) for allowed in allowed_hosts):
         return None
 
     path = (parsed.path or "/").lower()
@@ -73,19 +74,21 @@ def normalize_platform_external_url(platform: str, url: Any, *, kind: str) -> st
             if hostname != "i.zhaopin.com" or path != "/im" or not query.get("sessionId", [""])[0].strip():
                 return None
         elif platform_name == "boss":
-            if "chat" not in path and "chat" not in parsed.fragment.lower():
+            if "chat" not in path.split("/") and "chat" not in parsed.fragment.lower().split("/"):
                 return None
         elif platform_name == "liepin":
-            if not any(marker in path for marker in ("/im", "/message", "/communicate", "/chat")):
+            if not any(segment in {"im", "message", "communicate", "chat"} for segment in path.split("/")):
                 return None
-        elif "/job" in path:
+        elif platform_name == "51job":
+            return None
+        elif any(segment.startswith("job") for segment in path.split("/")):
             return None
     elif kind == "job":
-        if platform_name == "zhilian" and "/job" not in path:
+        if platform_name == "zhilian" and not any(segment.startswith("job") for segment in path.split("/")):
             return None
-        if platform_name == "liepin" and "/job/" not in path:
+        if platform_name == "liepin" and not any(segment == "job" for segment in path.split("/")):
             return None
-        if platform_name == "boss" and "/job" not in path:
+        if platform_name == "boss" and not any(segment.startswith("job") for segment in path.split("/")):
             return None
     else:
         raise ValueError(f"unsupported external URL kind: {kind}")
@@ -110,6 +113,12 @@ def _decorate_external_urls(row: dict[str, Any]) -> dict[str, Any]:
     result["job_url_reason"] = "可打开平台岗位详情" if job_url else (
         "岗位详情地址不是对应招聘平台外链" if raw_job_url else "尚未保存平台岗位详情地址"
     )
+    display_name = str(result.get("display_hr_name") or result.get("hr_name") or "").strip()
+    result["display_hr_name"] = display_name
+    if not str(result.get("hr_name") or "").strip() and display_name:
+        # Keep the public API useful for older cards whose platform snapshot did
+        # not persist an HR name but whose linked job still has one.
+        result["hr_name"] = display_name
     return result
 
 
@@ -251,6 +260,24 @@ def init_conversation_tables(conn: sqlite3.Connection) -> None:
             ON conv_deleted_conversations(user_id, platform, external_conversation_id)
             WHERE external_conversation_id IS NOT NULL
               AND external_conversation_id != '';
+
+        CREATE TABLE IF NOT EXISTS conv_send_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL DEFAULT 'default',
+            conversation_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            message_hash TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            status TEXT NOT NULL,
+            response_json TEXT NOT NULL DEFAULT '{}',
+            http_status INTEGER,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, conversation_id, idempotency_key),
+            FOREIGN KEY (conversation_id) REFERENCES conv_conversations(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_conv_send_attempts_conversation
+            ON conv_send_attempts(user_id, conversation_id, created_at DESC);
         """
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(conv_conversations)").fetchall()}
@@ -332,9 +359,25 @@ class ConversationRepository:
             "interest_score": conversation.get("interest_score"),
             "updated_at": now,
         }
+        # A delivered-job card is identified by (user, platform, job_id).
+        # Callers normally provide the stable delivery id, but legacy/import
+        # paths may supply a different id for the same job. Resolve that alias
+        # before inserting so a late platform snapshot cannot create a second
+        # local card for one delivered job.
         existing = self.conn.execute(
             "SELECT * FROM conv_conversations WHERE id = ?", (conversation_id,)
         ).fetchone()
+        job_id = str(fields.get("job_id") or "").strip()
+        if existing is None and job_id and not job_id.startswith("sync:"):
+            existing = self.conn.execute(
+                """SELECT * FROM conv_conversations
+                   WHERE user_id = ? AND platform = ? AND job_id = ?
+                   ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END, updated_at DESC, id
+                   LIMIT 1""",
+                (fields["user_id"], platform, job_id, conversation_id),
+            ).fetchone()
+            if existing:
+                conversation_id = str(existing["id"])
         if existing:
             # A partial platform snapshot must never erase trusted local/job context.
             preserve_if_empty = {
@@ -371,17 +414,54 @@ class ConversationRepository:
     def _has_jobs_table(self) -> bool:
         return bool(self.conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'").fetchone())
 
+    def _jobs_columns(self) -> set[str]:
+        """Return the columns available on the current jobs table.
+
+        Conversation persistence is also used by older/fixture databases whose
+        ``jobs`` table predates some of the HR snapshot columns.  Building the
+        projection from the live schema keeps conversation reads compatible
+        with those databases while preserving the richer joins in the full
+        application database.
+        """
+        if not self._has_jobs_table():
+            return set()
+        return {str(row[1]) for row in self.conn.execute("PRAGMA table_info(jobs)").fetchall()}
+
+    def _job_projection(self) -> str:
+        columns = self._jobs_columns()
+
+        def column(name: str, alias: str) -> str:
+            return f"j.{name} AS {alias}" if name in columns else f"NULL AS {alias}"
+
+        if "hr_name" in columns:
+            display_name = (
+                "COALESCE(NULLIF(TRIM(c.hr_name), ''), "
+                "NULLIF(TRIM(j.hr_name), '')) AS display_hr_name"
+            )
+        else:
+            display_name = "NULLIF(TRIM(c.hr_name), '') AS display_hr_name"
+        return ", ".join([
+            column("title", "job_title"),
+            column("company", "job_company"),
+            column("hr_name", "job_hr_name"),
+            column("hr_title", "job_hr_title"),
+            column("url", "job_url"),
+            column("source_platform", "job_platform"),
+            column("score", "job_score"),
+            column("score_reason", "job_score_reason"),
+            column("status", "job_status"),
+            display_name,
+        ])
+
     def get_conversation(self, conversation_id: str) -> dict[str, Any] | None:
         if not self._has_jobs_table():
             row = self.conn.execute(
                 "SELECT * FROM conv_conversations WHERE id = ?", (conversation_id,)
             ).fetchone()
         else:
+            job_select = self._job_projection()
             row = self.conn.execute(
-                """SELECT c.*, j.title AS job_title, j.company AS job_company,
-                          j.hr_title AS job_hr_title, j.url AS job_url,
-                          j.source_platform AS job_platform, j.score AS job_score,
-                          j.score_reason AS job_score_reason, j.status AS job_status
+                f"""SELECT c.*, {job_select}
                    FROM conv_conversations c
                    LEFT JOIN jobs j ON j.id = c.job_id
                    WHERE c.id = ?""",
@@ -497,7 +577,13 @@ class ConversationRepository:
 
     def list_messages(self, conversation_id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute(
-            "SELECT * FROM conv_messages WHERE conversation_id = ? ORDER BY message_time, id",
+            """SELECT * FROM conv_messages
+               WHERE conversation_id = ?
+               ORDER BY
+                 CASE WHEN message_time IS NULL OR TRIM(message_time) = '' THEN 1 ELSE 0 END,
+                 message_time ASC,
+                 created_at ASC,
+                 id ASC""",
             (conversation_id,),
         ).fetchall()
         return [_decorate_external_urls(dict(row)) for row in rows]
@@ -529,10 +615,10 @@ class ConversationRepository:
             "created": "c.created_at DESC, c.id DESC",
         }[sort]
         if self._has_jobs_table():
-            job_select = "j.title AS job_title, j.company AS job_company, j.hr_title AS job_hr_title, j.url AS job_url, j.source_platform AS job_platform, j.score AS job_score, j.status AS job_status"
+            job_select = self._job_projection()
             job_join = "LEFT JOIN jobs j ON j.id = c.job_id"
         else:
-            job_select = "NULL AS job_title, NULL AS job_company, NULL AS job_hr_title, NULL AS job_url, NULL AS job_platform, NULL AS job_score, NULL AS job_status"
+            job_select = "NULL AS job_title, NULL AS job_company, NULL AS job_hr_name, NULL AS job_hr_title, NULL AS job_url, NULL AS job_platform, NULL AS job_score, NULL AS job_score_reason, NULL AS job_status, NULLIF(TRIM(c.hr_name), '') AS display_hr_name"
             job_join = ""
         rows = self.conn.execute(
             f"""SELECT c.*, {job_select},
@@ -542,7 +628,11 @@ class ConversationRepository:
                        SUM(CASE WHEN m.sender_type = 'hr' THEN 1 ELSE 0 END) AS round_count,
                        (SELECT m2.content FROM conv_messages m2
                           WHERE m2.conversation_id = c.id
-                          ORDER BY COALESCE(m2.message_time, m2.created_at) DESC, m2.id DESC LIMIT 1) AS last_message_preview
+                          ORDER BY
+                            CASE WHEN m2.message_time IS NULL OR TRIM(m2.message_time) = '' THEN 1 ELSE 0 END ASC,
+                            m2.message_time DESC,
+                            m2.created_at DESC,
+                            m2.id DESC LIMIT 1) AS last_message_preview
                 FROM conv_conversations c
                 {job_join}
                 LEFT JOIN conv_messages m ON m.conversation_id = c.id
@@ -612,3 +702,127 @@ class ConversationRepository:
         self.conn.commit()
         row = self.conn.execute("SELECT * FROM conv_drafts WHERE id = ?", (cursor.lastrowid,)).fetchone()
         return dict(row)
+
+    def get_send_attempt(self, user_id: str, conversation_id: str, idempotency_key: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """SELECT * FROM conv_send_attempts
+               WHERE user_id = ? AND conversation_id = ? AND idempotency_key = ?""",
+            (user_id, conversation_id, idempotency_key),
+        ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        try:
+            result["response"] = json.loads(result.get("response_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            result["response"] = {}
+        return result
+
+    def create_send_attempt(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        idempotency_key: str,
+        message_hash: str,
+        platform: str,
+        status: str = "pending",
+    ) -> dict[str, Any]:
+        self.conn.execute(
+            """INSERT OR IGNORE INTO conv_send_attempts
+               (user_id, conversation_id, idempotency_key, message_hash, platform, status)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (user_id, conversation_id, idempotency_key, message_hash, platform, status),
+        )
+        self.conn.commit()
+        attempt = self.get_send_attempt(user_id, conversation_id, idempotency_key)
+        if not attempt:
+            raise ValueError("failed to create send attempt")
+        return attempt
+
+    def claim_send_attempt(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        idempotency_key: str,
+        message_hash: str,
+        platform: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically claim a reply key before touching a platform.
+
+        The unique index prevents duplicate rows, but a read-then-insert
+        sequence still lets two concurrent requests both reach the browser.
+        This method makes the state transition itself the gate: only the
+        request that inserts a new row or changes a previous ``not_sent`` row
+        to ``pending`` receives ``claimed=True``.
+        """
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            row = self.conn.execute(
+                """SELECT * FROM conv_send_attempts
+                   WHERE user_id = ? AND conversation_id = ? AND idempotency_key = ?""",
+                (user_id, conversation_id, idempotency_key),
+            ).fetchone()
+            if row is None:
+                self.conn.execute(
+                    """INSERT INTO conv_send_attempts
+                       (user_id, conversation_id, idempotency_key, message_hash, platform, status)
+                       VALUES (?, ?, ?, ?, ?, 'pending')""",
+                    (user_id, conversation_id, idempotency_key, message_hash, platform),
+                )
+                self.conn.commit()
+                return self.get_send_attempt(user_id, conversation_id, idempotency_key) or {}, True
+
+            current = dict(row)
+            if current.get("message_hash") != message_hash:
+                self.conn.rollback()
+                return self.get_send_attempt(user_id, conversation_id, idempotency_key) or current, False
+            if current.get("status") == "not_sent":
+                cursor = self.conn.execute(
+                    """UPDATE conv_send_attempts
+                       SET status = 'pending', updated_at = ?
+                       WHERE user_id = ? AND conversation_id = ? AND idempotency_key = ?
+                         AND status = 'not_sent'""",
+                    (utc_now(), user_id, conversation_id, idempotency_key),
+                )
+                claimed = cursor.rowcount == 1
+                self.conn.commit()
+                return self.get_send_attempt(user_id, conversation_id, idempotency_key) or current, claimed
+            self.conn.rollback()
+            return self.get_send_attempt(user_id, conversation_id, idempotency_key) or current, False
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def update_send_attempt(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        idempotency_key: str,
+        status: str,
+        response: dict[str, Any] | None = None,
+        http_status: int | None = None,
+    ) -> dict[str, Any]:
+        if status not in {"pending", "sent", "not_sent", "unknown"}:
+            raise ValueError(f"unsupported send attempt status: {status}")
+        self.conn.execute(
+            """UPDATE conv_send_attempts
+               SET status = ?, response_json = ?, http_status = ?, updated_at = ?
+               WHERE user_id = ? AND conversation_id = ? AND idempotency_key = ?""",
+            (
+                status,
+                _json_payload(response),
+                http_status,
+                utc_now(),
+                user_id,
+                conversation_id,
+                idempotency_key,
+            ),
+        )
+        self.conn.commit()
+        attempt = self.get_send_attempt(user_id, conversation_id, idempotency_key)
+        if not attempt:
+            raise ValueError("send attempt does not exist")
+        return attempt

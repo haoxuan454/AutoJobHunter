@@ -34,6 +34,26 @@ class ExternalUrlTests(unittest.TestCase):
         url = "https://i.zhaopin.com/im?sessionId=session-123&refcode=4019"
         self.assertEqual(normalize_platform_external_url("zhilian", url, kind="conversation"), url)
 
+    def test_unknown_platform_cannot_whitelist_arbitrary_https_urls(self):
+        self.assertIsNone(
+            normalize_platform_external_url("unknown", "https://attacker.example/chat", kind="conversation")
+        )
+
+    def test_platform_host_mismatch_is_rejected(self):
+        self.assertIsNone(
+            normalize_platform_external_url("boss", "https://zhipin.com.attacker.example/chat", kind="conversation")
+        )
+
+    def test_51job_conversation_links_are_not_supported(self):
+        self.assertIsNone(
+            normalize_platform_external_url("51job", "https://i.51job.com/chat/session-1", kind="conversation")
+        )
+
+    def test_chat_like_path_prefix_is_not_enough_for_liepin(self):
+        self.assertIsNone(
+            normalize_platform_external_url("liepin", "https://www.liepin.com/chatroom/stranger", kind="conversation")
+        )
+
     def test_local_dashboard_url_is_never_external(self):
         self.assertIsNone(
             normalize_platform_external_url(

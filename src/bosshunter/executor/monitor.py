@@ -116,10 +116,17 @@ JS_EXTRACT_CHAT_LIST = r"""
         const lastDirection = isOurMessage ? 'me' : (isHrMessage ? 'hr' : 'unknown');
         const hasReply = !!lastMsgEl && lastDirection !== 'me' && !isSystemMessage;
         const className = String(item.className || '').toLowerCase();
+        // BOSS currently marks the selected conversation on the nested
+        // `.friend-content` node rather than on the `<li>` itself. Keep the
+        // legacy li checks, but also read the nested state so conversation
+        // sync/reply verification does not treat the already-open chat as
+        // inactive and attempt a second click.
+        const selectedFriend = item.querySelector('.friend-content.selected');
         const active = item.getAttribute('aria-selected') === 'true'
             || item.classList.contains('active')
             || item.classList.contains('selected')
-            || /(^|[\\s_-])(active|selected)([\\s_-]|$)/.test(className);
+            || /(^|[\\s_-])(active|selected)([\\s_-]|$)/.test(className)
+            || !!selectedFriend;
         const conversationId = item.getAttribute('data-id')
             || item.getAttribute('data-conversation-id')
             || item.getAttribute('data-uid')

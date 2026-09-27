@@ -669,9 +669,11 @@ class JobSelectionTests(unittest.TestCase):
         self.assertEqual(report["failed_count"], 1)
         self.assertEqual(report["deferred_count"], 1)
         self.assertEqual(report["quota_deferred_count"], 1)
-        self.assertEqual(report["already_sent"], 0)
+        # The report is a post-send quota snapshot. The first job succeeded,
+        # so today's sent count and remaining quota reflect that success.
+        self.assertEqual(report["already_sent"], 1)
         self.assertEqual(report["daily_limit"], 2)
-        self.assertEqual(report["remaining_quota"], 2)
+        self.assertEqual(report["remaining_quota"], 1)
         self.assertEqual(report["stop_reason"], "daily_limit")
 
     def test_send_greetings_reports_current_and_next_job_to_workbench(self):

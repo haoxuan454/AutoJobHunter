@@ -68,3 +68,13 @@ AGENTS.md
 *.key
 secrets.json
 credentials.json
+
+# Codex / AI 本地备份与临时文件（不进 Git）
+.codex-backups/
+.codex-runtime/
+.codex-*.txt
+.codex-*.tmp
+.codex-*.log
+
+# 误创建的文件
+tuple[list[dict]

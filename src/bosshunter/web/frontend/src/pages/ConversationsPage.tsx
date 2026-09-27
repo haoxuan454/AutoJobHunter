@@ -41,6 +41,7 @@ type SyncResult = {
   conversation_id?: string
   status?: string
   message_count?: number
+  platform_message_count?: number
   inserted?: number
   history_complete?: boolean
   history_label?: string
@@ -77,6 +78,7 @@ const SYNC_STATUS_LABELS: Record<string, string> = {
   not_loaded: '目标聊天当前未加载',
   risk_blocked: '平台安全验证拦截',
   error: '读取失败',
+  unsupported_platform: '平台暂不支持会话同步',
 }
 
 function displayHrName(name?: string) {
@@ -113,14 +115,14 @@ export default function ConversationsPage() {
       const response = await fetch('/api/conversations/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ platforms: ['boss', 'zhilian', 'liepin'] }),
+        body: JSON.stringify({ platforms: ['boss', 'zhilian'] }),
       })
       const data = await response.json().catch(() => ({}))
       if (!response.ok) throw new Error(data.error || '会话同步失败')
       const results = Array.isArray(data.results) ? data.results as SyncResult[] : []
       const failed = results.filter(item => !['synced', 'empty'].includes(item.status || '')).length
       const summary = results
-        .map(item => `${PLATFORM_LABELS[item.platform || ''] || item.platform || '平台'}：${syncStatusLabel(item.status)}（消息 ${item.message_count || 0}，新增 ${item.inserted || 0}）`)
+        .map(item => `${PLATFORM_LABELS[item.platform || ''] || item.platform || '平台'}：${syncStatusLabel(item.status)}（平台读取 ${item.platform_message_count || 0}，本地 ${item.message_count || 0}，新增 ${item.inserted || 0}）`)
         .join('；')
       setNotice(`${failed ? '同步部分完成' : '同步完成'}：${summary || '没有本地会话返回结果'}`)
       await load()
@@ -140,7 +142,7 @@ export default function ConversationsPage() {
       const historyNote = typeof data.history_complete === 'boolean'
         ? (data.history_complete ? '，已到达平台可读取的历史边界' : '，平台未确认历史边界，当前展示已加载消息')
         : ''
-      setNotice(`${displayHrName(item.hr_name)}：${syncStatusLabel(data.status)}，读取 ${data.message_count || 0} 条平台消息${historyNote}`)
+      setNotice(`${displayHrName(item.hr_name)}：${syncStatusLabel(data.status)}，平台读取 ${data.platform_message_count || 0} 条，本地共 ${data.message_count || 0} 条${historyNote}`)
       await load()
     } catch (error) {
       setNotice(error instanceof Error ? error.message : '当前会话同步失败')

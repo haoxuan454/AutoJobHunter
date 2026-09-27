@@ -1,4 +1,7 @@
 import sqlite3
+import os
+import tempfile
+import threading
 import unittest
 
 from bosshunter.conversations import ConversationRepository, IncomingMessage, init_conversation_tables
@@ -94,12 +97,82 @@ class ConversationRepositoryTests(unittest.TestCase):
     def test_initialization_is_idempotent(self):
         init_conversation_tables(self.conn)
         init_conversation_tables(self.conn)
+
+    def test_send_attempt_claim_is_atomic_across_independent_connections(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "claims.sqlite3")
+            seed = sqlite3.connect(db_path)
+            seed.row_factory = sqlite3.Row
+            ConversationRepository(seed)
+            seed.close()
+
+            barrier = threading.Barrier(2)
+            results = []
+            errors = []
+
+            def claim():
+                conn = sqlite3.connect(db_path, timeout=10)
+                conn.row_factory = sqlite3.Row
+                try:
+                    repo = ConversationRepository(conn)
+                    barrier.wait(timeout=5)
+                    results.append(repo.claim_send_attempt(
+                        user_id="user-1",
+                        conversation_id="conv-atomic",
+                        idempotency_key="same-atomic-key",
+                        message_hash="same-message-hash",
+                        platform="boss",
+                    )[1])
+                except Exception as exc:  # surfaced in the parent test thread
+                    errors.append(exc)
+                finally:
+                    conn.close()
+
+            workers = [threading.Thread(target=claim) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=15)
+
+            self.assertTrue(all(not worker.is_alive() for worker in workers), "claim worker hung")
+            self.assertEqual(errors, [])
+            self.assertEqual(sorted(results), [False, True])
         names = {
             row[0] for row in self.conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'conv_%'"
             )
         }
-        self.assertEqual(names, {"conv_conversations", "conv_messages", "conv_sync_cursors", "conv_drafts", "conv_deleted_conversations"})
+        self.assertEqual(names, {"conv_conversations", "conv_messages", "conv_sync_cursors", "conv_drafts", "conv_deleted_conversations", "conv_send_attempts"})
+
+    def test_legacy_jobs_schema_without_hr_snapshot_columns_is_readable(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            """CREATE TABLE jobs (
+                id TEXT PRIMARY KEY, title TEXT, company TEXT,
+                url TEXT, score INTEGER, status TEXT
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO jobs (id, title, company, url, score, status) VALUES (?, ?, ?, ?, ?, ?)",
+            ("legacy-job", "Python Engineer", "Example Co", "https://example.test/job/1", 80, "ready"),
+        )
+        repo = ConversationRepository(conn)
+        repo.upsert_conversation({
+            "id": "legacy-conversation", "platform": "boss",
+            "job_id": "legacy-job", "hr_name": "刘先生",
+        })
+
+        detail = repo.get_conversation("legacy-conversation")
+        listed = repo.list_conversations()
+
+        self.assertEqual(detail["job_title"], "Python Engineer")
+        self.assertEqual(detail["job_company"], "Example Co")
+        self.assertIsNone(detail["job_hr_name"])
+        self.assertEqual(detail["display_hr_name"], "刘先生")
+        self.assertEqual(listed[0]["job_score"], 80)
+        self.assertIsNone(listed[0]["job_score_reason"])
+        conn.close()
 
     def test_draft_is_stored_but_not_sent(self):
         draft = self.repo.save_draft("conv-1", "这是一个需要人工确认的草稿", 1)

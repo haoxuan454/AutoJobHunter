@@ -7,6 +7,7 @@ Serves:
 
 import json
 import hashlib
+import re
 import smtplib
 from ipaddress import ip_address
 from urllib.parse import unquote, urlsplit
@@ -76,6 +77,7 @@ from bosshunter.db import (
 	soft_delete_jobs,
 	edit_job_greeting,
 	update_job_status,
+	update_job_last_error,
 )
 from bosshunter.collection.capabilities import platform_supports
 from bosshunter.collection.orchestrator import CollectionOrchestrator, normalize_collection_options
@@ -127,6 +129,7 @@ from bosshunter.platform_delivery import DeliveryContext, get_delivery_adapter
 from bosshunter.platform_delivery.zhilian import (
     _active_zhilian_conversation_snapshot,
     _conversation_message_snapshot,
+    _fill_and_send_zhilian_message,
     _match_zhilian_conversation_row,
     _open_zhilian_conversation_row,
     _scan_zhilian_conversation_list,
@@ -134,9 +137,9 @@ from bosshunter.platform_delivery.zhilian import (
     _zhilian_im_targets,
 )
 from bosshunter.platform_delivery.liepin import _liepin_im_targets, _liepin_conversation_list_snapshot, _liepin_chat_snapshot
-from bosshunter.browser import evaluate, get_page_targets
+from bosshunter.browser import click_at, evaluate, get_page_targets
 from bosshunter.platform_delivery.browser_helpers import parse_result
-from bosshunter.executor.monitor import JS_EXTRACT_CHAT_LIST, JS_EXTRACT_CONVERSATION
+from bosshunter.executor.monitor import JS_EXTRACT_CHAT_LIST, JS_EXTRACT_CONVERSATION, _send_message_in_chat
 from bosshunter.assistant_lab import list_messages as lab_list_messages, open_sandbox, reset as reset_lab, send_message as lab_send_message, session_payload as lab_session_payload
 from bosshunter.interview_practice import create_session as create_interview_session, evaluate_round as evaluate_interview_round, generate_question as generate_interview_question, list_sessions as list_interview_sessions
 from bosshunter.voice_assistant import generate_reply as generate_voice_reply
@@ -261,6 +264,49 @@ def _conversation_repo():
 	init_scheduler_tables(conn)
 	init_notification_tables(conn)
 	return ConversationRepository(conn)
+
+
+def _current_conversation_user_id() -> str:
+	"""Return the local dashboard owner used by conversation APIs.
+
+	The current workbench has no multi-account login layer. Keeping this in one
+	function makes the ownership boundary explicit and prevents reply routes
+	from accidentally accepting a conversation belonging to another local user
+	when that layer is added later.
+	"""
+	return "default"
+
+
+def _validate_local_conversation_reply_request() -> tuple[bool, str]:
+	"""Require a loopback, same-origin request for platform message sending."""
+	environ = request.environ
+	peer = str(environ.get("REMOTE_ADDR") or "")
+	host = str(environ.get("HTTP_HOST") or f"{environ.get('SERVER_NAME', '')}:{environ.get('SERVER_PORT', '')}")
+	scheme = str(environ.get("wsgi.url_scheme") or "http")
+	try:
+		authority = urlsplit(f"{scheme}://{host}")
+		valid_host = (
+			authority.hostname in {"localhost", "127.0.0.1", "::1"}
+			or _is_loopback_address(authority.hostname or "")
+		) and not authority.username and not authority.password and not authority.path and not authority.query and not authority.fragment
+		_ = authority.port
+	except ValueError:
+		valid_host = False
+	if not (_is_loopback_address(peer) and valid_host):
+		return False, "conversation reply API 仅允许本机请求"
+	expected_origin = f"{scheme}://{host}"
+	origin = str(environ.get("HTTP_ORIGIN") or "").strip()
+	if origin and origin != expected_origin:
+		return False, "conversation reply API 拒绝跨来源请求"
+	referer = str(environ.get("HTTP_REFERER") or "").strip()
+	if referer:
+		try:
+			referer_parts = urlsplit(referer)
+			if f"{referer_parts.scheme}://{referer_parts.netloc}" != expected_origin:
+				return False, "conversation reply API 拒绝跨来源请求"
+		except ValueError:
+			return False, "conversation reply API 拒绝无效 Referer"
+	return True, ""
 
 
 def _json_response(data, status_code=200):
@@ -2845,19 +2891,99 @@ def api_notification_dispatch(item_id):
 def api_conversation_analytics():
 	conn = _get_web_db()
 	try:
-		# Analytics must also work on a brand-new local database.
+		# Analytics must also work on a brand-new local database. Every series is
+		# derived from persisted rows; an empty database returns empty arrays.
 		ConversationRepository(conn)
-		rows = conn.execute("SELECT status, COUNT(*) AS count FROM conv_conversations GROUP BY status ORDER BY count DESC").fetchall()
-		message_rows = conn.execute("SELECT sender_type, COUNT(*) AS count FROM conv_messages GROUP BY sender_type ORDER BY count DESC").fetchall()
-		platform_rows = conn.execute("SELECT platform, COUNT(*) AS count FROM conv_conversations GROUP BY platform ORDER BY count DESC").fetchall()
+		# Keep analytics on the same public scope as /api/conversations: real
+		# delivered-job cards only. Assistant-lab and old sync:* records are
+		# useful for their own sandbox, but must not affect user-facing metrics.
+		visible = """c.job_id IS NOT NULL
+			AND TRIM(c.job_id) <> ''
+			AND c.job_id NOT LIKE 'sync:%'
+			AND c.platform IN ('boss', 'zhilian', 'liepin', '51job')"""
+		rows = conn.execute(f"SELECT c.status, COUNT(*) AS count FROM conv_conversations c WHERE {visible} GROUP BY c.status ORDER BY count DESC").fetchall()
+		message_rows = conn.execute(f"""SELECT m.sender_type, COUNT(*) AS count
+			FROM conv_messages m JOIN conv_conversations c ON c.id = m.conversation_id
+			WHERE {visible} GROUP BY m.sender_type ORDER BY count DESC""").fetchall()
+		platform_rows = conn.execute(f"SELECT c.platform, COUNT(*) AS count FROM conv_conversations c WHERE {visible} GROUP BY c.platform ORDER BY count DESC").fetchall()
+		platform_metric_rows = conn.execute("""
+			SELECT c.platform,
+			       COUNT(DISTINCT c.id) AS conversations,
+			       COUNT(DISTINCT CASE WHEN m.sender_type = 'hr' THEN c.id END) AS replied_conversations,
+			       ROUND(100.0 * COUNT(DISTINCT CASE WHEN m.sender_type = 'hr' THEN c.id END) / NULLIF(COUNT(DISTINCT c.id), 0), 1) AS reply_rate
+			FROM conv_conversations c
+			LEFT JOIN conv_messages m ON m.conversation_id = c.id
+			WHERE c.job_id IS NOT NULL AND TRIM(c.job_id) <> ''
+			  AND c.job_id NOT LIKE 'sync:%'
+			  AND c.platform IN ('boss', 'zhilian', 'liepin', '51job')
+			GROUP BY c.platform ORDER BY conversations DESC
+		""").fetchall()
+		daily_rows = conn.execute("""
+			SELECT substr(COALESCE(m.message_time, m.created_at), 1, 10) AS day,
+			       COUNT(DISTINCT CASE WHEN m.sender_type = 'user' THEN m.conversation_id END) AS deliveries,
+			       COUNT(DISTINCT CASE WHEN m.sender_type = 'hr' THEN m.conversation_id END) AS replied_conversations,
+			       COUNT(CASE WHEN m.sender_type = 'user' THEN 1 END) AS outgoing_messages,
+			       COUNT(CASE WHEN m.sender_type = 'hr' THEN 1 END) AS incoming_messages
+			FROM conv_messages m
+			JOIN conv_conversations c ON c.id = m.conversation_id
+			WHERE c.job_id IS NOT NULL AND TRIM(c.job_id) <> ''
+			  AND c.job_id NOT LIKE 'sync:%'
+			  AND c.platform IN ('boss', 'zhilian', 'liepin', '51job')
+			GROUP BY day ORDER BY day
+		""").fetchall()
+		job_direction_rows = conn.execute("""
+			SELECT COALESCE(NULLIF(TRIM(j.title), ''), '未关联岗位') AS label,
+			       COUNT(DISTINCT c.id) AS conversations,
+			       COUNT(CASE WHEN m.sender_type = 'hr' THEN 1 END) AS hr_messages
+			FROM conv_conversations c
+			LEFT JOIN jobs j ON j.id = c.job_id
+			LEFT JOIN conv_messages m ON m.conversation_id = c.id
+			WHERE c.job_id IS NOT NULL AND TRIM(c.job_id) <> ''
+			  AND c.job_id NOT LIKE 'sync:%'
+			  AND c.platform IN ('boss', 'zhilian', 'liepin', '51job')
+			GROUP BY label ORDER BY conversations DESC, label LIMIT 30
+		""").fetchall() if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'").fetchone() else []
+		score_rows = conn.execute("""
+			SELECT CASE
+			         WHEN c.interest_score IS NULL THEN '未评分'
+			         WHEN c.interest_score < 40 THEN '0-39'
+			         WHEN c.interest_score < 60 THEN '40-59'
+			         WHEN c.interest_score < 80 THEN '60-79'
+			         ELSE '80-100'
+			       END AS score_range,
+			       COUNT(DISTINCT c.id) AS conversations,
+			       COUNT(DISTINCT CASE WHEN EXISTS (
+			         SELECT 1 FROM conv_messages hm
+			         WHERE hm.conversation_id = c.id AND hm.sender_type = 'hr'
+			       ) THEN c.id END) AS replied_conversations
+			FROM conv_conversations c
+			WHERE c.job_id IS NOT NULL AND TRIM(c.job_id) <> ''
+			  AND c.job_id NOT LIKE 'sync:%'
+			  AND c.platform IN ('boss', 'zhilian', 'liepin', '51job')
+			GROUP BY score_range ORDER BY score_range
+		""").fetchall()
+		keyword_rows = conn.execute("""
+			SELECT content, COUNT(*) AS count
+			FROM conv_messages m JOIN conv_conversations c ON c.id = m.conversation_id
+			WHERE m.sender_type = 'hr' AND TRIM(m.content) <> ''
+			  AND c.job_id IS NOT NULL AND TRIM(c.job_id) <> ''
+			  AND c.job_id NOT LIKE 'sync:%'
+			  AND c.platform IN ('boss', 'zhilian', 'liepin', '51job')
+			GROUP BY content ORDER BY count DESC, content LIMIT 20
+		""").fetchall()
 		return _json_response({
-			"conversations_total": conn.execute("SELECT COUNT(*) FROM conv_conversations").fetchone()[0],
-			"messages_total": conn.execute("SELECT COUNT(*) FROM conv_messages").fetchone()[0],
+			"conversations_total": conn.execute(f"SELECT COUNT(*) FROM conv_conversations c WHERE {visible}").fetchone()[0],
+			"messages_total": conn.execute(f"SELECT COUNT(*) FROM conv_messages m JOIN conv_conversations c ON c.id = m.conversation_id WHERE {visible}").fetchone()[0],
 			"confirmed_public_facts": conn.execute("SELECT COUNT(*) FROM know_facts WHERE fact_status = 'confirmed' AND public_allowed = 1").fetchone()[0] if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='know_facts'").fetchone() else 0,
-			"salary_paused": conn.execute("SELECT COUNT(*) FROM conv_conversations WHERE status = 'paused_salary'").fetchone()[0],
+			"salary_paused": conn.execute(f"SELECT COUNT(*) FROM conv_conversations c WHERE {visible} AND c.status = 'paused_salary'").fetchone()[0],
 			"by_status": [dict(row) for row in rows],
 			"messages_by_sender": [dict(row) for row in message_rows],
 			"by_platform": [dict(row) for row in platform_rows],
+			"platform_metrics": [dict(row) for row in platform_metric_rows],
+			"daily_trend": [dict(row) for row in daily_rows],
+			"job_directions": [dict(row) for row in job_direction_rows],
+			"score_reply_rate": [dict(row) for row in score_rows],
+			"hr_question_keywords": [dict(row) for row in keyword_rows],
 		})
 	finally:
 		conn.close()
@@ -3272,9 +3398,16 @@ def _parse_browser_json(raw: Any) -> Any:
 
 def _sync_platform_target(conn, *, platform: str, target: dict, row: dict, base_dir: Path, config: dict) -> dict:
     """Open/read one already-rendered conversation and persist its snapshot."""
+    # A platform IM landing page is not a concrete HR conversation URL.  Keep
+    # it out of the local card until the browser extraction returns a specific
+    # URL (for example a Zhilian sessionId URL).  Otherwise the UI would show a
+    # misleading "open HR chat" link that only opens the platform inbox.
+    raw_conversation_url = row.get("conversation_url") or ""
+    if platform == "zhilian" and not raw_conversation_url:
+        raw_conversation_url = row.get("source_url") or target.get("url") or ""
     conversation_url = normalize_platform_external_url(
         platform,
-        row.get("conversation_url") or target.get("url") or row.get("source_url") or "",
+        raw_conversation_url,
         kind="conversation",
     ) or ""
     job_url = str(row.get("job_url") or row.get("job_page_url") or "").strip()
@@ -3290,7 +3423,18 @@ def _sync_platform_target(conn, *, platform: str, target: dict, row: dict, base_
         "hr_profile_url": str(row.get("hr_profile_url") or "").strip(),
         "company_url": str(row.get("company_url") or "").strip(),
     }
+    active: dict[str, Any] = {}
     if platform == "boss":
+        opened = _open_boss_conversation_row(target["target_id"], row)
+        if opened.get("status") != "matched_chat_loaded":
+            raise RuntimeError(str(opened.get("status") or "boss_chat_not_loaded"))
+        active = opened.get("row") if isinstance(opened.get("row"), dict) else {}
+        for key in ("hr_name", "company", "title", "hr_title"):
+            if str(active.get(key) or "").strip():
+                conversation[key] = str(active[key]).strip()
+        conversation["external_conversation_id"] = str(
+            active.get("conversation_id") or active.get("contact_id") or conversation["external_conversation_id"]
+        ).strip()
         parsed = _parse_browser_json(evaluate(target["target_id"], JS_EXTRACT_CONVERSATION, timeout=10))
         if not isinstance(parsed, list):
             raise RuntimeError("conversation_dom_unreadable")
@@ -3314,10 +3458,7 @@ def _sync_platform_target(conn, *, platform: str, target: dict, row: dict, base_
         conversation["source_url"] = conversation["conversation_url"]
         messages = active.get("messages") or _conversation_message_snapshot(target["target_id"])
     elif platform == "liepin":
-        snapshot = _liepin_chat_snapshot(target["target_id"])
-        if not snapshot.get("success"):
-            raise RuntimeError("conversation_dom_unreadable")
-        messages = snapshot.get("messages") or []
+        raise RuntimeError("unsupported_platform")
     else:
         raise RuntimeError("unsupported_platform")
     if not isinstance(messages, list):
@@ -3338,10 +3479,24 @@ def _sync_platform_target(conn, *, platform: str, target: dict, row: dict, base_
         history_complete=bool(active.get("history_complete")) if platform == "zhilian" else None,
     )
     status = synced.get("status") or ("synced" if synced.get("conversation") else "error")
+    # The adapter snapshot may contain legacy/system rows that are already
+    # represented locally, so ``len(messages)`` is not the same thing as the
+    # number shown in the conversation center.  Report both values explicitly
+    # and make the primary count match the persisted SQLite projection.
+    persisted_conversation = synced.get("conversation") or {}
+    persisted_id = str(persisted_conversation.get("id") or job_id).strip()
+    persisted_message_count = 0
+    if persisted_id:
+        count_row = conn.execute(
+            "SELECT COUNT(*) AS count FROM conv_messages WHERE conversation_id = ?",
+            (persisted_id,),
+        ).fetchone()
+        persisted_message_count = int(count_row["count"] if count_row else 0)
     return {
         "synced": synced,
         "status": status,
-        "message_count": len(messages),
+        "message_count": persisted_message_count,
+        "platform_message_count": len(messages),
         "message_readable": bool(messages),
         "history_complete": bool(active.get("history_complete")) if platform == "zhilian" else None,
         "history_label": str(active.get("history_label") or "") if platform == "zhilian" else "",
@@ -3365,15 +3520,43 @@ def _conversation_identity_score(local: dict, row: dict) -> int:
     row_company = compact(row.get("company") or row.get("company_role"))
     local_title = compact(local.get("job_title"))
     row_title = compact(row.get("title") or row.get("job_title"))
-    if not local_hr or not row_hr or local_hr != row_hr:
-        return 0
     if not local_company or not row_company or local_company != row_company:
+        return 0
+    if not local_hr:
+        # Historical delivery cards may predate HR snapshot persistence.  A
+        # company-only candidate is usable only when the caller proves that it
+        # is the sole rendered candidate; ties and cross-card reuse are rejected
+        # below.  Keep this score below HR/company matches so an exact card wins
+        # when one rendered row is shared by multiple local cards.
+        return 25
+    if not row_hr or local_hr != row_hr:
         return 0
     if local_title and row_title and (local_title == row_title or local_title in row_title or row_title in local_title):
         return 80
     # Company + HR is only a weak fallback.  It is acceptable only when this
     # platform has rendered one unique candidate; the caller rejects ties.
     return 40
+
+
+def _conversation_row_identity(row: dict) -> tuple[str, ...]:
+    """Return a stable identity for one rendered row within an open tab.
+
+    BOSS often omits an external conversation id from the sidebar DOM.  In
+    that case the target tab plus normalized visible fields are the safest
+    local identity.  Keeping the tab id prevents silently merging two equal
+    looking rows from different open tabs.
+    """
+    compact = lambda value: "".join(str(value or "").split()).casefold()
+    external = str(row.get("conversation_id") or row.get("contact_id") or row.get("session_id") or "").strip()
+    if external:
+        return (str(row.get("target_id") or ""), "external", external)
+    return (
+        str(row.get("target_id") or ""),
+        "visible",
+        compact(row.get("hr_name") or row.get("name")),
+        compact(row.get("company") or row.get("company_role")),
+        compact(row.get("title") or row.get("job_title")),
+    )
 
 
 def _zhilian_identity_score(local: dict, row: dict) -> int:
@@ -3406,14 +3589,64 @@ def _zhilian_identity_score(local: dict, row: dict) -> int:
     }.get(quality, 0)
 
 
+def _open_boss_conversation_row(target_id: str, row: dict[str, Any], *, timeout: float = 5.0) -> dict[str, Any]:
+    """Select one already-rendered BOSS chat row without navigating the tab."""
+    external_id = str(row.get("conversation_id") or row.get("contact_id") or "").strip()
+    hr_name = str(row.get("hr_name") or row.get("name") or "").strip()
+    company = str(row.get("company") or row.get("company_role") or "").strip()
+    if not external_id and not hr_name:
+        return {"status": "row_identity_missing", "opened": False}
+    script = f"""
+    (() => {{
+      const normalize = value => (value || '').replace(/\\s+/g, ' ').trim();
+      const wantedId = {json.dumps(external_id, ensure_ascii=False)};
+      const wantedName = normalize({json.dumps(hr_name, ensure_ascii=False)});
+      const wantedCompany = normalize({json.dumps(company, ensure_ascii=False)});
+      const rows = [...document.querySelectorAll('li[role=listitem]')];
+      const getId = item => item.getAttribute('data-id') || item.getAttribute('data-conversation-id') || item.getAttribute('data-uid') || '';
+      const getName = item => normalize(item.querySelector('.name-text')?.innerText || '');
+      const getCompany = item => normalize(item.querySelector('.name-box span:nth-child(2)')?.innerText || '');
+      let matches = wantedId ? rows.filter(item => getId(item) === wantedId) : [];
+      if (!matches.length) matches = rows.filter(item => getName(item) === wantedName && (!wantedCompany || getCompany(item) === wantedCompany));
+      if (!matches.length) return JSON.stringify({{success:false,status:'row_not_found'}});
+      if (matches.length !== 1) return JSON.stringify({{success:false,status:'row_ambiguous',count:matches.length}});
+       const item = matches[0];
+       const selectedFriend = item.querySelector('.friend-content.selected');
+       const rect = item.getBoundingClientRect();
+       return JSON.stringify({{success:true,active:item.getAttribute('aria-selected') === 'true' || item.classList.contains('active') || item.classList.contains('selected') || !!selectedFriend,x:rect.left + rect.width / 2,y:rect.top + rect.height / 2}});
+    }})()
+    """
+    located = _parse_browser_json(evaluate(target_id, script, timeout=10))
+    if not isinstance(located, dict):
+        return {"status": "row_not_found", "opened": False}
+    if not located.get("success"):
+        return {"status": str(located.get("status") or "row_not_found"), "opened": False}
+    if not located.get("active"):
+        if not click_at(target_id, f"{located.get('x')},{located.get('y')}"):
+            return {"status": "row_click_failed", "opened": False}
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            rows = _parse_browser_json(evaluate(target_id, JS_EXTRACT_CHAT_LIST, timeout=10))
+            if isinstance(rows, list):
+                active = next((item for item in rows if item.get("active") and (
+                    (external_id and str(item.get("conversation_id") or item.get("contact_id") or "") == external_id)
+                    or (not external_id and str(item.get("hr_name") or item.get("name") or "").strip() == hr_name)
+                )), None)
+                if active:
+                    return {"status": "matched_chat_loaded", "opened": True, "row": active}
+            time.sleep(0.25)
+        return {"status": "chat_open_not_verified", "opened": False}
+    return {"status": "matched_chat_loaded", "opened": True, "row": row}
+
+
 def _opened_platform_rows(platform: str) -> tuple[list[dict], list[dict]]:
-    """Read only active chat rows from already-open tabs; never navigate."""
+    """Read all already-rendered rows from already-open tabs; never navigate."""
     if platform == "boss":
         targets = _boss_im_targets()
     elif platform == "zhilian":
         targets = _zhilian_im_targets()
     else:
-        targets = _liepin_im_targets()
+        return [], []
     rows: list[dict] = []
     for target in targets:
         target_id = target["target_id"]
@@ -3421,14 +3654,14 @@ def _opened_platform_rows(platform: str) -> tuple[list[dict], list[dict]]:
             parsed = _parse_browser_json(evaluate(target_id, JS_EXTRACT_CHAT_LIST, timeout=10))
             source_rows = parsed if isinstance(parsed, list) else []
         elif platform == "zhilian":
-            # The sidebar is the source of truth for target selection. The
-            # selected row is opened later by _sync_platform_target.
-            source_rows = (_zhilian_conversation_list_snapshot(target_id).get("rows") or [])
+            # One bounded scan per already-open IM tab is shared by all local
+            # cards in this batch. Do not rescan/scroll once per card.
+            scan = _scan_zhilian_conversation_list(target_id)
+            source_rows = (scan.get("rows") or []) if scan.get("success") else []
         else:
-            snapshot = _liepin_conversation_list_snapshot(target_id)
-            source_rows = snapshot.get("rows") or [] if snapshot.get("success") else []
+            source_rows = []
         for row in source_rows:
-            if isinstance(row, dict) and row.get("active"):
+            if isinstance(row, dict):
                 rows.append({**row, "target_id": target_id, "source_url": target["url"]})
     return targets, rows
 
@@ -3437,13 +3670,13 @@ def _opened_platform_rows(platform: str) -> tuple[list[dict], list[dict]]:
 def api_conversations_sync():
     """Sync only local delivered-job cards against already-open chat panels."""
     body = request.json if isinstance(request.json, dict) else {}
-    requested = body.get("platforms") or ["boss", "zhilian", "liepin"]
+    requested = body.get("platforms") or ["boss", "zhilian"]
     if not isinstance(requested, list):
         return _json_response({"error": "platforms 必须是数组"}, 400)
     requested = [str(item).strip().lower() for item in requested]
-    unsupported = [item for item in requested if item not in {"boss", "zhilian", "liepin"}]
+    unsupported = [item for item in requested if item not in {"boss", "zhilian", "liepin", "51job"}]
     if unsupported:
-        return _json_response({"error": "unsupported_platform", "unsupported": unsupported, "manual_required": "51job" in unsupported}, 400)
+        return _json_response({"error": "unsupported_platform", "unsupported": unsupported}, 400)
 
     conn = _get_web_db()
     try:
@@ -3453,6 +3686,28 @@ def api_conversations_sync():
         results: list[dict] = []
         for platform in requested:
             cards = [item for item in local_cards if str(item.get("platform") or "").lower() == platform]
+            if platform in {"liepin", "51job"}:
+                if cards:
+                    results.extend({
+                        "conversation_id": str(card["id"]),
+                        "platform": platform,
+                        "status": "unsupported_platform",
+                        "message_count": int(card.get("message_count") or 0),
+                        "inserted": 0,
+                        "manual_required": True,
+                        "diagnostics": ["该平台当前不做 HR 会话同步，请在平台内人工查看"],
+                    } for card in cards)
+                else:
+                    results.append({
+                        "platform": platform,
+                        "status": "unsupported_platform",
+                        "discovered": 0,
+                        "updated": 0,
+                        "inserted": 0,
+                        "manual_required": True,
+                        "diagnostics": ["该平台当前不做 HR 会话同步"],
+                    })
+                continue
             if not cards:
                 # Deliberately do not touch Chrome when this platform has no
                 # local delivered-job card.
@@ -3474,13 +3729,51 @@ def api_conversations_sync():
                     "diagnostics": [str(exc)],
                 } for card in cards)
                 continue
-            for card in cards:
+            # Resolve ownership across all local cards before opening any
+            # conversation. A rendered platform row must never be reused by
+            # two jobs when the platform omitted a stable conversation id.
+            batch_candidates: dict[int, list[tuple[int, dict, tuple[str, ...]]]] = {}
+            for card_index, candidate_card in enumerate(cards):
+                by_identity: dict[tuple[str, ...], tuple[int, dict, tuple[str, ...]]] = {}
+                for candidate_row in rows:
+                    candidate_score = _conversation_identity_score(candidate_card, candidate_row)
+                    if not candidate_score:
+                        continue
+                    candidate_identity = _conversation_row_identity(candidate_row)
+                    previous = by_identity.get(candidate_identity)
+                    if previous is None or candidate_score > previous[0]:
+                        by_identity[candidate_identity] = (
+                            candidate_score, candidate_row, candidate_identity
+                        )
+                batch_candidates[card_index] = sorted(
+                    by_identity.values(), key=lambda item: (-item[0], item[2])
+                )
+
+            batch_claims: dict[tuple[str, ...], list[int]] = {}
+            for card_index, candidate_items in batch_candidates.items():
+                if not candidate_items:
+                    continue
+                best_score = candidate_items[0][0]
+                best_items = [item for item in candidate_items if item[0] == best_score]
+                if len(best_items) == 1:
+                    batch_claims.setdefault(best_items[0][2], []).append(card_index)
+            contested_cards = {
+                card_index
+                for claimants in batch_claims.values()
+                if len(claimants) > 1
+                for card_index in claimants
+            }
+
+            for card_index, card in enumerate(cards):
                 candidates = []
                 for row in rows:
                     score = _conversation_identity_score(card, row)
                     if score:
                         candidates.append((score, row))
                 candidates.sort(key=lambda item: item[0], reverse=True)
+                if candidates:
+                    best_score = candidates[0][0]
+                    candidates = [item for item in candidates if item[0] == best_score]
                 unique = []
                 seen = set()
                 for score, row in candidates:
@@ -3496,25 +3789,50 @@ def api_conversations_sync():
                         "diagnostics": ["找到多个可能的已打开会话" if unique else "目标 HR 会话未在已打开聊天面板中"]
                     })
                     continue
+                if card_index in contested_cards:
+                    results.append({
+                        'conversation_id': str(card['id']), 'platform': platform,
+                        'status': 'ambiguous', 'message_count': 0, 'inserted': 0,
+                        'diagnostics': ['same opened conversation claimed by multiple local cards'],
+                    })
+                    continue
                 row = unique[0][1]
                 target = next(item for item in targets if item["target_id"] == row["target_id"])
-                synced = _sync_platform_target(
-                    conn, platform=platform, target=target,
-                    row={**row, "job_id": card.get("job_id") or "", "job_url": card.get("job_url") or "", "local_conversation_id": card["id"]},
-                    base_dir=BASE_DIR, config=load_config(CONFIG_PATH),
-                )
+                try:
+                    synced = _sync_platform_target(
+                        conn, platform=platform, target=target,
+                        row={**row, "job_id": card.get("job_id") or "", "job_url": card.get("job_url") or "", "local_conversation_id": card["id"]},
+                        base_dir=BASE_DIR, config=load_config(CONFIG_PATH),
+                    )
+                except Exception as exc:
+                    results.append({
+                        "conversation_id": str(card["id"]), "platform": platform,
+                        "status": "error", "message_count": 0, "inserted": 0,
+                        "diagnostics": [str(exc)],
+                    })
+                    continue
                 status = synced.get("status") or synced["synced"].get("status") or "error"
                 results.append({
                     "conversation_id": str(card["id"]), "platform": platform,
                     "status": status,
                     "message_count": synced.get("message_count", 0),
+                    "platform_message_count": synced.get("platform_message_count", 0),
                     "inserted": len(synced["synced"].get("inserted") or []),
                     "conversation": synced["synced"].get("conversation"),
                     "history_complete": synced.get("history_complete"),
                     "history_label": synced.get("history_label") or "",
                     "diagnostics": [],
                 })
-        return _json_response({"success": all(item.get("status") != "error" for item in results), "results": results})
+        statuses = [str(item.get("status") or "error") for item in results]
+        complete = bool(statuses) and all(status == "synced" for status in statuses)
+        partial = any(status == "synced" for status in statuses) and not complete
+        return _json_response({
+            "success": complete,
+            "complete": complete,
+            "partial": partial,
+            "status": "synced" if complete else ("partial" if partial else "not_synced"),
+            "results": results,
+        })
     finally:
         conn.close()
 
@@ -3545,14 +3863,20 @@ def api_conversation_sync(conversation_id):
         if not str(local.get("job_id") or "").strip() or str(local.get("job_id") or "").startswith("sync:"):
             return _json_response({"status": "unmatched", "conversation_id": conversation_id, "detail": "该会话没有关联已投递岗位"})
         platform = str(local.get("platform") or "").lower()
-        if platform not in {"boss", "zhilian", "liepin"}:
-            return _json_response({"status": "unsupported", "platform": platform, "manual_required": platform == "51job"}, 400)
+        if platform in {"liepin", "51job"}:
+            return _json_response({
+                "status": "unsupported_platform",
+                "platform": platform,
+                "conversation_id": conversation_id,
+                "manual_required": True,
+                "detail": "该平台当前不做 HR 会话同步，请在平台内人工查看",
+            })
+        if platform not in {"boss", "zhilian"}:
+            return _json_response({"error": "unsupported_platform", "platform": platform}, 400)
         if platform == "boss":
             targets = _boss_im_targets()
         elif platform == "zhilian":
             targets = _zhilian_im_targets()
-        else:
-            targets = _liepin_im_targets()
         if not targets:
             return _json_response({"status": "not_loaded", "platform": platform, "conversation_id": conversation_id})
 
@@ -3632,6 +3956,7 @@ def api_conversation_sync(conversation_id):
             "status": "synced",
             "conversation_id": conversation_id,
             "message_count": synced["message_count"],
+            "platform_message_count": synced.get("platform_message_count", 0),
             "inserted": synced["synced"].get("inserted", []),
             "conversation": synced["synced"].get("conversation"),
             "history_complete": synced.get("history_complete"),
@@ -3799,6 +4124,301 @@ def api_conversation_draft(conversation_id):
 		"model_error": model_error,
 		"message": "草稿已生成，未发送；需要人工确认后才能进入发送流程",
 	})
+
+
+def _reply_platform_candidate(local: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
+	"""Find exactly one already-rendered platform chat for a local card.
+
+	This helper only inspects open pages. It never navigates, logs in, or creates
+	a new conversation. A tie is deliberately rejected to prevent cross-HR
+	messages.
+	"""
+	platform = str(local.get("platform") or "").lower()
+	if platform not in {"boss", "zhilian"}:
+		return None, None, "unsupported_platform"
+	local_external = str(local.get("external_conversation_id") or "").strip()
+	if not local_external:
+		# Manual replies must never fall back to HR+company alone.  A recruiter
+		# can own several roles under one company, so the local card needs all
+		# three visible identity fields before a platform row can be selected.
+		if not all(
+			str(local.get(field) or "").strip()
+			for field in ("hr_name", "job_company", "job_title")
+		):
+			return None, None, "identity_incomplete"
+	targets, rows = _opened_platform_rows(platform)
+	if not targets:
+		return None, None, "not_loaded"
+	candidates: list[tuple[int, dict[str, Any]]] = []
+	for row in rows:
+		row_external = str(row.get("conversation_id") or row.get("contact_id") or row.get("session_id") or "").strip()
+		if local_external and row_external != local_external:
+			continue
+		score = _zhilian_identity_score(local, row) if platform == "zhilian" else _conversation_identity_score(local, row)
+		if score:
+			candidates.append((score, row))
+	candidates.sort(key=lambda item: item[0], reverse=True)
+	unique: list[tuple[int, dict[str, Any]]] = []
+	seen: set[tuple[str, str, str]] = set()
+	for score, row in candidates:
+		identity = (
+			str(row.get("target_id") or ""),
+			str(row.get("conversation_id") or row.get("contact_id") or row.get("session_id") or ""),
+			str(row.get("hr_name") or row.get("name") or ""),
+		)
+		if identity not in seen:
+			seen.add(identity)
+			unique.append((score, row))
+	if not unique:
+		return None, None, "not_loaded"
+	if len(unique) > 1 and unique[0][0] == unique[1][0]:
+		return None, None, "ambiguous"
+	row = unique[0][1]
+	target = next((item for item in targets if item["target_id"] == row.get("target_id")), None)
+	return target, row, None if target else "not_loaded"
+
+
+def _reply_attempt_response(repo, user_id: str, conversation_id: str, idempotency_key: str, status: str, payload: dict[str, Any], http_status: int):
+	repo.update_send_attempt(
+		user_id=user_id,
+		conversation_id=conversation_id,
+		idempotency_key=idempotency_key,
+		status=status,
+		response=payload,
+		http_status=http_status,
+	)
+	return _json_response(payload, http_status)
+
+
+@app.route("/api/conversations/<conversation_id>/reply/send", method="POST")
+def api_conversation_reply_send_idempotent(conversation_id):
+	"""Send one human-approved reply with local ownership and retry safety."""
+	allowed, guard_error = _validate_local_conversation_reply_request()
+	if not allowed:
+		return _json_response({"status": "local_only", "error": guard_error}, 403)
+	conversation_id = _decoded_conversation_id(conversation_id)
+	body = request.json if isinstance(request.json, dict) else {}
+	message = str(body.get("message") or "").strip()
+	if not message or len(message) > 2000:
+		return _json_response({"status": "invalid_message", "error": "reply message must contain 1-2000 characters"}, 400)
+	idempotency_key = str(body.get("idempotency_key") or "").strip()
+	if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,199}", idempotency_key):
+		return _json_response({"status": "invalid_idempotency_key", "error": "idempotency_key is required and has an invalid format"}, 400)
+
+	conn = _get_web_db()
+	try:
+		repo = ConversationRepository(conn)
+		user_id = _current_conversation_user_id()
+		local = repo.get_conversation(conversation_id)
+		if not local or str(local.get("user_id") or "") != user_id:
+			return _json_response({"status": "not_found", "error": "conversation does not exist"}, 404)
+		job_id = str(local.get("job_id") or "").strip()
+		if not job_id or job_id.startswith("sync:"):
+			return _json_response({"status": "unmatched", "conversation_id": conversation_id, "error": "conversation has no delivered job association"}, 409)
+		platform = str(local.get("platform") or "").lower()
+		if platform in {"liepin", "51job"}:
+			return _json_response({"status": "unsupported_platform", "platform": platform, "conversation_id": conversation_id, "manual_required": True}, 409)
+		if platform not in {"boss", "zhilian"}:
+			return _json_response({"status": "unsupported_platform", "platform": platform}, 400)
+		if str(local.get("status") or "") in {"closed", "paused_salary", "paused_risk", "paused_manual", "waiting_human", "failed"}:
+			return _json_response({"status": "conversation_not_sendable", "platform": platform, "conversation_id": conversation_id, "conversation_status": local.get("status")}, 409)
+
+		message_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
+		attempt, claimed = repo.claim_send_attempt(
+			user_id=user_id,
+			conversation_id=conversation_id,
+			idempotency_key=idempotency_key,
+			message_hash=message_hash,
+			platform=platform,
+		)
+		if attempt.get("message_hash") != message_hash:
+			return _json_response({"status": "idempotency_conflict", "conversation_id": conversation_id}, 409)
+		if not claimed:
+			if attempt.get("status") == "sent":
+				payload = dict(attempt.get("response") or {})
+				payload["idempotent_replay"] = True
+				return _json_response(payload, int(attempt.get("http_status") or 200))
+			return _json_response({"status": attempt.get("status") or "pending", "conversation_id": conversation_id, "error": "previous send attempt is not safe to repeat"}, 409)
+
+		target, row, locate_error = _reply_platform_candidate(local)
+		if locate_error:
+			status_code = 409 if locate_error in {"ambiguous", "identity_incomplete"} else 503
+			return _reply_attempt_response(repo, user_id, conversation_id, idempotency_key, "not_sent", {"status": locate_error, "platform": platform, "conversation_id": conversation_id, "error": "platform conversation could not be selected safely"}, status_code)
+		assert target is not None and row is not None
+		verification = ""
+		verified = False
+		action_started = False
+		if platform == "boss":
+			opened = _open_boss_conversation_row(target["target_id"], row)
+			if opened.get("status") != "matched_chat_loaded":
+				return _reply_attempt_response(repo, user_id, conversation_id, idempotency_key, "not_sent", {"status": str(opened.get("status") or "not_loaded"), "platform": platform, "conversation_id": conversation_id}, 409)
+			expected = " ".join(message.split())
+			try:
+				before = _parse_browser_json(evaluate(target["target_id"], JS_EXTRACT_CONVERSATION, timeout=10))
+			except Exception:
+				before = None
+			before_count = sum(1 for item in before if isinstance(item, dict) and str(item.get("sender") or "").lower() in {"me", "user"} and " ".join(str(item.get("text") or item.get("content") or "").split()) == expected) if isinstance(before, list) else None
+			send_started = bool(_send_message_in_chat(target["target_id"], message))
+			action_started = send_started
+			if send_started and before_count is not None:
+				for attempt_no in range(3):
+					try:
+						after = _parse_browser_json(evaluate(target["target_id"], JS_EXTRACT_CONVERSATION, timeout=10))
+					except Exception:
+						after = []
+					after_count = sum(1 for item in after if isinstance(item, dict) and str(item.get("sender") or "").lower() in {"me", "user"} and " ".join(str(item.get("text") or item.get("content") or "").split()) == expected)
+					if after_count > before_count:
+						verified = True
+						break
+					if attempt_no < 2:
+						time.sleep(0.4)
+			verification = "boss_new_dom_message"
+		else:
+			opened = _open_zhilian_conversation_row(target["target_id"], row)
+			if opened.get("status") != "matched_chat_loaded" or not opened.get("success"):
+				return _reply_attempt_response(repo, user_id, conversation_id, idempotency_key, "not_sent", {"status": str(opened.get("status") or "not_loaded"), "platform": platform, "conversation_id": conversation_id}, 409)
+			result = _fill_and_send_zhilian_message(target["target_id"], message)
+			result_success = bool(result.get("success"))
+			verified = bool(result_success and result.get("verified"))
+			verification = str(result.get("verification") or "zhilian_new_dom_message")
+			# A successful platform action without a matching DOM message is
+			# deliberately unknown: the browser may have accepted the message,
+			# so retrying could duplicate it.  A failed adapter action is safe to
+			# classify as not_sent and may be retried with a new request key.
+			action_started = result_success or result.get("error") == "message_sent_not_verified"
+
+		if not verified:
+			status = "unknown" if action_started else "not_sent"
+			payload = {"status": "send_unknown" if status == "unknown" else "send_not_verified", "platform": platform, "conversation_id": conversation_id, "error": "platform send was not safely verified; do not retry automatically" if status == "unknown" else "platform did not confirm the reply", "verification": verification}
+			return _reply_attempt_response(repo, user_id, conversation_id, idempotency_key, status, payload, 502)
+
+		try:
+			inserted = repo.append_messages(conversation_id, [IncomingMessage(
+				sender_type="user", content=message, message_time=None,
+				platform_message_id=f"manual-reply:{idempotency_key}",
+				source_url=str(local.get("conversation_url") or ""),
+				raw_payload={"source": "human_approved_reply", "platform": platform, "idempotency_key": idempotency_key},
+				is_sent=True,
+			)])
+		except Exception as exc:
+			payload = {"status": "send_unknown", "platform": platform, "conversation_id": conversation_id, "error": "platform send was verified but local persistence failed; do not retry automatically", "detail": str(exc)[:300]}
+			return _reply_attempt_response(repo, user_id, conversation_id, idempotency_key, "unknown", payload, 502)
+		payload = {"success": True, "status": "sent", "platform": platform, "conversation_id": conversation_id, "inserted": inserted, "conversation": repo.get_conversation(conversation_id), "verification": verification}
+		return _reply_attempt_response(repo, user_id, conversation_id, idempotency_key, "sent", payload, 200)
+	finally:
+		conn.close()
+
+
+@app.route("/api/conversations/<conversation_id>/reply/send-legacy", method="POST")
+def api_conversation_reply_send_legacy_disabled(conversation_id):
+	return _json_response({
+		"status": "deprecated",
+		"error": "This reply endpoint is retired; use the idempotent reply endpoint.",
+		"send_enabled": False,
+	}, 410)
+
+# Retained unregistered temporarily as a local rollback reference only. The
+# route above never dispatches here; the idempotent endpoint is the sole sender.
+def _unregistered_legacy_reply_sender(conversation_id):
+	"""Deprecated sender implementation; intentionally not exposed as a route."""
+	conversation_id = _decoded_conversation_id(conversation_id)
+	body = request.json if isinstance(request.json, dict) else {}
+	message = str(body.get("message") or "").strip()
+	if not message:
+		return _json_response({"status": "invalid_message", "error": "回复内容不能为空"}, 400)
+	if len(message) > 2000:
+		return _json_response({"status": "invalid_message", "error": "回复内容不能超过 2000 个字符"}, 400)
+
+	conn = _get_web_db()
+	try:
+		repo = ConversationRepository(conn)
+		local = repo.get_conversation(conversation_id)
+		if not local:
+			return _json_response({"status": "not_found", "error": "会话不存在"}, 404)
+		job_id = str(local.get("job_id") or "").strip()
+		if not job_id or job_id.startswith("sync:"):
+			return _json_response({
+				"status": "unmatched", "conversation_id": conversation_id,
+				"error": "会话没有关联岗位，已阻止发送",
+			}, 409)
+		platform = str(local.get("platform") or "").lower()
+		if platform in {"liepin", "51job"}:
+			return _json_response({
+				"status": "unsupported_platform", "platform": platform,
+				"conversation_id": conversation_id, "manual_required": True,
+				"error": "该平台暂不支持从会话中心发送 HR 回复",
+			}, 409)
+		if platform not in {"boss", "zhilian"}:
+			return _json_response({"status": "unsupported_platform", "platform": platform}, 400)
+
+		target, row, locate_error = _reply_platform_candidate(local)
+		if locate_error:
+			status_code = 409 if locate_error == "ambiguous" else 503
+			return _json_response({
+				"status": locate_error, "platform": platform,
+				"conversation_id": conversation_id,
+				"error": {
+					"ambiguous": "检测到多个候选 HR 会话，已阻止发送",
+					"not_loaded": "请先在已登录的招聘平台中打开对应 HR 会话",
+				}.get(locate_error, locate_error),
+			}, status_code)
+		assert target is not None and row is not None
+		if platform == "boss":
+			opened = _open_boss_conversation_row(target["target_id"], row)
+			if opened.get("status") != "matched_chat_loaded":
+				return _json_response({
+					"status": str(opened.get("status") or "not_loaded"),
+					"platform": platform, "conversation_id": conversation_id,
+				}, 409)
+			sent = bool(_send_message_in_chat(target["target_id"], message))
+			if sent:
+				try:
+					observed = _parse_browser_json(evaluate(target["target_id"], JS_EXTRACT_CONVERSATION, timeout=10))
+				except Exception:
+					observed = []
+				expected = " ".join(message.split())
+				sent = isinstance(observed, list) and any(
+					str(item.get("sender") or "").lower() in {"me", "user"}
+					and " ".join(str(item.get("text") or item.get("content") or "").split()) == expected
+					for item in observed if isinstance(item, dict)
+				)
+			verification = "boss_dom_message_match"
+		else:
+			opened = _open_zhilian_conversation_row(target["target_id"], row)
+			if opened.get("status") != "matched_chat_loaded" or not opened.get("success"):
+				return _json_response({
+					"status": str(opened.get("status") or "not_loaded"),
+					"platform": platform, "conversation_id": conversation_id,
+				}, 409)
+			result = _fill_and_send_zhilian_message(target["target_id"], message)
+			sent = bool(result.get("success") and result.get("verified"))
+			verification = str(result.get("verification") or "zhilian_dom_message_match")
+
+		if not sent:
+			return _json_response({
+				"status": "send_not_verified", "platform": platform,
+				"conversation_id": conversation_id,
+				"error": "平台页面没有确认这条回复已发送，未写入本地成功消息",
+				"verification": verification,
+			}, 502)
+
+		inserted = repo.append_messages(conversation_id, [IncomingMessage(
+			sender_type="user",
+			content=message,
+			message_time=None,
+			platform_message_id=f"manual-reply:{uuid4().hex}",
+			source_url=str(local.get("conversation_url") or ""),
+			raw_payload={"source": "human_approved_reply", "platform": platform},
+			is_sent=True,
+		)])
+		return _json_response({
+			"success": True, "status": "sent", "platform": platform,
+			"conversation_id": conversation_id, "inserted": inserted,
+			"conversation": repo.get_conversation(conversation_id),
+			"verification": verification,
+		})
+	finally:
+		conn.close()
 
 
 # ─── Local Agent API ───────────────────────────────────────

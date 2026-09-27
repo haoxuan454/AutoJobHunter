@@ -144,7 +144,7 @@ class ConversationWebFlowTests(unittest.TestCase):
         self.assertTrue(status.startswith("200"), saved)
         self.assertTrue(saved["email"]["password_set"])
         self.assertNotIn("password", saved["email"])
-        self.request("/api/conversations", "POST", {"id": "c2", "platform": "test", "hr_name": "HR"})
+        self.request("/api/conversations", "POST", {"id": "c2", "platform": "boss", "job_id": "job-c2", "hr_name": "HR"})
         status, message = self.request(
             "/api/conversations/c2/messages", "POST",
             {"sender_type": "hr", "content": "我们想了解你的薪资期望", "platform_message_id": "salary-1"},
@@ -155,6 +155,7 @@ class ConversationWebFlowTests(unittest.TestCase):
         analytics = self.request("/api/conversations/analytics")[1]
         self.assertEqual(analytics["conversations_total"], 1)
         self.assertEqual(analytics["salary_paused"], 1)
+        self.assertEqual(analytics["daily_trend"][-1]["incoming_messages"], 1)
         self.assertEqual(self.request("/api/conversations/scheduler/next")[1]["candidate"], None)
 
     def test_configured_model_generates_contextual_draft_but_never_sends(self):
@@ -192,7 +193,7 @@ class ConversationWebFlowTests(unittest.TestCase):
         self.assertTrue(deleted["platform_untouched"])
         self.assertTrue(self.request("/api/conversations/c-delete")[0].startswith("404"))
 
-    def test_single_conversation_sync_rejects_ambiguous_identity(self):
+    def test_liepin_conversation_sync_is_explicitly_unsupported(self):
         from unittest.mock import patch
         self.request("/api/conversations", "POST", {
             "id": "ambiguous", "platform": "liepin", "external_conversation_id": "same",
@@ -206,7 +207,8 @@ class ConversationWebFlowTests(unittest.TestCase):
              patch.object(server, "_liepin_conversation_list_snapshot", return_value={"rows": rows, "success": True}):
             status, result = self.request("/api/conversations/ambiguous/sync", "POST")
         self.assertTrue(status.startswith("200"), result)
-        self.assertEqual(result["status"], "ambiguous")
+        self.assertEqual(result["status"], "unsupported_platform")
+        self.assertEqual(result["platform"], "liepin")
         detail = self.request("/api/conversations/ambiguous")[1]
         self.assertEqual(detail["messages"], [])
 
@@ -248,21 +250,113 @@ class ConversationWebFlowTests(unittest.TestCase):
         detail_status, detail = self.request("/api/conversations/assistant-lab%3Aassistant-lab%3Adefault")
         self.assertTrue(detail_status.startswith("200"), detail)
         self.assertEqual(len(detail["messages"]), 4)
-    def test_batch_sync_reports_loaded_contacts_without_active_chat(self):
-        from unittest.mock import patch
+    def test_batch_sync_allows_unique_company_fallback_for_history_card(self):
+        self.request('/api/conversations', 'POST', {
+            'id': 'boss-history', 'platform': 'boss', 'job_id': 'job-history',
+            'company_id': 'Example Co', 'hr_name': '',
+        })
+        synced_payload = {
+            'status': 'synced', 'message_count': 1, 'platform_message_count': 2,
+            'synced': {'inserted': [], 'conversation': {'hr_name': 'Recruiter'}},
+        }
+        with patch.object(server, '_opened_platform_rows', return_value=(
+            [{'target_id': 'boss-tab', 'url': 'https://www.zhipin.com/web/geek/chat'}],
+            [{'target_id': 'boss-tab', 'hr_name': 'Recruiter', 'company': 'Example Co'}],
+        )), patch.object(server, '_sync_platform_target', return_value=synced_payload) as sync_target:
+            status, result = self.request('/api/conversations/sync', 'POST', {'platforms': ['boss']})
 
-        with patch.object(server, "_boss_im_targets", return_value=[{"target_id": "boss", "url": "https://www.zhipin.com/web/geek/chat"}]), \
-             patch.object(server, "evaluate", return_value=json.dumps([
-                 {"hr_name": "刘先生", "company": "示例公司", "active": False},
-                 {"hr_name": "另一位 HR", "company": "另一家公司", "active": False},
-             ])):
+        self.assertTrue(status.startswith('200'), result)
+        self.assertTrue(result['success'])
+        self.assertTrue(result['complete'])
+        self.assertFalse(result['partial'])
+        self.assertEqual(result['status'], 'synced')
+        self.assertEqual(result['results'][0]['status'], 'synced')
+        self.assertEqual(result['results'][0]['message_count'], 1)
+        self.assertEqual(result['results'][0]['platform_message_count'], 2)
+        self.assertEqual(sync_target.call_count, 1)
+        self.assertEqual(sync_target.call_args.kwargs['row']['hr_name'], 'Recruiter')
+
+    def test_batch_sync_does_not_reuse_one_missing_id_row_for_two_jobs(self):
+        for conversation_id, job_id in (('boss-a', 'job-a'), ('boss-b', 'job-b')):
+            self.request('/api/conversations', 'POST', {
+                'id': conversation_id, 'platform': 'boss', 'job_id': job_id,
+                'company_id': 'Example Co', 'hr_name': '',
+            })
+        with patch.object(server, '_opened_platform_rows', return_value=(
+            [{'target_id': 'boss-tab', 'url': 'https://www.zhipin.com/web/geek/chat'}],
+            [{'target_id': 'boss-tab', 'hr_name': 'Recruiter', 'company': 'Example Co'}],
+        )), patch.object(server, '_sync_platform_target') as sync_target:
+            status, result = self.request('/api/conversations/sync', 'POST', {'platforms': ['boss']})
+
+        self.assertTrue(status.startswith('200'), result)
+        by_id = {item['conversation_id']: item for item in result['results']}
+        self.assertEqual(by_id['boss-a']['status'], 'ambiguous')
+        self.assertEqual(by_id['boss-b']['status'], 'ambiguous')
+        sync_target.assert_not_called()
+
+    def test_batch_sync_reports_loaded_contacts_without_active_chat(self):
+        with patch.object(server, "_opened_platform_rows") as opened:
             status, result = self.request(
                 "/api/conversations/sync", "POST", {"platforms": ["boss"]}
             )
         self.assertTrue(status.startswith("200"), result)
         self.assertEqual(result["results"][0]["status"], "no_active_conversation")
+        self.assertFalse(result["success"])
+        self.assertFalse(result["complete"])
+        self.assertFalse(result["partial"])
+        self.assertEqual(result["status"], "not_synced")
         self.assertEqual(result["results"][0]["updated"], 0)
         self.assertEqual(self.request("/api/conversations")[1]["conversations"], [])
+        opened.assert_not_called()
+
+    def test_batch_sync_reports_partial_per_card_results(self):
+        for conversation_id, job_id, hr_name in (
+            ("boss-a", "job-a", "Recruiter A"),
+            ("boss-b", "job-b", "Recruiter B"),
+        ):
+            self.request("/api/conversations", "POST", {
+                "id": conversation_id, "platform": "boss", "job_id": job_id,
+                "company_id": "Example Co", "hr_name": hr_name,
+            })
+        synced_payload = {
+            "status": "synced", "message_count": 1, "platform_message_count": 1,
+            "synced": {"inserted": [], "conversation": {"hr_name": "Recruiter A"}},
+        }
+
+        def score(local, row):
+            return 10 if local["id"] == "boss-a" and row.get("hr_name") == "Recruiter A" else 0
+
+        with patch.object(server, "_opened_platform_rows", return_value=(
+            [{"target_id": "boss-tab", "url": "https://www.zhipin.com/web/geek/chat"}],
+            [{"target_id": "boss-tab", "hr_name": "Recruiter A", "company": "Example Co"}],
+        )), patch.object(server, "_conversation_identity_score", side_effect=score), \
+             patch.object(server, "_sync_platform_target", return_value=synced_payload) as sync_target:
+            status, result = self.request("/api/conversations/sync", "POST", {"platforms": ["boss"]})
+
+        self.assertTrue(status.startswith("200"), result)
+        self.assertFalse(result["success"])
+        self.assertFalse(result["complete"])
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["status"], "partial")
+        by_id = {item["conversation_id"]: item for item in result["results"]}
+        self.assertEqual(by_id["boss-a"]["status"], "synced")
+        self.assertEqual(by_id["boss-b"]["status"], "not_loaded")
+        self.assertEqual(sync_target.call_count, 1)
+
+    def test_legacy_reply_route_is_disabled_without_touching_platform(self):
+        self.request("/api/conversations", "POST", {
+            "id": "legacy-reply", "platform": "boss", "job_id": "job-legacy", "hr_name": "HR",
+        })
+        with patch.object(server, "_opened_platform_rows") as opened, \
+                patch.object(server, "_send_message_in_chat") as send:
+            status, result = self.request(
+                "/api/conversations/legacy-reply/reply/send-legacy", "POST", {"message": "must not send"}
+            )
+        self.assertTrue(status.startswith("410"), result)
+        self.assertEqual(result["status"], "deprecated")
+        self.assertFalse(result["send_enabled"])
+        opened.assert_not_called()
+        send.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()
