@@ -146,6 +146,7 @@ from bosshunter.platform_delivery.zhilian import (
     _open_zhilian_conversation_row,
     _scan_zhilian_conversation_list,
     _zhilian_conversation_list_snapshot,
+    _zhilian_company_equal,
     _zhilian_im_targets,
 )
 from bosshunter.platform_delivery.liepin import _liepin_im_targets, _liepin_conversation_list_snapshot, _liepin_chat_snapshot
@@ -3524,6 +3525,52 @@ def _zhilian_identity_score(local: dict, row: dict) -> int:
     }.get(quality, 0)
 
 
+def _zhilian_reply_identity_score(local: dict, row: dict) -> int:
+    """Score an already-rendered row for a human reply.
+
+    Reply cards are backed by a delivered ``job_id``.  Some Zhilian sidebar
+    rows expose only recruiter and company (the job title is rendered in the
+    active header, not in the sidebar).  That is safe only when the recruiter
+    and company identify one unique rendered row; the caller still opens the
+    row and ``_open_zhilian_conversation_row`` performs the full header check.
+    Keep the normal sync scorer strict so this fallback cannot broaden batch
+    synchronization or attach history to another job.
+    """
+    external = str(row.get("conversation_id") or row.get("contact_id") or row.get("session_id") or "").strip()
+    local_external = str(local.get("external_conversation_id") or "").strip()
+    if external and local_external and external == local_external:
+        return 100
+    compact = lambda value: "".join(str(value or "").split()).casefold()
+    local_company = compact(local.get("job_company") or local.get("company_id"))
+    row_company = compact(row.get("company") or row.get("company_role"))
+    local_hr = compact(local.get("hr_name"))
+    row_hr = compact(row.get("hr_name") or row.get("name"))
+    if not local_company or not row_company or not _zhilian_company_equal(
+        local.get("job_company") or local.get("company_id") or "",
+        row.get("company") or row.get("company_role") or "",
+    ):
+        return 0
+    local_title = compact(local.get("job_title"))
+    row_title = compact(row.get("title") or row.get("job_title"))
+    if not local_hr or not row_hr:
+        # Historical delivery cards can lack the recruiter name. A unique
+        # company + recruiter row remains safe to open even when the sidebar
+        # omits the job title; the active header is checked again before the
+        # composer is touched. Never accept a company-only row.
+        if local_hr or not local_title or not row_hr:
+            return 0
+        if not row_title:
+            return 65
+        return 75 if (local_title == row_title or local_title in row_title or row_title in local_title) else 0
+    if local_hr != row_hr:
+        return 0
+    if local_title and row_title and (local_title == row_title or local_title in row_title or row_title in local_title):
+        return 90
+    # The title may be absent from the list row; uniqueness is enforced by
+    # _reply_platform_candidate before this score can select a row.
+    return 70
+
+
 def _open_boss_conversation_row(target_id: str, row: dict[str, Any], *, timeout: float = 5.0) -> dict[str, Any]:
     """Select one already-rendered BOSS chat row without navigating the tab."""
     external_id = str(row.get("conversation_id") or row.get("contact_id") or "").strip()
@@ -4171,7 +4218,14 @@ def _reply_platform_candidate(local: dict[str, Any]) -> tuple[dict[str, Any] | N
 		# Manual replies must never fall back to HR+company alone.  A recruiter
 		# can own several roles under one company, so the local card needs all
 		# three visible identity fields before a platform row can be selected.
-		if not all(
+		# Zhilian historical cards are the one exception: the recruiter name
+		# was not always persisted, but company + job title still scopes a
+		# unique rendered row. The scorer below rejects company-only matches and
+		# the open step rechecks the active header before sending.
+		if platform == "zhilian":
+			if not all(str(local.get(field) or "").strip() for field in ("job_company", "job_title")):
+				return None, None, "identity_incomplete"
+		elif not all(
 			str(local.get(field) or "").strip()
 			for field in ("hr_name", "job_company", "job_title")
 		):
@@ -4184,18 +4238,37 @@ def _reply_platform_candidate(local: dict[str, Any]) -> tuple[dict[str, Any] | N
 		row_external = str(row.get("conversation_id") or row.get("contact_id") or row.get("session_id") or "").strip()
 		if local_external and row_external and row_external != local_external:
 			continue
-		score = _zhilian_identity_score(local, row) if platform == "zhilian" else _conversation_identity_score(local, row)
+		score = _zhilian_reply_identity_score(local, row) if platform == "zhilian" else _conversation_identity_score(local, row)
 		if score:
 			candidates.append((score, row))
 	candidates.sort(key=lambda item: item[0], reverse=True)
 	unique: list[tuple[int, dict[str, Any]]] = []
-	seen: set[tuple[str, str, str]] = set()
+	seen: set[tuple[str, ...]] = set()
 	for score, row in candidates:
-		identity = (
-			str(row.get("target_id") or ""),
-			str(row.get("conversation_id") or row.get("contact_id") or row.get("session_id") or ""),
-			str(row.get("hr_name") or row.get("name") or ""),
-		)
+		external = str(
+			row.get("conversation_id") or row.get("contact_id") or row.get("session_id") or ""
+		).strip()
+		if platform == "zhilian" and not external:
+			# The same Zhilian inbox is often open in multiple tabs. Its
+			# sidebar rows may have no stable session id, so an exact visible
+			# identity is one candidate, not one candidate per browser tab.
+			# Keep preview/time in the key: different rendered messages must
+			# remain ambiguous rather than being silently merged.
+			normalize = lambda value: " ".join(str(value or "").split()).casefold()
+			identity = (
+				"zhilian-visible",
+				normalize(row.get("hr_name") or row.get("name")),
+				normalize(row.get("company") or row.get("company_role")),
+				normalize(row.get("title") or row.get("job_title")),
+				normalize(row.get("preview")),
+				normalize(row.get("time")),
+			)
+		else:
+			identity = (
+				str(row.get("target_id") or ""),
+				external,
+				str(row.get("hr_name") or row.get("name") or ""),
+			)
 		if identity not in seen:
 			seen.add(identity)
 			unique.append((score, row))
@@ -4203,7 +4276,18 @@ def _reply_platform_candidate(local: dict[str, Any]) -> tuple[dict[str, Any] | N
 		return None, None, "not_loaded"
 	if len(unique) > 1 and unique[0][0] == unique[1][0]:
 		return None, None, "ambiguous"
-	row = unique[0][1]
+	row = dict(unique[0][1])
+	if platform == "zhilian":
+		# The sidebar can omit the job title. Carry the local delivered-job
+		# identity into the open-step expectation; the active chat header is
+		# still checked against it before any composer interaction occurs.
+		if not str(row.get("title") or row.get("job_title") or "").strip():
+			row.setdefault("expected_hr_name", str(local.get("hr_name") or "").strip())
+			row.setdefault("expected_company", str(local.get("job_company") or local.get("company_id") or "").strip())
+			row.setdefault("expected_title", str(local.get("job_title") or "").strip())
+			row["hr_name"] = str(row.get("hr_name") or local.get("hr_name") or "").strip()
+			row["company"] = str(row.get("company") or local.get("job_company") or local.get("company_id") or "").strip()
+			row["title"] = str(row.get("title") or local.get("job_title") or "").strip()
 	target = next((item for item in targets if item["target_id"] == row.get("target_id")), None)
 	return target, row, None if target else "not_loaded"
 
@@ -4434,6 +4518,26 @@ def api_conversation_reply_send_idempotent(conversation_id):
 			return _reply_attempt_response(repo, user_id, conversation_id, idempotency_key, status, payload, 502)
 
 		try:
+			# A verified Zhilian reply has already opened the concrete HR chat.
+			# Persist that resolved identity before appending the local message so
+			# the card can immediately expose the real platform conversation link.
+			if platform == "zhilian":
+				resolved_url = normalize_platform_external_url(
+					platform,
+					result.get("url") or "",
+					kind="conversation",
+				) or ""
+				resolved_external = str(
+					result.get("external_conversation_id") or result.get("session_id") or ""
+				).strip()
+				if resolved_url or resolved_external or result.get("hr_name"):
+					repo.upsert_conversation({
+						**local,
+						"id": conversation_id,
+						"conversation_url": resolved_url or local.get("conversation_url"),
+						"external_conversation_id": resolved_external or local.get("external_conversation_id"),
+						"hr_name": result.get("hr_name") or local.get("hr_name"),
+					})
 			inserted = repo.append_messages(conversation_id, [IncomingMessage(
 				sender_type="user", content=message, message_time=None,
 				platform_message_id=f"manual-reply:{idempotency_key}",

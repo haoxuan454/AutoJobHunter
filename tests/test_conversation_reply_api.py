@@ -132,6 +132,78 @@ class ConversationReplyApiTests(unittest.TestCase):
         self.assertEqual(selected_row, row)
         self.assertIsNone(error)
 
+    def test_zhilian_reply_uses_unique_hr_company_when_sidebar_omits_title(self):
+        local = {
+            "platform": "zhilian", "external_conversation_id": "",
+            "hr_name": "Liu", "job_company": "Example Co", "job_title": "Python Engineer",
+        }
+        target = {"target_id": "tab", "url": "https://i.zhaopin.com/im?refcode=4019"}
+        row = {"target_id": "tab", "hr_name": "Liu", "company": "Example Co", "title": "", "session_id": "s1"}
+        with patch.object(server, "_opened_platform_rows", return_value=([target], [row])):
+            selected_target, selected_row, error = server._reply_platform_candidate(local)
+        self.assertEqual(selected_target, target)
+        self.assertEqual(selected_row["expected_title"], "Python Engineer")
+        self.assertEqual(selected_row["title"], "Python Engineer")
+        self.assertIsNone(error)
+
+    def test_zhilian_reply_uses_unique_company_title_when_local_hr_is_missing(self):
+        local = {
+            "platform": "zhilian", "external_conversation_id": "",
+            "hr_name": "", "job_company": "Example Co", "job_title": "Python Engineer",
+        }
+        target = {"target_id": "tab", "url": "https://i.zhaopin.com/im?refcode=4019"}
+        row = {"target_id": "tab", "hr_name": "Liu", "company": "Example Co", "title": "Python Engineer", "session_id": "s1"}
+        with patch.object(server, "_opened_platform_rows", return_value=([target], [row])):
+            selected_target, selected_row, error = server._reply_platform_candidate(local)
+        self.assertEqual(selected_target, target)
+        self.assertEqual(selected_row, row)
+        self.assertIsNone(error)
+
+    def test_zhilian_reply_does_not_use_company_only_when_local_hr_is_missing(self):
+        local = {
+            "platform": "zhilian", "external_conversation_id": "",
+            "hr_name": "", "job_company": "Example Co", "job_title": "Python Engineer",
+        }
+        target = {"target_id": "tab", "url": "https://i.zhaopin.com/im?refcode=4019"}
+        row = {"target_id": "tab", "hr_name": "", "company": "Example Co", "title": "", "session_id": "s1"}
+        with patch.object(server, "_opened_platform_rows", return_value=([target], [row])):
+            selected_target, selected_row, error = server._reply_platform_candidate(local)
+        self.assertIsNone(selected_target)
+        self.assertIsNone(selected_row)
+        self.assertEqual(error, "not_loaded")
+
+    def test_zhilian_reply_uses_unique_company_hr_when_sidebar_omits_title(self):
+        local = {
+            "platform": "zhilian", "external_conversation_id": "",
+            "hr_name": "", "job_company": "Example Co", "job_title": "Python Engineer",
+        }
+        target = {"target_id": "tab", "url": "https://i.zhaopin.com/im?refcode=4019"}
+        row = {"target_id": "tab", "hr_name": "Liu", "company": "Example Co", "title": "", "session_id": "s1"}
+        with patch.object(server, "_opened_platform_rows", return_value=([target], [row])):
+            selected_target, selected_row, error = server._reply_platform_candidate(local)
+        self.assertEqual(selected_target, target)
+        self.assertEqual(selected_row["expected_title"], "Python Engineer")
+        self.assertIsNone(error)
+
+    def test_zhilian_reply_rejects_two_same_hr_company_rows_without_title(self):
+        local = {
+            "platform": "zhilian", "external_conversation_id": "",
+            "hr_name": "Liu", "job_company": "Example Co", "job_title": "Python Engineer",
+        }
+        targets = [
+            {"target_id": "tab-a", "url": "https://i.zhaopin.com/im?refcode=4019"},
+            {"target_id": "tab-b", "url": "https://i.zhaopin.com/im?refcode=4019"},
+        ]
+        rows = [
+            {"target_id": "tab-a", "hr_name": "Liu", "company": "Example Co", "title": "", "session_id": "s1"},
+            {"target_id": "tab-b", "hr_name": "Liu", "company": "Example Co", "title": "", "session_id": "s2"},
+        ]
+        with patch.object(server, "_opened_platform_rows", return_value=(targets, rows)):
+            selected_target, selected_row, error = server._reply_platform_candidate(local)
+        self.assertIsNone(selected_target)
+        self.assertIsNone(selected_row)
+        self.assertEqual(error, "ambiguous")
+
     def test_zhilian_active_candidate_identity(self):
         local = {"platform": "zhilian", "external_conversation_id": "s1", "hr_name": "Liu", "job_company": "Example Co", "job_title": "Python Engineer"}
         target = {"target_id": "tab", "url": "https://i.zhaopin.com/im?sessionId=s1"}

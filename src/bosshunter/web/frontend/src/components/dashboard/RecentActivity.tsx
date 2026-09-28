@@ -1,6 +1,7 @@
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import type { HistoryItem } from '@/hooks/useDashboard'
+import { formatHistoryTime } from '@/lib/historyDisplay'
 
 interface RecentActivityProps {
   data: HistoryItem[]
@@ -21,12 +22,6 @@ const ACTION_LABELS: Record<string, string> = {
 }
 
 export function RecentActivity({ data }: RecentActivityProps) {
-  const formatTime = (dateStr: string) => {
-    if (!dateStr) return ''
-    const d = new Date(dateStr)
-    return `${(d.getMonth() + 1).toString().padStart(2, '0')}-${d.getDate().toString().padStart(2, '0')} ${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`
-  }
-
   if (!data.length) {
     return (
       <Card>
@@ -59,7 +54,7 @@ export function RecentActivity({ data }: RecentActivityProps) {
                     {item.company} · {item.title}
                   </span>
                 </div>
-                <time className="shrink-0 text-[11px] text-muted" dateTime={item.created_at}>{formatTime(item.created_at)}</time>
+                <time className="shrink-0 text-[11px] text-muted" dateTime={item.created_at}>{formatHistoryTime(item.created_at)}</time>
               </div>
             </div>
           ))}

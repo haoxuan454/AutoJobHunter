@@ -123,4 +123,19 @@ def send_conversation_reply(
     if opened.get("status") != "matched_chat_loaded" or not opened.get("success"):
         return {"success": False, "verified": False, "action_started": False,
                 "error": str(opened.get("status") or "conversation_not_loaded")}
-    return send_and_verify(target_id, message, read_snapshot=read_snapshot, send=send)
+    result = send_and_verify(target_id, message, read_snapshot=read_snapshot, send=send)
+    # Opening the matched chat resolves the concrete session URL even when
+    # the sidebar row had no session id. Preserve it for the caller so a
+    # verified reply can update the local card with a real HR-chat link.
+    for key in (
+        "url",
+        "external_conversation_id",
+        "session_id",
+        "hr_name",
+        "company",
+        "title",
+    ):
+        value = opened.get(key)
+        if value not in (None, ""):
+            result.setdefault(key, value)
+    return result
