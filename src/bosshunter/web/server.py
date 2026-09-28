@@ -15,6 +15,7 @@ import math
 import mimetypes
 import random
 import time
+from datetime import datetime, timedelta, timezone
 from copy import deepcopy
 from pathlib import Path
 from socketserver import ThreadingMixIn
@@ -123,14 +124,25 @@ from bosshunter.web.tasks import (
 	wait_for_initial_monitor_cooldown,
 )
 from bosshunter.conversations import ConversationRepository, IncomingMessage, normalize_platform_external_url
+from bosshunter.conversation_analytics import build_conversation_analytics
 from bosshunter.conversation_bridge import reconcile_verified_deliveries, sync_extracted_messages
 from bosshunter.conversation_scheduler import SerialConversationScheduler, init_scheduler_tables
 from bosshunter.platform_delivery import DeliveryContext, get_delivery_adapter
+from bosshunter.platform_delivery.reply import send_boss_reply, send_zhilian_reply
+from bosshunter.platform_delivery.reply.boss import (
+    local_message_matches_hash as boss_local_message_matches_hash,
+    normalize_reconciliation_text as boss_normalize_reconciliation_text,
+    outgoing_count as boss_reply_outgoing_count,
+    outgoing_matches as boss_reply_outgoing_matches,
+    snapshot_expression as boss_reply_snapshot_expression,
+)
+from bosshunter.platform_delivery.reply.zhilian import snapshot_expression as zhilian_reply_snapshot_expression
 from bosshunter.platform_delivery.zhilian import (
     _active_zhilian_conversation_snapshot,
     _conversation_message_snapshot,
     _fill_and_send_zhilian_message,
     _match_zhilian_conversation_row,
+    _match_zhilian_sync_identity,
     _open_zhilian_conversation_row,
     _scan_zhilian_conversation_list,
     _zhilian_conversation_list_snapshot,
@@ -2891,103 +2903,10 @@ def api_notification_dispatch(item_id):
 def api_conversation_analytics():
 	conn = _get_web_db()
 	try:
-		# Analytics must also work on a brand-new local database. Every series is
-		# derived from persisted rows; an empty database returns empty arrays.
 		ConversationRepository(conn)
-		# Keep analytics on the same public scope as /api/conversations: real
-		# delivered-job cards only. Assistant-lab and old sync:* records are
-		# useful for their own sandbox, but must not affect user-facing metrics.
-		visible = """c.job_id IS NOT NULL
-			AND TRIM(c.job_id) <> ''
-			AND c.job_id NOT LIKE 'sync:%'
-			AND c.platform IN ('boss', 'zhilian', 'liepin', '51job')"""
-		rows = conn.execute(f"SELECT c.status, COUNT(*) AS count FROM conv_conversations c WHERE {visible} GROUP BY c.status ORDER BY count DESC").fetchall()
-		message_rows = conn.execute(f"""SELECT m.sender_type, COUNT(*) AS count
-			FROM conv_messages m JOIN conv_conversations c ON c.id = m.conversation_id
-			WHERE {visible} GROUP BY m.sender_type ORDER BY count DESC""").fetchall()
-		platform_rows = conn.execute(f"SELECT c.platform, COUNT(*) AS count FROM conv_conversations c WHERE {visible} GROUP BY c.platform ORDER BY count DESC").fetchall()
-		platform_metric_rows = conn.execute("""
-			SELECT c.platform,
-			       COUNT(DISTINCT c.id) AS conversations,
-			       COUNT(DISTINCT CASE WHEN m.sender_type = 'hr' THEN c.id END) AS replied_conversations,
-			       ROUND(100.0 * COUNT(DISTINCT CASE WHEN m.sender_type = 'hr' THEN c.id END) / NULLIF(COUNT(DISTINCT c.id), 0), 1) AS reply_rate
-			FROM conv_conversations c
-			LEFT JOIN conv_messages m ON m.conversation_id = c.id
-			WHERE c.job_id IS NOT NULL AND TRIM(c.job_id) <> ''
-			  AND c.job_id NOT LIKE 'sync:%'
-			  AND c.platform IN ('boss', 'zhilian', 'liepin', '51job')
-			GROUP BY c.platform ORDER BY conversations DESC
-		""").fetchall()
-		daily_rows = conn.execute("""
-			SELECT substr(COALESCE(m.message_time, m.created_at), 1, 10) AS day,
-			       COUNT(DISTINCT CASE WHEN m.sender_type = 'user' THEN m.conversation_id END) AS deliveries,
-			       COUNT(DISTINCT CASE WHEN m.sender_type = 'hr' THEN m.conversation_id END) AS replied_conversations,
-			       COUNT(CASE WHEN m.sender_type = 'user' THEN 1 END) AS outgoing_messages,
-			       COUNT(CASE WHEN m.sender_type = 'hr' THEN 1 END) AS incoming_messages
-			FROM conv_messages m
-			JOIN conv_conversations c ON c.id = m.conversation_id
-			WHERE c.job_id IS NOT NULL AND TRIM(c.job_id) <> ''
-			  AND c.job_id NOT LIKE 'sync:%'
-			  AND c.platform IN ('boss', 'zhilian', 'liepin', '51job')
-			GROUP BY day ORDER BY day
-		""").fetchall()
-		job_direction_rows = conn.execute("""
-			SELECT COALESCE(NULLIF(TRIM(j.title), ''), '未关联岗位') AS label,
-			       COUNT(DISTINCT c.id) AS conversations,
-			       COUNT(CASE WHEN m.sender_type = 'hr' THEN 1 END) AS hr_messages
-			FROM conv_conversations c
-			LEFT JOIN jobs j ON j.id = c.job_id
-			LEFT JOIN conv_messages m ON m.conversation_id = c.id
-			WHERE c.job_id IS NOT NULL AND TRIM(c.job_id) <> ''
-			  AND c.job_id NOT LIKE 'sync:%'
-			  AND c.platform IN ('boss', 'zhilian', 'liepin', '51job')
-			GROUP BY label ORDER BY conversations DESC, label LIMIT 30
-		""").fetchall() if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'").fetchone() else []
-		score_rows = conn.execute("""
-			SELECT CASE
-			         WHEN c.interest_score IS NULL THEN '未评分'
-			         WHEN c.interest_score < 40 THEN '0-39'
-			         WHEN c.interest_score < 60 THEN '40-59'
-			         WHEN c.interest_score < 80 THEN '60-79'
-			         ELSE '80-100'
-			       END AS score_range,
-			       COUNT(DISTINCT c.id) AS conversations,
-			       COUNT(DISTINCT CASE WHEN EXISTS (
-			         SELECT 1 FROM conv_messages hm
-			         WHERE hm.conversation_id = c.id AND hm.sender_type = 'hr'
-			       ) THEN c.id END) AS replied_conversations
-			FROM conv_conversations c
-			WHERE c.job_id IS NOT NULL AND TRIM(c.job_id) <> ''
-			  AND c.job_id NOT LIKE 'sync:%'
-			  AND c.platform IN ('boss', 'zhilian', 'liepin', '51job')
-			GROUP BY score_range ORDER BY score_range
-		""").fetchall()
-		keyword_rows = conn.execute("""
-			SELECT content, COUNT(*) AS count
-			FROM conv_messages m JOIN conv_conversations c ON c.id = m.conversation_id
-			WHERE m.sender_type = 'hr' AND TRIM(m.content) <> ''
-			  AND c.job_id IS NOT NULL AND TRIM(c.job_id) <> ''
-			  AND c.job_id NOT LIKE 'sync:%'
-			  AND c.platform IN ('boss', 'zhilian', 'liepin', '51job')
-			GROUP BY content ORDER BY count DESC, content LIMIT 20
-		""").fetchall()
-		return _json_response({
-			"conversations_total": conn.execute(f"SELECT COUNT(*) FROM conv_conversations c WHERE {visible}").fetchone()[0],
-			"messages_total": conn.execute(f"SELECT COUNT(*) FROM conv_messages m JOIN conv_conversations c ON c.id = m.conversation_id WHERE {visible}").fetchone()[0],
-			"confirmed_public_facts": conn.execute("SELECT COUNT(*) FROM know_facts WHERE fact_status = 'confirmed' AND public_allowed = 1").fetchone()[0] if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='know_facts'").fetchone() else 0,
-			"salary_paused": conn.execute(f"SELECT COUNT(*) FROM conv_conversations c WHERE {visible} AND c.status = 'paused_salary'").fetchone()[0],
-			"by_status": [dict(row) for row in rows],
-			"messages_by_sender": [dict(row) for row in message_rows],
-			"by_platform": [dict(row) for row in platform_rows],
-			"platform_metrics": [dict(row) for row in platform_metric_rows],
-			"daily_trend": [dict(row) for row in daily_rows],
-			"job_directions": [dict(row) for row in job_direction_rows],
-			"score_reply_rate": [dict(row) for row in score_rows],
-			"hr_question_keywords": [dict(row) for row in keyword_rows],
-		})
+		return _json_response(build_conversation_analytics(conn, _current_conversation_user_id()))
 	finally:
 		conn.close()
-
 
 @app.route("/api/conversations/scheduler/next")
 def api_conversation_scheduler_next():
@@ -4126,6 +4045,22 @@ def api_conversation_draft(conversation_id):
 	})
 
 
+@app.route("/api/conversations/<conversation_id>/draft/<draft_id:int>", method="DELETE")
+def api_conversation_draft_delete(conversation_id, draft_id):
+	conversation_id = _decoded_conversation_id(conversation_id)
+	user_id = _current_conversation_user_id()
+	repo = _conversation_repo()
+	try:
+		conversation = repo.get_conversation(conversation_id)
+		if not conversation or conversation.get("user_id") != user_id:
+			return _json_response({"error": "会话不存在"}, 404)
+		if not repo.delete_draft(conversation_id, draft_id, user_id=user_id):
+			return _json_response({"error": "草稿不存在"}, 404)
+		return _json_response({"success": True, "conversation_id": conversation_id, "draft_id": draft_id})
+	finally:
+		repo.conn.close()
+
+
 def _reply_platform_candidate(local: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
 	"""Find exactly one already-rendered platform chat for a local card.
 
@@ -4137,6 +4072,47 @@ def _reply_platform_candidate(local: dict[str, Any]) -> tuple[dict[str, Any] | N
 	if platform not in {"boss", "zhilian"}:
 		return None, None, "unsupported_platform"
 	local_external = str(local.get("external_conversation_id") or "").strip()
+	if platform == "zhilian" and local_external:
+		# Prefer an exact active session. This avoids sidebar scanning while still
+		# requiring an HR, company, and job-title identity match.
+		if not all(str(local.get(field) or "").strip() for field in ("hr_name", "job_company", "job_title")):
+			return None, None, "identity_incomplete"
+		active_matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+		for target in _zhilian_im_targets():
+			try:
+				active = _active_zhilian_conversation_snapshot(target["target_id"])
+			except Exception:
+				continue
+			active_id = str(active.get("external_conversation_id") or active.get("session_id") or "").strip()
+			if not active.get("success") or active_id != local_external:
+				continue
+			active_identity = {
+				"hr_name": active.get("hr_name") or "",
+				"company": active.get("company") or "",
+				"title": active.get("title") or "",
+			}
+			expected_identity = {
+				"hr_name": local.get("hr_name") or "",
+				"company": local.get("job_company") or local.get("company_id") or "",
+				"title": local.get("job_title") or "",
+			}
+			matched, _quality = _match_zhilian_sync_identity(active_identity, expected_identity)
+			if not matched:
+				return None, None, "identity_mismatch"
+			row = {
+				"session_id": active_id,
+				"conversation_id": active_id,
+				**active_identity,
+				"active_chat": True,
+				"expected_hr_name": expected_identity["hr_name"],
+				"expected_company": expected_identity["company"],
+				"expected_title": expected_identity["title"],
+			}
+			active_matches.append((target, row))
+		if len(active_matches) > 1:
+			return None, None, "ambiguous"
+		if active_matches:
+			return active_matches[0][0], active_matches[0][1], None
 	if not local_external:
 		# Manual replies must never fall back to HR+company alone.  A recruiter
 		# can own several roles under one company, so the local card needs all
@@ -4152,7 +4128,7 @@ def _reply_platform_candidate(local: dict[str, Any]) -> tuple[dict[str, Any] | N
 	candidates: list[tuple[int, dict[str, Any]]] = []
 	for row in rows:
 		row_external = str(row.get("conversation_id") or row.get("contact_id") or row.get("session_id") or "").strip()
-		if local_external and row_external != local_external:
+		if local_external and row_external and row_external != local_external:
 			continue
 		score = _zhilian_identity_score(local, row) if platform == "zhilian" else _conversation_identity_score(local, row)
 		if score:
@@ -4176,6 +4152,105 @@ def _reply_platform_candidate(local: dict[str, Any]) -> tuple[dict[str, Any] | N
 	row = unique[0][1]
 	target = next((item for item in targets if item["target_id"] == row.get("target_id")), None)
 	return target, row, None if target else "not_loaded"
+
+
+def _reconcile_boss_unknown_attempts(
+    repo: ConversationRepository,
+    user_id: str,
+    local: dict[str, Any],
+    *,
+    idempotency_key: str = "",
+) -> dict[str, Any]:
+    """Safely settle BOSS ``unknown`` attempts using the active chat only.
+
+    A send can reach BOSS while the immediate DOM verification races the page
+    update.  Before allowing a new reply, use two independent local/browser
+    facts: the exact message hash must already exist once in the local sent
+    messages, and the uniquely matched active BOSS chat must currently expose
+    that outgoing text.  This function never clicks, navigates, types, or
+    sends; failures leave the attempt unresolved so the existing 409 guard
+    remains in force.
+    """
+    if str(local.get("platform") or "").lower() != "boss":
+        return {"status": "skipped", "reconciled": 0}
+    # An existing idempotency key must remain under the original state
+    # machine.  In particular, retrying an existing ``not_sent`` key must not
+    # trigger a browser read before ``claim_send_attempt`` can observe an
+    # unresolved attempt for another key.  Only a genuinely new key may use
+    # this read-only recovery path.
+    if idempotency_key and repo.get_send_attempt(user_id, str(local.get("id") or ""), idempotency_key):
+        return {"status": "existing_attempt", "reconciled": 0}
+    attempts = repo.list_send_attempts(user_id, str(local.get("id") or ""), statuses=("unknown",))
+    if not attempts:
+        return {"status": "no_unknown_attempts", "reconciled": 0}
+
+    target, row, locate_error = _reply_platform_candidate(local)
+    if locate_error or not target or not row or row.get("active") is not True:
+        return {"status": locate_error or "active_chat_not_loaded", "reconciled": 0}
+
+    local_messages = [
+        item for item in repo.list_messages(str(local.get("id") or ""))
+        if str(item.get("sender_type") or "") == "user" and bool(item.get("is_sent"))
+    ]
+    reconciled = 0
+    for attempt in attempts:
+        matches = [
+            item for item in local_messages
+            if boss_local_message_matches_hash(item.get("content"), str(attempt.get("message_hash") or ""))
+        ]
+        # More than one local candidate would make the evidence ambiguous.
+        if len(matches) != 1:
+            continue
+        expected = boss_normalize_reconciliation_text(matches[0].get("content"))
+        try:
+            snapshot = evaluate(target["target_id"], boss_reply_snapshot_expression(expected), timeout=10)
+            count = boss_reply_outgoing_count(snapshot)
+            dom_matches = boss_reply_outgoing_matches(snapshot)
+        except Exception:
+            count, dom_matches = None, []
+        if count is None or count < 1:
+            continue
+        # Identical BOSS messages can appear several times in one chat.  A
+        # count-only match is therefore insufficient for settling an unknown
+        # attempt.  When the page exposes the Vue message timestamp, require
+        # exactly one DOM message within a small window of the persisted
+        # attempt time.  Older/test snapshots without metadata remain
+        # conservative and are not reconciled.
+        timestamp_candidates: list[dict[str, Any]] = []
+        try:
+            updated_at = str(attempt.get("updated_at") or "").replace("Z", "+00:00")
+            attempt_time = datetime.fromisoformat(updated_at)
+            if attempt_time.tzinfo is None:
+                attempt_time = attempt_time.replace(tzinfo=timezone.utc)
+            attempt_epoch_ms = attempt_time.astimezone(timezone.utc).timestamp() * 1000
+            for item in dom_matches:
+                dom_epoch_ms = float(item.get("time"))
+                if abs(dom_epoch_ms - attempt_epoch_ms) <= timedelta(minutes=5).total_seconds() * 1000:
+                    timestamp_candidates.append(item)
+        except (TypeError, ValueError, OverflowError):
+            timestamp_candidates = []
+        if len(timestamp_candidates) != 1:
+            continue
+        repo.update_send_attempt(
+            user_id=user_id,
+            conversation_id=str(local.get("id") or ""),
+            idempotency_key=str(attempt.get("idempotency_key") or ""),
+            status="sent",
+            response={
+                "success": True,
+                "status": "sent",
+                "platform": "boss",
+                "conversation_id": str(local.get("id") or ""),
+                "verification": "boss_unknown_reconciled_from_local_message_and_active_dom",
+                "reconciled": True,
+                "existing_local_message_id": matches[0].get("id"),
+                "dom_match_count": count,
+                "dom_match_id": timestamp_candidates[0].get("mid"),
+            },
+            http_status=200,
+        )
+        reconciled += 1
+    return {"status": "reconciled" if reconciled else "not_reconciled", "reconciled": reconciled}
 
 
 def _reply_attempt_response(repo, user_id: str, conversation_id: str, idempotency_key: str, status: str, payload: dict[str, Any], http_status: int):
@@ -4224,6 +4299,16 @@ def api_conversation_reply_send_idempotent(conversation_id):
 			return _json_response({"status": "conversation_not_sendable", "platform": platform, "conversation_id": conversation_id, "conversation_status": local.get("status")}, 409)
 
 		message_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
+		if platform == "boss":
+			# A previous BOSS action may have reached the page after the original
+			# verification window. Reconcile it read-only before the idempotency
+			# gate; unresolved evidence must continue to block new sends.
+			_reconcile_boss_unknown_attempts(
+				repo,
+				user_id,
+				local,
+				idempotency_key=idempotency_key,
+			)
 		attempt, claimed = repo.claim_send_attempt(
 			user_id=user_id,
 			conversation_id=conversation_id,
@@ -4231,6 +4316,16 @@ def api_conversation_reply_send_idempotent(conversation_id):
 			message_hash=message_hash,
 			platform=platform,
 		)
+		if (
+			attempt.get("idempotency_key") != idempotency_key
+			and attempt.get("status") in {"pending", "unknown"}
+		):
+			return _json_response({
+				"status": "unresolved_send_attempt",
+				"conversation_id": conversation_id,
+				"previous_status": attempt.get("status"),
+				"error": "a previous reply may already have been sent; verify the platform conversation before trying again",
+			}, 409)
 		if attempt.get("message_hash") != message_hash:
 			return _json_response({"status": "idempotency_conflict", "conversation_id": conversation_id}, 409)
 		if not claimed:
@@ -4245,47 +4340,39 @@ def api_conversation_reply_send_idempotent(conversation_id):
 			status_code = 409 if locate_error in {"ambiguous", "identity_incomplete"} else 503
 			return _reply_attempt_response(repo, user_id, conversation_id, idempotency_key, "not_sent", {"status": locate_error, "platform": platform, "conversation_id": conversation_id, "error": "platform conversation could not be selected safely"}, status_code)
 		assert target is not None and row is not None
-		verification = ""
-		verified = False
-		action_started = False
-		if platform == "boss":
-			opened = _open_boss_conversation_row(target["target_id"], row)
-			if opened.get("status") != "matched_chat_loaded":
-				return _reply_attempt_response(repo, user_id, conversation_id, idempotency_key, "not_sent", {"status": str(opened.get("status") or "not_loaded"), "platform": platform, "conversation_id": conversation_id}, 409)
-			expected = " ".join(message.split())
-			try:
-				before = _parse_browser_json(evaluate(target["target_id"], JS_EXTRACT_CONVERSATION, timeout=10))
-			except Exception:
-				before = None
-			before_count = sum(1 for item in before if isinstance(item, dict) and str(item.get("sender") or "").lower() in {"me", "user"} and " ".join(str(item.get("text") or item.get("content") or "").split()) == expected) if isinstance(before, list) else None
-			send_started = bool(_send_message_in_chat(target["target_id"], message))
-			action_started = send_started
-			if send_started and before_count is not None:
-				for attempt_no in range(3):
-					try:
-						after = _parse_browser_json(evaluate(target["target_id"], JS_EXTRACT_CONVERSATION, timeout=10))
-					except Exception:
-						after = []
-					after_count = sum(1 for item in after if isinstance(item, dict) and str(item.get("sender") or "").lower() in {"me", "user"} and " ".join(str(item.get("text") or item.get("content") or "").split()) == expected)
-					if after_count > before_count:
-						verified = True
-						break
-					if attempt_no < 2:
-						time.sleep(0.4)
-			verification = "boss_new_dom_message"
-		else:
-			opened = _open_zhilian_conversation_row(target["target_id"], row)
-			if opened.get("status") != "matched_chat_loaded" or not opened.get("success"):
-				return _reply_attempt_response(repo, user_id, conversation_id, idempotency_key, "not_sent", {"status": str(opened.get("status") or "not_loaded"), "platform": platform, "conversation_id": conversation_id}, 409)
-			result = _fill_and_send_zhilian_message(target["target_id"], message)
-			result_success = bool(result.get("success"))
-			verified = bool(result_success and result.get("verified"))
-			verification = str(result.get("verification") or "zhilian_new_dom_message")
-			# A successful platform action without a matching DOM message is
-			# deliberately unknown: the browser may have accepted the message,
-			# so retrying could duplicate it.  A failed adapter action is safe to
-			# classify as not_sent and may be retried with a new request key.
-			action_started = result_success or result.get("error") == "message_sent_not_verified"
+		try:
+			if platform == "boss":
+				result = send_boss_reply(
+					target["target_id"], row, message,
+					open_chat=_open_boss_conversation_row,
+					read_snapshot=lambda target_id, text: evaluate(
+						target_id, boss_reply_snapshot_expression(text), timeout=10
+					),
+					send=_send_message_in_chat,
+				)
+			else:
+				result = send_zhilian_reply(
+					target["target_id"], row, message,
+					open_chat=_open_zhilian_conversation_row,
+					read_snapshot=lambda target_id, text: evaluate(
+						target_id, zhilian_reply_snapshot_expression(text), timeout=10
+					),
+					send=_fill_and_send_zhilian_message,
+				)
+		except Exception as exc:
+			payload = {"status": "send_unknown", "platform": platform, "conversation_id": conversation_id,
+				"error": "reply adapter failed unexpectedly; verify the platform chat before retrying",
+				"detail": str(exc)[:200]}
+			return _reply_attempt_response(repo, user_id, conversation_id, idempotency_key, "unknown", payload, 502)
+		verified = bool(result.get("verified"))
+		action_started = bool(result.get("action_started"))
+		verification = str(result.get("verification") or f"{platform}_new_dom_message")
+		if result.get("error") in {"matched_chat_loaded", "conversation_not_loaded", "not_loaded", "conversation_open_exception"}:
+			return _reply_attempt_response(
+				repo, user_id, conversation_id, idempotency_key, "not_sent",
+				{"status": str(result.get("error")), "platform": platform, "conversation_id": conversation_id,
+				 "error": "platform conversation could not be opened safely"}, 409,
+			)
 
 		if not verified:
 			status = "unknown" if action_started else "not_sent"

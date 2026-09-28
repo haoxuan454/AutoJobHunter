@@ -1,7 +1,7 @@
 import sqlite3
 import unittest
 
-from bosshunter.conversation_bridge import sync_extracted_messages
+from bosshunter.conversation_bridge import reconcile_verified_deliveries, sync_extracted_messages
 
 
 class ConversationBridgeTests(unittest.TestCase):
@@ -226,6 +226,36 @@ class ConversationBridgeTests(unittest.TestCase):
             ).fetchone()[0],
             0,
         )
+
+    def test_verified_delivery_reconciliation_uses_history_time_and_is_idempotent(self):
+        self.conn.executescript("""
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY, status TEXT, source_platform TEXT, deleted_at TEXT,
+                company TEXT, title TEXT, hr_name TEXT, hr_title TEXT, url TEXT,
+                score INTEGER, updated_at TEXT
+            );
+            CREATE TABLE history (
+                id INTEGER PRIMARY KEY, job_id TEXT, action TEXT, created_at TEXT
+            );
+            INSERT INTO jobs VALUES (
+                'job-sent', 'sent', 'zhilian', NULL, 'Example', 'Python 后端',
+                '刘先生', 'HR', 'https://example.test/job-sent', 88, '2026-09-27 12:00:00'
+            );
+            INSERT INTO history(job_id, action, created_at)
+            VALUES ('job-sent', 'sent', '2026-09-26 08:15:00');
+        """)
+
+        first = reconcile_verified_deliveries(self.conn)
+        second = reconcile_verified_deliveries(self.conn)
+
+        self.assertEqual(first, {"created": 1, "events_inserted": 1, "skipped_deleted": 0})
+        self.assertEqual(second, {"created": 0, "events_inserted": 0, "skipped_deleted": 0})
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM conv_conversations").fetchone()[0], 1)
+        message = self.conn.execute(
+            "SELECT message_time, content FROM conv_messages"
+        ).fetchone()
+        self.assertEqual(message["message_time"], "2026-09-26 08:15:00")
+        self.assertEqual(message["content"], "历史记录确认已投递；原始招呼正文未保存")
 
     def test_unique_job_pool_match_replaces_synthetic_job_id_and_exposes_join_context(self):
         self.conn.executescript("""

@@ -585,6 +585,23 @@ def _open_zhilian_conversation_row(
     signature, scroll that row into the sidebar viewport, then click it. Never
     fall back to a stale list index: a reordered list could open another HR.
     """
+    if bool(row.get("active_chat")):
+        expected_session = str(row.get("session_id") or row.get("conversation_id") or "").strip()
+        active = _active_zhilian_conversation_snapshot(target_id)
+        active_session = str(active.get("session_id") or active.get("external_conversation_id") or "").strip()
+        expected = {"hr_name": row.get("expected_hr_name") or "", "company": row.get("expected_company") or "", "title": row.get("expected_title") or ""}
+        actual = {"hr_name": active.get("hr_name") or "", "company": active.get("company") or "", "title": active.get("title") or ""}
+        if not expected_session or active_session != expected_session:
+            return {"status": "active_session_mismatch", "opened": False}
+        if not all(str(expected.get(key) or "").strip() for key in ("hr_name", "company", "title")):
+            return {"status": "identity_incomplete", "opened": False}
+        if not active.get("success"):
+            return {"status": "active_chat_unreadable", "opened": False}
+        matched, quality = _match_zhilian_sync_identity(actual, expected)
+        if not matched:
+            return {"status": "active_identity_mismatch", "opened": False}
+        return {**active, "status": "matched_chat_loaded", "success": True, "opened": False, "active_chat": True, "match_quality": quality}
+
     signature = str(row.get("signature") or "")
     session_id = str(row.get("session_id") or row.get("conversation_id") or "")
     if not session_id and bool(row.get("identity_ambiguous")):
@@ -973,13 +990,13 @@ def _fill_and_send_zhilian_message(target_id: str, message: str) -> dict[str, An
         """, timeout=10))
         if matching_outgoing > before_count and composer.get("empty"):
             if first_verified_snapshot is not None:
-                return {"success": True, "verified": True, "verification": "new_outgoing_message_and_empty_composer"}
+                return {"success": True, "verified": True, "action_started": True, "verification": "new_outgoing_message_and_empty_composer"}
             first_verified_snapshot = current_messages
             time.sleep(0.8)
             continue
         first_verified_snapshot = None
         time.sleep(0.4)
-    return {"success": False, "error": "message_sent_not_verified"}
+    return {"success": False, "error": "message_sent_not_verified", "action_started": True}
 
 
 class ZhilianDeliveryAdapter:

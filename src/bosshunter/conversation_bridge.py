@@ -117,7 +117,10 @@ def reconcile_verified_deliveries(conn, *, user_id: str = "default") -> dict[str
 
     repo = ConversationRepository(conn)
     rows = conn.execute(
-        """SELECT j.* FROM jobs j
+        """SELECT j.*,
+                  (SELECT MIN(h.created_at) FROM history h
+                   WHERE h.job_id = j.id AND h.action = 'sent') AS verified_sent_at
+           FROM jobs j
            WHERE j.deleted_at IS NULL
              AND j.status IN ('sent','replied','resume_sent','needs_resume','follow_up_sent')
              AND EXISTS (SELECT 1 FROM history h WHERE h.job_id=j.id AND h.action='sent')
@@ -163,6 +166,7 @@ def reconcile_verified_deliveries(conn, *, user_id: str = "default") -> dict[str
         inserted = repo.append_messages(conversation_id, [IncomingMessage(
             sender_type="system",
             content="历史记录确认已投递；原始招呼正文未保存",
+            message_time=str(job.get("verified_sent_at") or "") or None,
             platform_message_id=event_id,
             source_url=str(job.get("url") or ""),
             raw_payload={"source": "local_delivery_reconciliation", "action": "sent"},

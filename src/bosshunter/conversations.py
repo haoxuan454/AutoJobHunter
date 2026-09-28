@@ -703,6 +703,18 @@ class ConversationRepository:
         row = self.conn.execute("SELECT * FROM conv_drafts WHERE id = ?", (cursor.lastrowid,)).fetchone()
         return dict(row)
 
+    def delete_draft(self, conversation_id: str, draft_id: int, user_id: str = "default") -> bool:
+        """Delete one draft only when both its conversation and owner match."""
+        conversation = self.get_conversation(conversation_id)
+        if not conversation or conversation.get("user_id") != user_id:
+            return False
+        cursor = self.conn.execute(
+            "DELETE FROM conv_drafts WHERE id = ? AND conversation_id = ?",
+            (int(draft_id), conversation_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
     def get_send_attempt(self, user_id: str, conversation_id: str, idempotency_key: str) -> dict[str, Any] | None:
         row = self.conn.execute(
             """SELECT * FROM conv_send_attempts
@@ -717,6 +729,40 @@ class ConversationRepository:
         except (TypeError, json.JSONDecodeError):
             result["response"] = {}
         return result
+
+    def list_send_attempts(
+        self,
+        user_id: str,
+        conversation_id: str,
+        *,
+        statuses: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """List reply attempts for one local conversation.
+
+        The caller owns any platform-side reconciliation.  Keeping this query
+        in the repository makes that reconciliation explicit and prevents
+        platform adapters from reaching into SQLite directly.
+        """
+        params: list[Any] = [user_id, conversation_id]
+        where = "user_id = ? AND conversation_id = ?"
+        normalized_statuses = [str(status).strip() for status in (statuses or []) if str(status).strip()]
+        if normalized_statuses:
+            placeholders = ", ".join("?" for _ in normalized_statuses)
+            where += f" AND status IN ({placeholders})"
+            params.extend(normalized_statuses)
+        rows = self.conn.execute(
+            f"SELECT * FROM conv_send_attempts WHERE {where} ORDER BY updated_at DESC, id DESC",
+            params,
+        ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["response"] = json.loads(item.get("response_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                item["response"] = {}
+            results.append(item)
+        return results
 
     def create_send_attempt(
         self,
@@ -765,6 +811,16 @@ class ConversationRepository:
                 (user_id, conversation_id, idempotency_key),
             ).fetchone()
             if row is None:
+                unresolved = self.conn.execute(
+                    """SELECT * FROM conv_send_attempts
+                       WHERE user_id = ? AND conversation_id = ?
+                         AND status IN ('pending', 'unknown')
+                       ORDER BY updated_at DESC, id DESC LIMIT 1""",
+                    (user_id, conversation_id),
+                ).fetchone()
+                if unresolved is not None:
+                    self.conn.rollback()
+                    return dict(unresolved), False
                 self.conn.execute(
                     """INSERT INTO conv_send_attempts
                        (user_id, conversation_id, idempotency_key, message_hash, platform, status)
@@ -779,6 +835,16 @@ class ConversationRepository:
                 self.conn.rollback()
                 return self.get_send_attempt(user_id, conversation_id, idempotency_key) or current, False
             if current.get("status") == "not_sent":
+                unresolved = self.conn.execute(
+                    """SELECT * FROM conv_send_attempts
+                       WHERE user_id = ? AND conversation_id = ?
+                         AND idempotency_key != ? AND status IN ('pending', 'unknown')
+                       ORDER BY updated_at DESC, id DESC LIMIT 1""",
+                    (user_id, conversation_id, idempotency_key),
+                ).fetchone()
+                if unresolved is not None:
+                    self.conn.rollback()
+                    return dict(unresolved), False
                 cursor = self.conn.execute(
                     """UPDATE conv_send_attempts
                        SET status = 'pending', updated_at = ?

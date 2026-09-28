@@ -2,6 +2,7 @@ import io
 import hashlib
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -48,6 +49,13 @@ class ConversationReplyApiTests(unittest.TestCase):
                 response.close()
         return status["value"], json.loads(text)
 
+    @staticmethod
+    def snapshot(count=0, matches=None):
+        payload = {"success": True, "chatFound": True, "count": count}
+        if matches is not None:
+            payload["matches"] = matches
+        return json.dumps(payload)
+
     def add_job_and_conversation(self, *, platform, conversation_id, external_conversation_id="external-1"):
         conn = server._get_web_db()
         try:
@@ -76,7 +84,7 @@ class ConversationReplyApiTests(unittest.TestCase):
         with patch.object(server, "_opened_platform_rows", return_value=([{"target_id": "boss-tab", "url": "https://www.zhipin.com/web/geek/chat"}], [row])), \
              patch.object(server, "_open_boss_conversation_row", return_value={"status": "matched_chat_loaded"}), \
              patch.object(server, "_send_message_in_chat", return_value=True), \
-             patch.object(server, "evaluate", side_effect=[json.dumps([]), json.dumps([{"sender": "me", "text": "感谢您的联系"}])]):
+             patch.object(server, "evaluate", side_effect=[self.snapshot(0), self.snapshot(1)]):
             status, result = self.request(
                 "/api/conversations/boss-reply/reply/send", "POST", {"message": "感谢您的联系"}
             )
@@ -91,7 +99,7 @@ class ConversationReplyApiTests(unittest.TestCase):
         with patch.object(server, "_opened_platform_rows", return_value=([{"target_id": "boss-tab", "url": "https://www.zhipin.com/web/geek/chat"}], [row])), \
              patch.object(server, "_open_boss_conversation_row", return_value={"status": "matched_chat_loaded"}), \
              patch.object(server, "_send_message_in_chat", return_value=True), \
-             patch.object(server, "evaluate", return_value=json.dumps([])):
+             patch.object(server, "evaluate", return_value=self.snapshot(0)):
             status, result = self.request(
                 "/api/conversations/boss-unverified/reply/send", "POST", {"message": "未确认消息"}
             )
@@ -105,7 +113,8 @@ class ConversationReplyApiTests(unittest.TestCase):
         row = {"target_id": "zhilian-tab", "hr_name": "刘先生", "company": "Example Co", "title": "Python Engineer", "conversation_id": "external-1"}
         with patch.object(server, "_opened_platform_rows", return_value=([{"target_id": "zhilian-tab", "url": "https://i.zhaopin.com/im?refcode=4019"}], [row])), \
              patch.object(server, "_open_zhilian_conversation_row", return_value={"status": "matched_chat_loaded", "success": True}), \
-             patch.object(server, "_fill_and_send_zhilian_message", return_value={"success": True, "verified": True, "verification": "dom_match"}):
+             patch.object(server, "_fill_and_send_zhilian_message", return_value={"success": True}), \
+             patch.object(server, "evaluate", side_effect=[self.snapshot(0), self.snapshot(1)]):
             status, result = self.request(
                 "/api/conversations/zhilian-reply/reply/send", "POST", {"message": "感谢您的沟通"}
             )
@@ -113,12 +122,36 @@ class ConversationReplyApiTests(unittest.TestCase):
         self.assertEqual(result["status"], "sent")
         self.assertEqual(result["inserted"][0]["sender_type"], "user")
 
+    def test_zhilian_candidate_missing_dom_id_matches_unique_identity(self):
+        local = {"platform": "zhilian", "external_conversation_id": "local-id", "hr_name": "Liu", "job_company": "Example Co", "job_title": "Python Engineer"}
+        target = {"target_id": "tab", "url": "https://i.zhaopin.com/im?refcode=4019"}
+        row = {"target_id": "tab", "hr_name": "Liu", "company": "Example Co", "title": "Python Engineer"}
+        with patch.object(server, "_opened_platform_rows", return_value=([target], [row])):
+            selected_target, selected_row, error = server._reply_platform_candidate(local)
+        self.assertEqual(selected_target, target)
+        self.assertEqual(selected_row, row)
+        self.assertIsNone(error)
+
+    def test_zhilian_active_candidate_identity(self):
+        local = {"platform": "zhilian", "external_conversation_id": "s1", "hr_name": "Liu", "job_company": "Example Co", "job_title": "Python Engineer"}
+        target = {"target_id": "tab", "url": "https://i.zhaopin.com/im?sessionId=s1"}
+        active = {"success": True, "session_id": "s1", "hr_name": "Liu", "company": "Example Co", "title": "Python Engineer"}
+        with patch.object(server, "_zhilian_im_targets", return_value=[target]), \
+             patch.object(server, "_active_zhilian_conversation_snapshot", return_value=active), \
+             patch.object(server, "_opened_platform_rows") as sidebar_scan:
+            selected_target, selected_row, error = server._reply_platform_candidate(local)
+        self.assertEqual(selected_target, target)
+        self.assertEqual(selected_row["conversation_id"], "s1")
+        self.assertIsNone(error)
+        sidebar_scan.assert_not_called()
+
     def test_zhilian_unverified_reply_does_not_persist(self):
         self.add_job_and_conversation(platform="zhilian", conversation_id="zhilian-unverified")
         row = {"target_id": "zhilian-tab", "hr_name": "刘先生", "company": "Example Co", "title": "Python Engineer", "conversation_id": "external-1"}
         with patch.object(server, "_opened_platform_rows", return_value=([{"target_id": "zhilian-tab", "url": "https://i.zhaopin.com/im?refcode=4019"}], [row])), \
              patch.object(server, "_open_zhilian_conversation_row", return_value={"status": "matched_chat_loaded", "success": True}), \
-             patch.object(server, "_fill_and_send_zhilian_message", return_value={"success": True, "verified": False}):
+             patch.object(server, "_fill_and_send_zhilian_message", return_value={"success": True}), \
+             patch.object(server, "evaluate", return_value=self.snapshot(0)):
             status, result = self.request(
                 "/api/conversations/zhilian-unverified/reply/send", "POST", {"message": "未确认智联消息"}
             )
@@ -200,7 +233,8 @@ class ConversationReplyApiTests(unittest.TestCase):
         body = {"message": "幂等回复", "idempotency_key": "replay-key-001"}
         with patch.object(server, "_opened_platform_rows", return_value=([{"target_id": "zhilian-tab", "url": "https://i.zhaopin.com/im?refcode=4019"}], [row])), \
              patch.object(server, "_open_zhilian_conversation_row", return_value={"status": "matched_chat_loaded", "success": True}), \
-             patch.object(server, "_fill_and_send_zhilian_message", return_value={"success": True, "verified": True, "verification": "dom_match"}) as send:
+             patch.object(server, "_fill_and_send_zhilian_message", return_value={"success": True}) as send, \
+             patch.object(server, "evaluate", side_effect=[self.snapshot(0), self.snapshot(1)]):
             first_status, first = self.request("/api/conversations/replay-reply/reply/send", "POST", body)
             second_status, second = self.request("/api/conversations/replay-reply/reply/send", "POST", body)
         self.assertTrue(first_status.startswith("200"), first)
@@ -215,7 +249,8 @@ class ConversationReplyApiTests(unittest.TestCase):
         row = {"target_id": "zhilian-tab", "hr_name": "刘先生", "company": "Example Co", "title": "Python Engineer", "conversation_id": "external-1"}
         with patch.object(server, "_opened_platform_rows", return_value=([{"target_id": "zhilian-tab", "url": "https://i.zhaopin.com/im?refcode=4019"}], [row])), \
              patch.object(server, "_open_zhilian_conversation_row", return_value={"status": "matched_chat_loaded", "success": True}), \
-             patch.object(server, "_fill_and_send_zhilian_message", return_value={"success": True, "verified": True, "verification": "dom_match"}) as send:
+             patch.object(server, "_fill_and_send_zhilian_message", return_value={"success": True}) as send, \
+             patch.object(server, "evaluate", side_effect=[self.snapshot(0), self.snapshot(1)]):
             first_status, first = self.request(
                 "/api/conversations/conflict-reply/reply/send", "POST",
                 {"message": "第一段", "idempotency_key": "conflict-key-001"}, add_default_key=False,
@@ -235,7 +270,8 @@ class ConversationReplyApiTests(unittest.TestCase):
         body = {"message": "可能已发送", "idempotency_key": "unknown-key-001"}
         with patch.object(server, "_opened_platform_rows", return_value=([{"target_id": "zhilian-tab", "url": "https://i.zhaopin.com/im?refcode=4019"}], [row])), \
              patch.object(server, "_open_zhilian_conversation_row", return_value={"status": "matched_chat_loaded", "success": True}), \
-             patch.object(server, "_fill_and_send_zhilian_message", return_value={"success": True, "verified": False}) as send:
+             patch.object(server, "_fill_and_send_zhilian_message", return_value={"success": True}) as send, \
+             patch.object(server, "evaluate", return_value=self.snapshot(0)):
             first_status, first = self.request("/api/conversations/unknown-reply/reply/send", "POST", body)
             second_status, second = self.request("/api/conversations/unknown-reply/reply/send", "POST", body)
         self.assertTrue(first_status.startswith("502"), first)
@@ -251,13 +287,15 @@ class ConversationReplyApiTests(unittest.TestCase):
         body = {"message": "可重试回复", "idempotency_key": "retry-key-001"}
         with patch.object(server, "_opened_platform_rows", return_value=([{"target_id": "zhilian-tab", "url": "https://i.zhaopin.com/im?refcode=4019"}], [row])), \
              patch.object(server, "_open_zhilian_conversation_row", return_value={"status": "matched_chat_loaded", "success": True}), \
-             patch.object(server, "_fill_and_send_zhilian_message", return_value={"success": False, "error": "input_not_found"}) as send:
+             patch.object(server, "_fill_and_send_zhilian_message", return_value={"success": False, "error": "input_not_found"}) as send, \
+             patch.object(server, "evaluate", return_value=self.snapshot(0)):
             first_status, first = self.request("/api/conversations/retry-reply/reply/send", "POST", body)
         self.assertTrue(first_status.startswith("502"), first)
         self.assertEqual(first["status"], "send_not_verified")
         with patch.object(server, "_opened_platform_rows", return_value=([{"target_id": "zhilian-tab", "url": "https://i.zhaopin.com/im?refcode=4019"}], [row])), \
              patch.object(server, "_open_zhilian_conversation_row", return_value={"status": "matched_chat_loaded", "success": True}), \
-             patch.object(server, "_fill_and_send_zhilian_message", return_value={"success": True, "verified": True, "verification": "dom_match"}) as retry_send:
+             patch.object(server, "_fill_and_send_zhilian_message", return_value={"success": True}) as retry_send, \
+             patch.object(server, "evaluate", side_effect=[self.snapshot(0), self.snapshot(1)]):
             second_status, second = self.request("/api/conversations/retry-reply/reply/send", "POST", body)
         self.assertTrue(second_status.startswith("200"), second)
         self.assertEqual(second["status"], "sent")
@@ -269,10 +307,210 @@ class ConversationReplyApiTests(unittest.TestCase):
         row = {"target_id": "boss-tab", "hr_name": "刘先生", "company": "Example Co", "title": "Python Engineer", "conversation_id": "external-1"}
         with patch.object(server, "_opened_platform_rows", return_value=([{"target_id": "boss-tab", "url": "https://www.zhipin.com/web/geek/chat"}], [row])), \
              patch.object(server, "_open_boss_conversation_row", return_value={"status": "matched_chat_loaded"}), \
-             patch.object(server, "_send_message_in_chat", return_value=False):
+             patch.object(server, "_send_message_in_chat", return_value=False), \
+             patch.object(server, "evaluate", return_value=self.snapshot(0)):
             status, result = self.request("/api/conversations/boss-not-sent/reply/send", "POST", {"message": "未发送"})
         self.assertTrue(status.startswith("502"), result)
         self.assertEqual(result["status"], "send_not_verified")
+
+    def test_boss_pre_send_snapshot_exception_is_retryable_and_never_clicks(self):
+        self.add_job_and_conversation(platform="boss", conversation_id="boss-snapshot-error")
+        row = {"target_id": "boss-tab", "hr_name": "刘先生", "company": "Example Co", "title": "Python Engineer", "conversation_id": "external-1"}
+        body = {"message": "确认面试安排", "idempotency_key": "snapshot-error-key-001"}
+        with patch.object(server, "_opened_platform_rows", return_value=([{"target_id": "boss-tab", "url": "https://www.zhipin.com/web/geek/chat"}], [row])), \
+             patch.object(server, "_open_boss_conversation_row", return_value={"status": "matched_chat_loaded"}), \
+             patch.object(server, "_send_message_in_chat") as send, \
+             patch.object(server, "evaluate", side_effect=RuntimeError("snapshot unavailable")):
+            status, result = self.request("/api/conversations/boss-snapshot-error/reply/send", "POST", body, add_default_key=False)
+        self.assertTrue(status.startswith("502"), result)
+        self.assertEqual(result["status"], "send_not_verified")
+        send.assert_not_called()
+        conn = server._get_web_db()
+        try:
+            attempt = server.ConversationRepository(conn).get_send_attempt("default", "boss-snapshot-error", body["idempotency_key"])
+        finally:
+            conn.close()
+        self.assertEqual(attempt["status"], "not_sent")
+
+    def test_unknown_attempt_blocks_new_key_after_page_reload(self):
+        self.add_job_and_conversation(platform="zhilian", conversation_id="unknown-new-key")
+        conn = server._get_web_db()
+        try:
+            repo = server.ConversationRepository(conn)
+            repo.create_send_attempt(
+                user_id="default", conversation_id="unknown-new-key", idempotency_key="old-reply-key-001",
+                message_hash=hashlib.sha256("原始内容".encode("utf-8")).hexdigest(), platform="zhilian",
+            )
+            repo.update_send_attempt(
+                user_id="default", conversation_id="unknown-new-key", idempotency_key="old-reply-key-001",
+                status="unknown", response={"status": "send_unknown"}, http_status=502,
+            )
+        finally:
+            conn.close()
+        with patch.object(server, "_opened_platform_rows") as opened:
+            status, result = self.request(
+                "/api/conversations/unknown-new-key/reply/send", "POST",
+                {"message": "修改后的内容", "idempotency_key": "new-reply-key-001"}, add_default_key=False,
+            )
+        self.assertTrue(status.startswith("409"), result)
+        self.assertEqual(result["status"], "unresolved_send_attempt")
+        self.assertEqual(result["previous_status"], "unknown")
+        opened.assert_not_called()
+
+    def test_boss_unknown_attempt_reconciles_from_local_message_and_active_dom(self):
+        self.add_job_and_conversation(platform="boss", conversation_id="boss-reconcile")
+        old_key = "boss-old-unknown-001"
+        old_message = "你好"
+        conn = server._get_web_db()
+        try:
+            repo = server.ConversationRepository(conn)
+            repo.append_messages(
+                "boss-reconcile",
+                [server.IncomingMessage(
+                    sender_type="user",
+                    content="送达 你好",
+                    platform_message_id="boss-sync-message-1",
+                    is_sent=True,
+                )],
+            )
+            repo.create_send_attempt(
+                user_id="default",
+                conversation_id="boss-reconcile",
+                idempotency_key=old_key,
+                message_hash=hashlib.sha256(old_message.encode("utf-8")).hexdigest(),
+                platform="boss",
+            )
+            repo.update_send_attempt(
+                user_id="default",
+                conversation_id="boss-reconcile",
+                idempotency_key=old_key,
+                status="unknown",
+                response={"status": "send_unknown"},
+                http_status=502,
+            )
+        finally:
+            conn.close()
+
+        row = {
+            "target_id": "boss-tab",
+            "hr_name": "刘先生",
+            "company": "Example Co",
+            "title": "Python Engineer",
+            "conversation_id": "external-1",
+            "active": True,
+        }
+        with patch.object(server, "_opened_platform_rows", return_value=([
+            {"target_id": "boss-tab", "url": "https://www.zhipin.com/web/geek/chat"}
+        ], [row])), \
+             patch.object(server, "_open_boss_conversation_row", return_value={"status": "matched_chat_loaded"}), \
+             patch.object(server, "_send_message_in_chat", return_value=True) as send, \
+             patch.object(server, "evaluate", side_effect=[
+                 self.snapshot(1, [{"mid": "boss-old-mid", "time": int(time.time() * 1000), "text": "你好"}]),
+                 self.snapshot(0),
+                 self.snapshot(1),
+             ]):
+            status, result = self.request(
+                "/api/conversations/boss-reconcile/reply/send",
+                "POST",
+                {"message": "感谢您的回复", "idempotency_key": "boss-new-reply-001"},
+                add_default_key=False,
+            )
+
+        self.assertTrue(status.startswith("200"), result)
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(send.call_count, 1)
+        conn = server._get_web_db()
+        try:
+            old_attempt = server.ConversationRepository(conn).get_send_attempt("default", "boss-reconcile", old_key)
+        finally:
+            conn.close()
+        self.assertEqual(old_attempt["status"], "sent")
+        self.assertTrue(old_attempt["response"]["reconciled"])
+
+    def test_boss_unknown_attempt_with_ambiguous_local_messages_stays_blocked(self):
+        self.add_job_and_conversation(platform="boss", conversation_id="boss-reconcile-ambiguous")
+        old_key = "boss-old-unknown-002"
+        old_message = "你好"
+        conn = server._get_web_db()
+        try:
+            repo = server.ConversationRepository(conn)
+            repo.append_messages(
+                "boss-reconcile-ambiguous",
+                [
+                    server.IncomingMessage(sender_type="user", content="送达 你好", platform_message_id="boss-sync-1", is_sent=True),
+                    server.IncomingMessage(sender_type="user", content="你好", platform_message_id="boss-sync-2", is_sent=True),
+                ],
+            )
+            repo.create_send_attempt(
+                user_id="default",
+                conversation_id="boss-reconcile-ambiguous",
+                idempotency_key=old_key,
+                message_hash=hashlib.sha256(old_message.encode("utf-8")).hexdigest(),
+                platform="boss",
+            )
+            repo.update_send_attempt(
+                user_id="default",
+                conversation_id="boss-reconcile-ambiguous",
+                idempotency_key=old_key,
+                status="unknown",
+                response={"status": "send_unknown"},
+                http_status=502,
+            )
+        finally:
+            conn.close()
+
+        row = {"target_id": "boss-tab", "hr_name": "刘先生", "company": "Example Co", "title": "Python Engineer", "active": True}
+        with patch.object(server, "_opened_platform_rows", return_value=([
+            {"target_id": "boss-tab", "url": "https://www.zhipin.com/web/geek/chat"}
+        ], [row])), \
+             patch.object(server, "evaluate") as evaluate, \
+             patch.object(server, "_send_message_in_chat") as send:
+            status, result = self.request(
+                "/api/conversations/boss-reconcile-ambiguous/reply/send",
+                "POST",
+                {"message": "新的安全测试内容", "idempotency_key": "boss-new-reply-002"},
+                add_default_key=False,
+            )
+
+        self.assertTrue(status.startswith("409"), result)
+        self.assertEqual(result["status"], "unresolved_send_attempt")
+        evaluate.assert_not_called()
+        send.assert_not_called()
+
+    def test_unresolved_attempt_blocks_reclaiming_an_older_not_sent_key(self):
+        self.add_job_and_conversation(platform="boss", conversation_id="old-not-sent-key")
+        conn = server._get_web_db()
+        try:
+            repo = server.ConversationRepository(conn)
+            old_key, unresolved_key = "old-not-sent-001", "unknown-attempt-001"
+            old_message = "可安全重试的旧内容"
+            repo.create_send_attempt(
+                user_id="default", conversation_id="old-not-sent-key", idempotency_key=old_key,
+                message_hash=hashlib.sha256(old_message.encode("utf-8")).hexdigest(), platform="boss",
+            )
+            repo.update_send_attempt(
+                user_id="default", conversation_id="old-not-sent-key", idempotency_key=old_key,
+                status="not_sent", response={"status": "send_not_verified"}, http_status=502,
+            )
+            repo.create_send_attempt(
+                user_id="default", conversation_id="old-not-sent-key", idempotency_key=unresolved_key,
+                message_hash=hashlib.sha256("可能已发送".encode("utf-8")).hexdigest(), platform="boss",
+            )
+            repo.update_send_attempt(
+                user_id="default", conversation_id="old-not-sent-key", idempotency_key=unresolved_key,
+                status="unknown", response={"status": "send_unknown"}, http_status=502,
+            )
+        finally:
+            conn.close()
+        with patch.object(server, "_opened_platform_rows") as opened:
+            status, result = self.request(
+                "/api/conversations/old-not-sent-key/reply/send", "POST",
+                {"message": old_message, "idempotency_key": old_key}, add_default_key=False,
+            )
+        self.assertTrue(status.startswith("409"), result)
+        self.assertEqual(result["status"], "unresolved_send_attempt")
+        self.assertEqual(result["previous_status"], "unknown")
+        opened.assert_not_called()
 
     def test_blocked_conversation_does_not_query_browser(self):
         self.add_job_and_conversation(platform="boss", conversation_id="blocked-reply")

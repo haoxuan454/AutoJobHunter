@@ -112,6 +112,47 @@ class ConversationWebFlowTests(unittest.TestCase):
         status, blocked = self.request("/api/conversations/c1/draft", "POST", {})
         self.assertTrue(status.startswith("409"), blocked)
 
+    def test_draft_delete_is_scoped_to_its_conversation(self):
+        for conversation_id in ("draft-owner-a", "draft-owner-b"):
+            status, created = self.request("/api/conversations", "POST", {
+                "id": conversation_id, "platform": "boss", "hr_name": "HR",
+            })
+            self.assertTrue(status.startswith("201"), created)
+        conn = server._get_web_db()
+        try:
+            repo = server.ConversationRepository(conn)
+            owned_draft = repo.save_draft("draft-owner-a", "A conversation draft")
+        finally:
+            conn.close()
+
+        status, wrong_owner = self.request(
+            f"/api/conversations/draft-owner-b/draft/{owned_draft['id']}", "DELETE",
+        )
+        self.assertTrue(status.startswith("404"), wrong_owner)
+        self.assertEqual(len(self.request("/api/conversations/draft-owner-a")[1]["drafts"]), 1)
+
+        status, deleted = self.request(
+            f"/api/conversations/draft-owner-a/draft/{owned_draft['id']}", "DELETE",
+        )
+        self.assertTrue(status.startswith("200"), deleted)
+        self.assertEqual(self.request("/api/conversations/draft-owner-a")[1]["drafts"], [])
+
+        status, missing = self.request(
+            f"/api/conversations/draft-owner-a/draft/{owned_draft['id']}", "DELETE",
+        )
+        self.assertTrue(status.startswith("404"), missing)
+
+    def test_draft_delete_rejects_wrong_user_at_repository_boundary(self):
+        self.request("/api/conversations", "POST", {"id": "private-draft", "platform": "boss"})
+        conn = server._get_web_db()
+        try:
+            repo = server.ConversationRepository(conn)
+            draft = repo.save_draft("private-draft", "Private draft")
+            self.assertFalse(repo.delete_draft("private-draft", draft["id"], user_id="another-user"))
+            self.assertEqual(len(repo.list_drafts("private-draft")), 1)
+        finally:
+            conn.close()
+
     def test_conversation_detail_clears_unread_after_hr_message_sync(self):
         status, created = self.request("/api/conversations", "POST", {
             "id": "zhilian:delivery:job-unread", "platform": "zhilian",

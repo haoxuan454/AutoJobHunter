@@ -25,9 +25,11 @@ function jsonResponse(body: unknown, ok = true) {
 describe('ConversationDetailPage', () => {
   const fetchMock = vi.fn()
   let sentMessage = ''
+  let drafts: { id: number; draft_text: string; status: string; created_at: string }[] = []
 
   beforeEach(() => {
     sentMessage = ''
+    drafts = []
     vi.stubGlobal('fetch', fetchMock)
     vi.stubGlobal('confirm', vi.fn(() => true))
     fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -36,10 +38,16 @@ describe('ConversationDetailPage', () => {
         const messages = sentMessage
           ? [...initialMessages, { id: 3, sender_type: 'user', content: sentMessage, is_sent: 1 }]
           : initialMessages
-        return jsonResponse({ conversation, messages, drafts: [] })
+        return jsonResponse({ conversation, messages, drafts })
       }
       if (url === '/api/conversations/conv-1/draft' && init?.method === 'POST') {
-        return jsonResponse({ draft: { id: 1, draft_text: 'AI 建议：可以介绍相关项目经验。', status: 'draft', created_at: '2026-09-27' } })
+        const draft = { id: 1, draft_text: 'AI 建议：可以介绍相关项目经验。', status: 'draft', created_at: '2026-09-27' }
+        drafts = [draft]
+        return jsonResponse({ draft })
+      }
+      if (url === '/api/conversations/conv-1/draft/1' && init?.method === 'DELETE') {
+        drafts = drafts.filter(draft => draft.id !== 1)
+        return jsonResponse({ success: true })
       }
       if (url === '/api/conversations/conv-1/reply/send' && init?.method === 'POST') {
         sentMessage = JSON.parse(String(init.body)).message
@@ -83,5 +91,20 @@ describe('ConversationDetailPage', () => {
     const sendCall = fetchMock.mock.calls.find(([url]) => String(url) === '/api/conversations/conv-1/reply/send')
     expect(sendCall).toBeTruthy()
     expect(JSON.parse(String(sendCall?.[1]?.body))).toMatchObject({ message: '我已核对并编辑的回复内容。' })
+  })
+
+  it('requires confirmation and deletes only the selected persisted draft', async () => {
+    render(
+      <MemoryRouter initialEntries={['/conversations/conv-1']}>
+        <Routes><Route path="/conversations/:id" element={<ConversationDetailPage />} /></Routes>
+      </MemoryRouter>,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: 'AI 生成回复草稿' }))
+    expect(await screen.findByText('AI 建议：可以介绍相关项目经验。')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '删除草稿' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/conversations/conv-1/draft/1', { method: 'DELETE' }))
+    expect(await screen.findByText('历史草稿已删除')).toBeTruthy()
+    expect(screen.getByText('暂无草稿')).toBeTruthy()
   })
 })

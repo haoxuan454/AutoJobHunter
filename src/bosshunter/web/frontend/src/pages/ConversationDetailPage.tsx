@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { ArrowDown, BriefcaseBusiness, ExternalLink, Send, Sparkles } from 'lucide-react'
+import { ArrowDown, BriefcaseBusiness, ExternalLink, Send, Sparkles, Trash2 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 
@@ -169,6 +169,19 @@ export default function ConversationDetailPage() {
     }
   }
 
+  const deleteDraft = async (draft: Draft) => {
+    if (!window.confirm('确认删除这条历史草稿吗？删除后无法恢复。')) return
+    try {
+      const response = await fetch(`/api/conversations/${encodeURIComponent(id)}/draft/${draft.id}`, { method: 'DELETE' })
+      const payload = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(payload.error || '草稿删除失败')
+      await refresh()
+      setNotice('历史草稿已删除')
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '草稿删除失败')
+    }
+  }
+
   const sendReply = async () => {
     const message = composer.trim()
     if (!message || sending) return
@@ -280,7 +293,10 @@ export default function ConversationDetailPage() {
             <div key={draft.id} className="rounded-xl border border-card-border p-3">
               <div className="mb-2 text-xs text-muted">{draft.status} · {draft.created_at}</div>
               <p className="whitespace-pre-wrap text-sm leading-6">{draft.draft_text}</p>
-              <Button className="mt-3 gap-2" size="sm" variant="ghost" onClick={() => void copy(draft.draft_text)}><span>复制草稿</span></Button>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button className="gap-2" size="sm" variant="ghost" onClick={() => void copy(draft.draft_text)}><span>复制草稿</span></Button>
+                <Button className="gap-2 text-danger" size="sm" variant="ghost" onClick={() => void deleteDraft(draft)}><Trash2 className="h-4 w-4" /><span>删除草稿</span></Button>
+              </div>
             </div>
           ))}
           {data.drafts.length === 0 && <div className="text-sm text-muted">暂无草稿</div>}
