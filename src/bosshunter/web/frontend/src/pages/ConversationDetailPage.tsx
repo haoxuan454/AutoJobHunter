@@ -3,6 +3,7 @@ import { Link, useParams } from 'react-router-dom'
 import { ArrowDown, BriefcaseBusiness, ExternalLink, Send, Sparkles, Trash2 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { formatConversationTime } from '@/lib/conversationDisplay'
 
 type Message = {
   id: number
@@ -72,7 +73,7 @@ function displayHrName(name?: string) {
 }
 
 function messageTime(message: Message) {
-  return message.message_time || message.created_at || ''
+  return formatConversationTime(message.message_time || message.created_at || '')
 }
 
 export default function ConversationDetailPage() {
@@ -291,7 +292,7 @@ export default function ConversationDetailPage() {
           </div>
           {data.drafts.map(draft => (
             <div key={draft.id} className="rounded-xl border border-card-border p-3">
-              <div className="mb-2 text-xs text-muted">{draft.status} · {draft.created_at}</div>
+              <div className="mb-2 text-xs text-muted">{draft.status} · {formatConversationTime(draft.created_at)}</div>
               <p className="whitespace-pre-wrap text-sm leading-6">{draft.draft_text}</p>
               <div className="mt-3 flex flex-wrap gap-2">
                 <Button className="gap-2" size="sm" variant="ghost" onClick={() => void copy(draft.draft_text)}><span>复制草稿</span></Button>

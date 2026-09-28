@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 from urllib.parse import parse_qs, urlsplit
 
+from bosshunter.conversation_ordering import latest_message, message_order_key
+
 
 CONVERSATION_STATUSES = {
     "new",
@@ -140,6 +142,11 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def activity_now() -> str:
+    """Return a precise local activity marker for same-second message batches."""
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
 def message_content_hash(message: IncomingMessage) -> str:
     """Return a stable content hash for platforms without message IDs."""
     payload = "\x1f".join(
@@ -174,6 +181,8 @@ def init_conversation_tables(conn: sqlite3.Connection) -> None:
             pause_reason TEXT,
             interest_score INTEGER,
             last_message_at TEXT,
+            last_activity_at TEXT,
+            last_activity_message_id INTEGER,
             last_sync_at TEXT,
             last_sync_attempt_at TEXT,
             sync_cursor TEXT,
@@ -291,9 +300,31 @@ def init_conversation_tables(conn: sqlite3.Connection) -> None:
         "last_hr_message_at": "TEXT",
         "last_read_at": "TEXT",
         "last_sync_attempt_at": "TEXT",
+        "last_activity_at": "TEXT",
+        "last_activity_message_id": "INTEGER",
     }.items():
         if column not in columns:
             conn.execute(f"ALTER TABLE conv_conversations ADD COLUMN {column} {definition}")
+    # Older databases predate last_activity_at.  Rebuild only the local
+    # activity baseline from message insertion time; never use sync attempts
+    # or platform-relative labels for this migration.
+    conn.execute(
+        """UPDATE conv_conversations
+           SET last_activity_at = COALESCE(
+               (SELECT MAX(m.created_at) FROM conv_messages m
+                WHERE m.conversation_id = conv_conversations.id),
+               created_at
+           )
+           WHERE last_activity_at IS NULL OR TRIM(last_activity_at) = ''"""
+    )
+    conn.execute(
+        """UPDATE conv_conversations
+           SET last_activity_message_id = (
+               SELECT MAX(m.id) FROM conv_messages m
+               WHERE m.conversation_id = conv_conversations.id
+           )
+           WHERE last_activity_message_id IS NULL"""
+    )
     jobs_columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
     if {"source_platform", "hr_name", "company", "deleted_at"}.issubset(jobs_columns):
         candidates = conn.execute(
@@ -534,23 +565,27 @@ class ConversationRepository:
             row = self.conn.execute("SELECT * FROM conv_messages WHERE id = last_insert_rowid()").fetchone()
             inserted.append(dict(row))
         if inserted:
-            last_time = max((row["message_time"] or row["created_at"] for row in inserted), default=utc_now())
+            activity_time = activity_now()
+            latest = latest_message(inserted)
+            last_time = str((latest or {}).get("message_time") or activity_time)
+            latest_activity_id = max(int(row["id"]) for row in inserted)
             hr_rows = [row for row in inserted if row["sender_type"] == "hr"]
             if hr_rows:
-                last_hr_time = max((row["message_time"] or row["created_at"] for row in hr_rows), default=last_time)
+                latest_hr = latest_message(hr_rows)
+                last_hr_time = str((latest_hr or {}).get("message_time") or activity_time)
                 self.conn.execute(
                     """UPDATE conv_conversations
-                       SET last_message_at = ?, updated_at = ?,
+                       SET last_message_at = ?, last_activity_at = ?, last_activity_message_id = ?, updated_at = ?,
                            last_hr_message_at = ?,
                            unread_count = COALESCE(unread_count, 0) + ?,
                            has_unread = 1
                        WHERE id = ?""",
-                    (last_time, utc_now(), last_hr_time, len(hr_rows), conversation_id),
+                    (last_time, activity_time, latest_activity_id, activity_time, last_hr_time, len(hr_rows), conversation_id),
                 )
             else:
                 self.conn.execute(
-                    "UPDATE conv_conversations SET last_message_at = ?, updated_at = ? WHERE id = ?",
-                    (last_time, utc_now(), conversation_id),
+                    "UPDATE conv_conversations SET last_message_at = ?, last_activity_at = ?, last_activity_message_id = ?, updated_at = ? WHERE id = ?",
+                    (last_time, activity_time, latest_activity_id, activity_time, conversation_id),
                 )
         self.conn.commit()
         return inserted
@@ -599,17 +634,11 @@ class ConversationRepository:
         return value
 
     def list_messages(self, conversation_id: str) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
-            """SELECT * FROM conv_messages
-               WHERE conversation_id = ?
-               ORDER BY
-                 CASE WHEN message_time IS NULL OR TRIM(message_time) = '' THEN 1 ELSE 0 END,
-                 message_time ASC,
-                 created_at ASC,
-                 id ASC""",
-            (conversation_id,),
-        ).fetchall()
-        return [_decorate_external_urls(dict(row)) for row in rows]
+        rows = [dict(row) for row in self.conn.execute(
+            "SELECT * FROM conv_messages WHERE conversation_id = ?", (conversation_id,)
+        ).fetchall()]
+        rows.sort(key=message_order_key)
+        return [_decorate_external_urls(row) for row in rows]
 
     def mark_conversation_read(self, conversation_id: str) -> dict[str, Any] | None:
         """Clear the local unread marker after the user opens a conversation."""
@@ -633,8 +662,8 @@ class ConversationRepository:
         if sort not in {"recent", "frequency", "created"}:
             raise ValueError("unsupported conversation sort")
         order_by = {
-            "recent": "COALESCE(c.last_message_at, c.updated_at) DESC, c.id DESC",
-            "frequency": "round_count DESC, COALESCE(c.last_message_at, c.updated_at) DESC, c.id DESC",
+            "recent": "COALESCE(c.last_activity_message_id, 0) DESC, COALESCE(c.last_activity_at, c.last_message_at, c.created_at) DESC, c.id DESC",
+            "frequency": "round_count DESC, COALESCE(c.last_activity_message_id, 0) DESC, COALESCE(c.last_activity_at, c.last_message_at, c.created_at) DESC, c.id DESC",
             "created": "c.created_at DESC, c.id DESC",
         }[sort]
         if self._has_jobs_table():
@@ -649,13 +678,8 @@ class ConversationRepository:
                        SUM(CASE WHEN m.sender_type = 'hr' THEN 1 ELSE 0 END) AS hr_message_count,
                        SUM(CASE WHEN m.sender_type IN ('user', 'ai') THEN 1 ELSE 0 END) AS user_message_count,
                        SUM(CASE WHEN m.sender_type = 'hr' THEN 1 ELSE 0 END) AS round_count,
-                       (SELECT m2.content FROM conv_messages m2
-                          WHERE m2.conversation_id = c.id
-                          ORDER BY
-                            CASE WHEN m2.message_time IS NULL OR TRIM(m2.message_time) = '' THEN 1 ELSE 0 END ASC,
-                            m2.message_time DESC,
-                            m2.created_at DESC,
-                            m2.id DESC LIMIT 1) AS last_message_preview
+                       NULL AS last_message_preview,
+                       NULL AS latest_message_sender
                 FROM conv_conversations c
                 {job_join}
                 LEFT JOIN conv_messages m ON m.conversation_id = c.id
@@ -669,7 +693,17 @@ class ConversationRepository:
                 ORDER BY {order_by}""",
             (user_id,),
         ).fetchall()
-        return [_decorate_external_urls(dict(row)) for row in rows]
+        result = []
+        for row in rows:
+            item = dict(row)
+            messages = [dict(message) for message in self.conn.execute(
+                "SELECT * FROM conv_messages WHERE conversation_id = ?", (item["id"],)
+            ).fetchall()]
+            latest = latest_message(messages)
+            item["last_message_preview"] = latest.get("content") if latest else None
+            item["latest_message_sender"] = latest.get("sender_type") if latest else None
+            result.append(_decorate_external_urls(item))
+        return result
 
     def update_status(self, conversation_id: str, status: str, reason: str = "") -> dict[str, Any]:
         if status not in CONVERSATION_STATUSES:

@@ -49,6 +49,42 @@ class ConversationRepositoryTests(unittest.TestCase):
         self.assertEqual(conversation["unread_count"], 1)
         self.assertEqual(conversation["has_unread"], 1)
 
+    def test_latest_summary_prefers_new_platform_row_when_time_is_missing(self):
+        self.repo.append_messages("conv-1", [IncomingMessage(
+            "hr", "旧消息", "2026-09-19T01:03:00+00:00", "old-1",
+        )])
+        self.repo.append_messages("conv-1", [IncomingMessage(
+            "hr", "不会强制晚班，按你意愿选班次", None, "new-1",
+        )])
+
+        listed = self.repo.list_conversations()
+
+        self.assertEqual(listed[0]["last_message_preview"], "不会强制晚班，按你意愿选班次")
+        self.assertEqual(listed[0]["latest_message_sender"], "hr")
+
+    def test_sync_success_without_new_messages_does_not_change_recent_activity(self):
+        self.repo.append_messages("conv-1", [IncomingMessage(
+            "hr", "最近活动", "2026-09-19T01:03:00+00:00", "activity-1",
+        )])
+        before = self.repo.get_conversation("conv-1")["last_activity_at"]
+        self.repo.mark_sync_success("conv-1", "2099-01-01T00:00:00+00:00")
+        after = self.repo.get_conversation("conv-1")
+
+        self.assertEqual(after["last_activity_at"], before)
+        self.assertEqual(after["last_sync_at"], "2099-01-01T00:00:00+00:00")
+
+    def test_recent_sort_uses_new_message_activity_not_sync_timestamp(self):
+        self.repo.upsert_conversation({
+            "id": "conv-2", "platform": "zhilian", "job_id": "job-2", "hr_name": "刘先生",
+        })
+        self.repo.append_messages("conv-1", [IncomingMessage("hr", "较早", None, "old-activity")])
+        self.repo.append_messages("conv-2", [IncomingMessage("hr", "刚刚更新", None, "new-activity")])
+        self.repo.mark_sync_success("conv-1", "2099-01-01T00:00:00+00:00")
+
+        listed = self.repo.list_conversations()
+
+        self.assertEqual([item["id"] for item in listed[:2]], ["conv-2", "conv-1"])
+
     def test_user_message_does_not_set_unread(self):
         message = IncomingMessage(
             "user", "Previously sent greeting", "2026-09-19T01:04:00+08:00", "user-1", is_sent=True,
