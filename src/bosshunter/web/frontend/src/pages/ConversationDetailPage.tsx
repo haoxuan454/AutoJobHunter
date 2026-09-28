@@ -248,7 +248,7 @@ export default function ConversationDetailPage() {
               <a href={conversation.conversation_url} target="_blank" rel="noreferrer">
                 <Button className="gap-2" size="sm" variant="secondary"><ExternalLink className="h-4 w-4" /><span>打开平台 HR 会话</span></Button>
               </a>
-            ) : <span className="text-sm text-muted">HR 会话链接未就绪：{conversation.conversation_url_reason || '平台尚未返回可验证的具体会话地址'}</span>}
+            ) : null}
             {conversation.job_url ? (
               <a href={conversation.job_url} target="_blank" rel="noreferrer">
                 <Button className="gap-2" size="sm" variant="ghost"><BriefcaseBusiness className="h-4 w-4" /><span>查看平台岗位详情</span></Button>

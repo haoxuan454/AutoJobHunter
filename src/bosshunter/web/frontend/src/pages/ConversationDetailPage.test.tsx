@@ -107,4 +107,23 @@ describe('ConversationDetailPage', () => {
     expect(await screen.findByText('历史草稿已删除')).toBeTruthy()
     expect(screen.getByText('暂无草稿')).toBeTruthy()
   })
+
+  it('does not render a misleading platform-chat link when no concrete URL exists', async () => {
+    const withoutConversationUrl = { ...conversation, conversation_url: '' }
+    fetchMock.mockImplementationOnce(async () => jsonResponse({
+      conversation: withoutConversationUrl,
+      messages: [],
+      drafts: [],
+    }))
+
+    render(
+      <MemoryRouter initialEntries={['/conversations/conv-1']}>
+        <Routes><Route path="/conversations/:id" element={<ConversationDetailPage />} /></Routes>
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => expect(screen.getByText('暂无已持久化消息。请在招聘平台中人工打开目标 HR 的聊天面板，再从会话卡片点击同步；同步不会发送消息。')).toBeTruthy())
+    expect(screen.queryByRole('link', { name: '打开平台 HR 会话' })).toBeNull()
+    expect(screen.queryByText(/HR 会话链接未就绪/)).toBeNull()
+  })
 })

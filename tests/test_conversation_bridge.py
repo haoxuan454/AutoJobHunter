@@ -227,6 +227,41 @@ class ConversationBridgeTests(unittest.TestCase):
             0,
         )
 
+    def test_empty_snapshot_refreshes_existing_card_without_creating_message(self):
+        first = sync_extracted_messages(
+            self.conn,
+            job=self.job,
+            conversation=self.conversation,
+            messages=[{"sender": "me", "text": "sent already", "message_id": "sent-1"}],
+        )
+        conversation_id = first["conversation"]["id"]
+        before = self.conn.execute(
+            "SELECT last_sync_at FROM conv_conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()[0]
+
+        result = sync_extracted_messages(
+            self.conn,
+            job=self.job,
+            conversation=self.conversation,
+            local_conversation_id=conversation_id,
+            messages=[],
+        )
+
+        self.assertEqual(result["status"], "synced")
+        self.assertEqual(result["inserted"], [])
+        self.assertIsNotNone(result["conversation"])
+        after = self.conn.execute(
+            "SELECT last_sync_at FROM conv_conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()[0]
+        self.assertIsNotNone(after)
+        self.assertGreaterEqual(after, before)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM conv_messages WHERE conversation_id = ?", (conversation_id,)
+            ).fetchone()[0],
+            1,
+        )
+
     def test_verified_delivery_reconciliation_uses_history_time_and_is_idempotent(self):
         self.conn.executescript("""
             CREATE TABLE jobs (

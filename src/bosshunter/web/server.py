@@ -123,7 +123,7 @@ from bosshunter.web.tasks import (
 	WorkbenchTaskRunner,
 	wait_for_initial_monitor_cooldown,
 )
-from bosshunter.conversations import ConversationRepository, IncomingMessage, normalize_platform_external_url
+from bosshunter.conversations import ConversationRepository, IncomingMessage, normalize_platform_external_url, utc_now
 from bosshunter.conversation_analytics import build_conversation_analytics
 from bosshunter.conversation_bridge import reconcile_verified_deliveries, sync_extracted_messages
 from bosshunter.conversation_scheduler import SerialConversationScheduler, init_scheduler_tables
@@ -3354,6 +3354,22 @@ def _sync_platform_target(conn, *, platform: str, target: dict, row: dict, base_
         conversation["external_conversation_id"] = str(
             active.get("conversation_id") or active.get("contact_id") or conversation["external_conversation_id"]
         ).strip()
+        # BOSS commonly exposes only the generic chat entry URL. Persist a
+        # conversation link only when the rendered row exposes a distinct URL
+        # from the entry page; never invent a deep-link from an opaque ID.
+        candidate_url = str(active.get("conversation_url") or row.get("conversation_url") or "").strip()
+        target_url = str(target.get("url") or "").strip()
+        if candidate_url and candidate_url != target_url:
+            conversation["conversation_url"] = normalize_platform_external_url(
+                platform, candidate_url, kind="conversation"
+            ) or ""
+            conversation["source_url"] = conversation["conversation_url"]
+        else:
+            # The sidebar may echo the generic chat entry URL.  It identifies
+            # the inbox, not this HR thread, so never expose it as a concrete
+            # card link.
+            conversation["conversation_url"] = ""
+            conversation["source_url"] = ""
         parsed = _parse_browser_json(evaluate(target["target_id"], JS_EXTRACT_CONVERSATION, timeout=10))
         if not isinstance(parsed, list):
             raise RuntimeError("conversation_dom_unreadable")
@@ -3569,6 +3585,9 @@ def _opened_platform_rows(platform: str) -> tuple[list[dict], list[dict]]:
     rows: list[dict] = []
     for target in targets:
         target_id = target["target_id"]
+        # Metadata is platform-specific.  Keep a per-target default so BOSS
+        # rows cannot accidentally reuse the previous Zhilian scan metadata.
+        scan_meta: dict = {}
         if platform == "boss":
             parsed = _parse_browser_json(evaluate(target_id, JS_EXTRACT_CHAT_LIST, timeout=10))
             source_rows = parsed if isinstance(parsed, list) else []
@@ -3577,11 +3596,18 @@ def _opened_platform_rows(platform: str) -> tuple[list[dict], list[dict]]:
             # cards in this batch. Do not rescan/scroll once per card.
             scan = _scan_zhilian_conversation_list(target_id)
             source_rows = (scan.get("rows") or []) if scan.get("success") else []
+            scan_meta = {
+                "_scan_success": bool(scan.get("success")),
+                "_scan_complete": bool(scan.get("complete")),
+                "_scan_rounds": int(scan.get("scroll_rounds") or 0),
+                "_scan_loaded_count": int(scan.get("loaded_count") or 0),
+            }
         else:
             source_rows = []
+            scan_meta = {}
         for row in source_rows:
             if isinstance(row, dict):
-                rows.append({**row, "target_id": target_id, "source_url": target["url"]})
+                rows.append({**row, **scan_meta, "target_id": target_id, "source_url": target["url"]})
     return targets, rows
 
 
@@ -3602,6 +3628,14 @@ def api_conversations_sync():
         reconcile_verified_deliveries(conn)
         repo = ConversationRepository(conn)
         local_cards = repo.list_conversations()
+        # Keep the attempt timestamp in the same timezone-aware ISO format as
+        # last_sync_at. SQLite datetime('now') is a naive UTC string; browsers
+        # interpret that string as local time and display it eight hours early
+        # in China.
+        attempt_time = utc_now()
+        for card in local_cards:
+            if str(card.get("platform") or "").lower() in requested:
+                repo.mark_sync_attempt(str(card["id"]), attempt_time)
         results: list[dict] = []
         for platform in requested:
             cards = [item for item in local_cards if str(item.get("platform") or "").lower() == platform]
@@ -3655,7 +3689,11 @@ def api_conversations_sync():
             for card_index, candidate_card in enumerate(cards):
                 by_identity: dict[tuple[str, ...], tuple[int, dict, tuple[str, ...]]] = {}
                 for candidate_row in rows:
-                    candidate_score = _conversation_identity_score(candidate_card, candidate_row)
+                    candidate_score = (
+                        _zhilian_identity_score(candidate_card, candidate_row)
+                        if platform == "zhilian"
+                        else _conversation_identity_score(candidate_card, candidate_row)
+                    )
                     if not candidate_score:
                         continue
                     candidate_identity = _conversation_row_identity(candidate_row)
@@ -3686,7 +3724,11 @@ def api_conversations_sync():
             for card_index, card in enumerate(cards):
                 candidates = []
                 for row in rows:
-                    score = _conversation_identity_score(card, row)
+                    score = (
+                        _zhilian_identity_score(card, row)
+                        if platform == "zhilian"
+                        else _conversation_identity_score(card, row)
+                    )
                     if score:
                         candidates.append((score, row))
                 candidates.sort(key=lambda item: item[0], reverse=True)
@@ -3705,7 +3747,13 @@ def api_conversations_sync():
                         "conversation_id": str(card["id"]), "platform": platform,
                         "status": "ambiguous" if unique else "not_loaded",
                         "message_count": 0, "inserted": 0,
-                        "diagnostics": ["找到多个可能的已打开会话" if unique else "目标 HR 会话未在已打开聊天面板中"]
+                        "diagnostics": [
+                            "找到多个可能的已打开会话" if unique else (
+                                "智联会话列表扫描未完成，目标会话可能尚未加载"
+                                if any(item.get("_scan_complete") is False for item in rows)
+                                else "目标 HR 会话未在已打开聊天面板中"
+                            )
+                        ]
                     })
                     continue
                 if card_index in contested_cards:
@@ -3764,7 +3812,13 @@ def api_conversations():
         # Build cards from locally verified delivery history before reading the
         # projection.  This is SQLite-only and never scans platform contacts.
         reconcile_verified_deliveries(repo.conn)
-        return _json_response({"sort": sort, "conversations": repo.list_conversations(sort=sort)})
+        # This is an internal diagnostic timestamp, not proof that a platform
+        # chat was read successfully. Do not expose it to the card UI as a
+        # misleading "recent attempt" time.
+        conversations = repo.list_conversations(sort=sort)
+        for conversation in conversations:
+            conversation.pop("last_sync_attempt_at", None)
+        return _json_response({"sort": sort, "conversations": conversations})
     except ValueError as exc:
         return _json_response({"error": str(exc)}, 400)
     finally:

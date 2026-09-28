@@ -131,6 +131,7 @@ JS_EXTRACT_CHAT_LIST = r"""
             || item.getAttribute('data-conversation-id')
             || item.getAttribute('data-uid')
             || '';
+        const conversationLink = item.querySelector('a[href*="/chat"]')?.href || '';
 
         results.push({
             hr_name: nameText.textContent.trim(),
@@ -143,6 +144,7 @@ JS_EXTRACT_CHAT_LIST = r"""
             last_direction: lastDirection,
             active: active,
             conversation_id: conversationId || null,
+            conversation_url: conversationLink,
             element_index: results.length
         });
     });

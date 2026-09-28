@@ -19,6 +19,8 @@ const unreadConversation = {
   last_message_preview: '方便介绍一下相关项目经验吗？',
   has_unread: true,
   unread_count: 2,
+  last_sync_at: '2026-09-28T04:35:02+00:00',
+  last_sync_attempt_at: '2026-09-28T04:40:02+00:00',
 }
 
 function jsonResponse(body: unknown, ok = true) {
@@ -43,6 +45,15 @@ describe('ConversationsPage', () => {
       if (url === '/api/conversations/zhilian%3Adelivery%3Ajob%2F1/sync' && init?.method === 'POST') {
         readState = { ...unreadConversation, message_count: 4 }
         return jsonResponse({ status: 'synced', platform_message_count: 4, message_count: 4, inserted: 1 })
+      }
+      if (url === '/api/conversations/sync' && init?.method === 'POST') {
+        return jsonResponse({
+          status: 'partial',
+          results: [{
+            platform: 'zhilian', conversation_id: unreadConversation.id,
+            status: 'synced', platform_message_count: 4, message_count: 4, inserted: 0,
+          }],
+        })
       }
       if (url === '/api/conversations/zhilian%3Adelivery%3Ajob%2F1' && (!init?.method || init.method === 'GET')) {
         readState = { ...readState, has_unread: false, unread_count: 0 }
@@ -78,6 +89,8 @@ describe('ConversationsPage', () => {
     expect(screen.getByText('智联招聘')).toBeTruthy()
     expect(screen.getByText('AI 评分：86')).toBeTruthy()
     expect(screen.getByLabelText('2 条未读消息')).toBeTruthy()
+    expect(screen.getByText('最近同步：2026-09-28 12:35:02')).toBeTruthy()
+    expect(screen.queryByText(/最近同步尝试/)).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: '同步当前会话' }))
 
@@ -94,5 +107,18 @@ describe('ConversationsPage', () => {
     expect(await screen.findByText('方便介绍一下相关项目经验吗？')).toBeTruthy()
     fireEvent.click(screen.getByRole('link', { name: '← 返回会话列表' }))
     await waitFor(() => expect(screen.queryByLabelText('2 条未读消息')).toBeNull())
+  })
+
+  it('explains that global sync read the platform but found no new messages', async () => {
+    render(
+      <MemoryRouter initialEntries={['/conversations']}>
+        <Routes><Route path="/conversations" element={<ConversationsPage />} /></Routes>
+      </MemoryRouter>,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: '同步已打开平台会话' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/conversations/sync', expect.objectContaining({ method: 'POST' })))
+    expect(await screen.findByText(/已读取并核对，无新增消息/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: '同步已打开平台会话' }).className).toContain('gap-2')
   })
 })

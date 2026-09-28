@@ -10,6 +10,7 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { formatConversationTime } from '@/lib/conversationDisplay'
 
 type SortMode = 'recent' | 'frequency' | 'created'
 
@@ -22,6 +23,7 @@ type Conversation = {
   status: string
   last_message_at?: string
   last_sync_at?: string
+  last_sync_attempt_at?: string
   round_count?: number
   message_count?: number
   last_message_preview?: string
@@ -45,6 +47,7 @@ type SyncResult = {
   inserted?: number
   history_complete?: boolean
   history_label?: string
+  diagnostics?: string[]
 }
 
 const SORT_LABELS: Record<SortMode, string> = {
@@ -122,7 +125,13 @@ export default function ConversationsPage() {
       const results = Array.isArray(data.results) ? data.results as SyncResult[] : []
       const failed = results.filter(item => !['synced', 'empty'].includes(item.status || '')).length
       const summary = results
-        .map(item => `${PLATFORM_LABELS[item.platform || ''] || item.platform || '平台'}：${syncStatusLabel(item.status)}（平台读取 ${item.platform_message_count || 0}，本地 ${item.message_count || 0}，新增 ${item.inserted || 0}）`)
+        .map(item => {
+          const detail = item.diagnostics?.[0] ? `，${item.diagnostics[0]}` : ''
+          const unchanged = item.status === 'synced' && Number(item.inserted || 0) === 0
+            ? '，已读取并核对，无新增消息'
+            : ''
+          return `${PLATFORM_LABELS[item.platform || ''] || item.platform || '平台'}：${syncStatusLabel(item.status)}（平台读取 ${item.platform_message_count || 0}，本地 ${item.message_count || 0}，新增 ${item.inserted || 0}${unchanged}${detail}）`
+        })
         .join('；')
       setNotice(`${failed ? '同步部分完成' : '同步完成'}：${summary || '没有本地会话返回结果'}`)
       await load()
@@ -186,7 +195,7 @@ export default function ConversationsPage() {
               {Object.entries(SORT_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
             </select>
           </label>
-          <Button disabled={syncing} onClick={() => void sync()} title="只同步会话中心已有卡片对应的已打开平台会话">
+          <Button className="gap-2" disabled={syncing} onClick={() => void sync()} title="只同步会话中心已有卡片对应的已打开平台会话">
             <RefreshCw className={`h-4 w-4 ${syncing ? 'animate-spin' : ''}`} />
             <span>{syncing ? '同步中…' : '同步已打开平台会话'}</span>
           </Button>
@@ -232,7 +241,7 @@ export default function ConversationsPage() {
                     <span>状态：{item.status}</span>
                   </div>
                   {item.last_message_preview && <p className="line-clamp-2 text-sm leading-5 text-muted">{item.last_message_preview}</p>}
-                  {item.last_sync_at && <div className="text-xs text-muted">最近同步：{item.last_sync_at}</div>}
+                  {item.last_sync_at && <div className="text-xs text-muted">最近同步：{formatConversationTime(item.last_sync_at)}</div>}
                   <div className="flex flex-wrap items-center gap-2 pt-2">
                     <Button className="gap-2" size="sm" variant="secondary" disabled={syncingId === item.id} onClick={() => void syncOne(item)}>
                       <RefreshCw className={`h-3.5 w-3.5 ${syncingId === item.id ? 'animate-spin' : ''}`} />

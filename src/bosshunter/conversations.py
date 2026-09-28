@@ -175,10 +175,12 @@ def init_conversation_tables(conn: sqlite3.Connection) -> None:
             interest_score INTEGER,
             last_message_at TEXT,
             last_sync_at TEXT,
+            last_sync_attempt_at TEXT,
             sync_cursor TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+
 
         -- A recruiter/platform conversation may be shared by several delivered
         -- jobs.  The local card identity is platform + job_id, so an external
@@ -288,6 +290,7 @@ def init_conversation_tables(conn: sqlite3.Connection) -> None:
         "has_unread": "INTEGER NOT NULL DEFAULT 0",
         "last_hr_message_at": "TEXT",
         "last_read_at": "TEXT",
+        "last_sync_attempt_at": "TEXT",
     }.items():
         if column not in columns:
             conn.execute(f"ALTER TABLE conv_conversations ADD COLUMN {column} {definition}")
@@ -574,6 +577,26 @@ class ConversationRepository:
             (cursor_value, utc_now(), utc_now(), conversation_id),
         )
         self.conn.commit()
+
+    def mark_sync_attempt(self, conversation_id: str, attempted_at: str | None = None) -> str:
+        """Record a sync attempt separately from a successful platform read."""
+        value = attempted_at or utc_now()
+        self.conn.execute(
+            "UPDATE conv_conversations SET last_sync_attempt_at = ?, updated_at = ? WHERE id = ?",
+            (value, value, conversation_id),
+        )
+        self.conn.commit()
+        return value
+
+    def mark_sync_success(self, conversation_id: str, synced_at: str | None = None) -> str:
+        """Record a successful platform read, including zero new messages."""
+        value = synced_at or utc_now()
+        self.conn.execute(
+            "UPDATE conv_conversations SET last_sync_at = ?, updated_at = ? WHERE id = ?",
+            (value, value, conversation_id),
+        )
+        self.conn.commit()
+        return value
 
     def list_messages(self, conversation_id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute(

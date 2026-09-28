@@ -413,6 +413,22 @@ def sync_extracted_messages(
     if platform == "zhilian":
         messages = _prepare_zhilian_snapshot(messages)
     if not messages:
+        # An empty snapshot can still be a successful platform read when the
+        # local delivery card already exists.  Refresh its success timestamp,
+        # but never create a new empty card from a contact-list miss.
+        if local_conversation_id:
+            repo = ConversationRepository(conn)
+            existing_id = str(local_conversation_id).strip()
+            if repo.get_conversation(existing_id) and not repo.is_deleted(existing_id):
+                repo.mark_sync_success(existing_id)
+                return {
+                    "conversation": repo.get_conversation(existing_id),
+                    "inserted": [],
+                    "notification": None,
+                    "notifications": [],
+                    "status": "synced",
+                    "history_complete": history_complete if platform == "zhilian" else None,
+                }
         return {
             "conversation": None,
             "inserted": [],
@@ -491,6 +507,8 @@ def sync_extracted_messages(
     if platform == "zhilian" and history_complete is True:
         _canonicalize_zhilian_generated_messages(conn, conversation_id, messages)
     if not incoming:
+        repo.mark_sync_success(conversation_id)
+        record = repo.get_conversation(conversation_id) or record
         return {
             "conversation": record,
             "inserted": inserted,

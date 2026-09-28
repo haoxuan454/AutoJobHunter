@@ -53,6 +53,18 @@ class ConversationWebFlowTests(unittest.TestCase):
                 response.close()
         return status["value"], json.loads(text)
 
+    def test_opened_boss_rows_do_not_require_zhilian_scan_metadata(self):
+        with patch.object(server, "_boss_im_targets", return_value=[
+            {"target_id": "boss-tab", "url": "https://www.zhipin.com/web/geek/chat"},
+        ]), patch.object(server, "evaluate", return_value=json.dumps([
+            {"hr_name": "Recruiter", "company": "Example Co", "conversation_id": "boss-1"},
+        ])):
+            targets, rows = server._opened_platform_rows("boss")
+
+        self.assertEqual(targets[0]["target_id"], "boss-tab")
+        self.assertEqual(rows[0]["conversation_id"], "boss-1")
+        self.assertNotIn("_scan_complete", rows[0])
+
     def test_zhilian_sync_identity_requires_matching_job_title(self):
         local = {
             "hr_name": "刘先生", "job_company": "Example Co", "job_title": "Python Engineer",
@@ -317,6 +329,70 @@ class ConversationWebFlowTests(unittest.TestCase):
         self.assertEqual(sync_target.call_count, 1)
         self.assertEqual(sync_target.call_args.kwargs['row']['hr_name'], 'Recruiter')
 
+    def test_boss_sync_persists_only_a_concrete_validated_conversation_url(self):
+        conn = server._get_web_db()
+        server.ConversationRepository(conn)
+        conn.execute(
+            "INSERT INTO jobs (id, title, company, url, score, status) VALUES (?, ?, ?, ?, ?, ?)",
+            ("job-boss", "Python Engineer", "Example Co", "https://www.zhipin.com/job_detail/123.html", 82, "sent"),
+        )
+        conn.execute("INSERT INTO history (job_id, action) VALUES (?, 'sent')", ("job-boss",))
+        conn.commit()
+        target = {"target_id": "boss-tab", "url": "https://www.zhipin.com/web/geek/chat"}
+        row = {
+            "hr_name": "Recruiter", "company": "Example Co", "title": "Python Engineer",
+            "job_id": "job-boss", "job_url": "https://www.zhipin.com/job_detail/123.html",
+        }
+        with patch.object(server, "_open_boss_conversation_row", return_value={
+            "status": "matched_chat_loaded", "row": {
+                "hr_name": "Recruiter", "company": "Example Co", "title": "Python Engineer",
+                "conversation_id": "thread-123",
+                "conversation_url": "https://www.zhipin.com/web/geek/chat?conversationId=thread-123",
+            },
+        }), patch.object(server, "evaluate", return_value=json.dumps([
+            {"sender": "hr", "text": "Hello", "message_id": "m-1"},
+        ])):
+            try:
+                result = server._sync_platform_target(
+                    conn, platform="boss", target=target, row=row,
+                    base_dir=server.BASE_DIR, config={},
+                )
+                self.assertEqual(
+                    result["synced"]["conversation"]["conversation_url"],
+                    "https://www.zhipin.com/web/geek/chat?conversationId=thread-123",
+                )
+            finally:
+                conn.close()
+
+    def test_boss_sync_does_not_promote_generic_chat_entry_to_conversation_link(self):
+        conn = server._get_web_db()
+        server.ConversationRepository(conn)
+        conn.execute(
+            "INSERT INTO jobs (id, title, company, url, score, status) VALUES (?, ?, ?, ?, ?, ?)",
+            ("job-boss", "Python Engineer", "Example Co", "https://www.zhipin.com/job_detail/123.html", 82, "sent"),
+        )
+        conn.execute("INSERT INTO history (job_id, action) VALUES (?, 'sent')", ("job-boss",))
+        conn.commit()
+        target_url = "https://www.zhipin.com/web/geek/chat"
+        row = {
+            "hr_name": "Recruiter", "company": "Example Co", "title": "Python Engineer",
+            "job_id": "job-boss", "job_url": "https://www.zhipin.com/job_detail/123.html",
+            "conversation_url": target_url,
+        }
+        with patch.object(server, "_open_boss_conversation_row", return_value={
+            "status": "matched_chat_loaded", "row": {"hr_name": "Recruiter", "conversation_url": target_url},
+        }), patch.object(server, "evaluate", return_value=json.dumps([
+            {"sender": "hr", "text": "Hello", "message_id": "m-2"},
+        ])):
+            try:
+                result = server._sync_platform_target(
+                    conn, platform="boss", target={"target_id": "boss-tab", "url": target_url}, row=row,
+                    base_dir=server.BASE_DIR, config={},
+                )
+                self.assertIsNone(result["synced"]["conversation"]["conversation_url"])
+            finally:
+                conn.close()
+
     def test_batch_sync_does_not_reuse_one_missing_id_row_for_two_jobs(self):
         for conversation_id, job_id in (('boss-a', 'job-a'), ('boss-b', 'job-b')):
             self.request('/api/conversations', 'POST', {
@@ -383,6 +459,71 @@ class ConversationWebFlowTests(unittest.TestCase):
         self.assertEqual(by_id["boss-a"]["status"], "synced")
         self.assertEqual(by_id["boss-b"]["status"], "not_loaded")
         self.assertEqual(sync_target.call_count, 1)
+
+    def test_batch_sync_persists_hr_unread_marker_for_the_card(self):
+        """Global sync must reuse card sync persistence, including the red dot."""
+        conn = server._get_web_db()
+        conn.execute(
+            "INSERT INTO jobs (id, title, company, url, score, status) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "job-zhilian-unread",
+                "Python Engineer",
+                "Example Co",
+                "https://i.zhaopin.com/job/zhilian-unread",
+                88,
+                "sent",
+            ),
+        )
+        conn.execute("INSERT INTO history (job_id, action) VALUES (?, 'sent')", ("job-zhilian-unread",))
+        conn.commit()
+        conn.close()
+        self.request('/api/conversations', 'POST', {
+            'id': 'zhilian-unread-batch', 'platform': 'zhilian', 'job_id': 'job-zhilian-unread',
+            'company_id': 'Example Co', 'hr_name': 'Recruiter',
+        })
+
+        def sync_one(conn, **kwargs):
+            synced = server.sync_extracted_messages(
+                conn,
+                job={
+                    'id': 'job-zhilian-unread', 'company': 'Example Co',
+                    'title': 'Python Engineer', 'score': 88,
+                },
+                conversation={
+                    'hr_name': 'Recruiter', 'company': 'Example Co',
+                    'title': 'Python Engineer', 'external_conversation_id': 'zhilian-thread-1',
+                },
+                platform='zhilian',
+                messages=[{
+                    'sender': 'hr', 'text': '请介绍一下你的 Python 项目',
+                    'message_id': 'zhilian-hr-1',
+                }],
+                local_conversation_id=kwargs['row']['local_conversation_id'],
+                base_dir=server.BASE_DIR,
+                config={},
+            )
+            return {
+                'status': 'synced',
+                'message_count': 1,
+                'platform_message_count': 1,
+                'synced': synced,
+            }
+
+        with patch.object(server, '_opened_platform_rows', return_value=(
+            [{'target_id': 'zhilian-tab', 'url': 'https://i.zhaopin.com/im?refcode=4019'}],
+            [{'target_id': 'zhilian-tab', 'hr_name': 'Recruiter', 'company': 'Example Co',
+              'title': 'Python Engineer', 'session_id': 'zhilian-thread-1'}],
+        )), patch.object(server, '_sync_platform_target', side_effect=sync_one):
+            status, result = self.request('/api/conversations/sync', 'POST', {'platforms': ['zhilian']})
+
+        self.assertTrue(status.startswith('200'), result)
+        self.assertEqual(result['results'][0]['status'], 'synced')
+        self.assertEqual(result['results'][0]['inserted'], 1)
+        card = next(item for item in self.request('/api/conversations')[1]['conversations']
+                    if item['id'] == 'zhilian-unread-batch')
+        self.assertEqual(card['unread_count'], 1)
+        self.assertTrue(card['has_unread'])
+        self.assertNotIn('last_sync_attempt_at', card)
 
     def test_legacy_reply_route_is_disabled_without_touching_platform(self):
         self.request("/api/conversations", "POST", {
