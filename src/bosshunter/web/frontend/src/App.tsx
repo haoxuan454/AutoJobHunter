@@ -11,6 +11,7 @@ import AssistantLabPage from './pages/AssistantLabPage'
 import CommonQuestionsPage from './pages/CommonQuestionsPage'
 import AIUsagePage from './pages/AIUsagePage'
 import VoiceAssistantPage from './pages/VoiceAssistantPage'
+import LogsPage from './pages/LogsPage'
 
 function JobsPage() {
   return <DashboardPage view="jobs" />
@@ -39,6 +40,7 @@ export default function App() {
               <Route path="/analytics" element={<AnalyticsPage />} />
               <Route path="/ai-usage" element={<AIUsagePage />} />
               <Route path="/voice-assistant" element={<VoiceAssistantPage />} />
+              <Route path="/logs" element={<LogsPage />} />
               <Route path="/assistant-lab" element={<AssistantLabPage />} />
               <Route path="/common-questions" element={<CommonQuestionsPage />} />
               <Route path="/notifications" element={<Navigate to="/config?section=notifications" replace />} />

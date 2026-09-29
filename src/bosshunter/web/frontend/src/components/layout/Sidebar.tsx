@@ -1,8 +1,9 @@
 import { NavLink } from 'react-router-dom'
-import { Activity, AudioLines, BarChart3, BookOpen, BriefcaseBusiness, Coins, FlaskConical, Heart, LayoutDashboard, ListChecks, MessageSquare, Radar, Rocket, Settings } from 'lucide-react'
+import { Activity, AudioLines, BarChart3, BookOpen, BriefcaseBusiness, Coins, FileSearch, FlaskConical, Heart, LayoutDashboard, ListChecks, MessageSquare, Radar, Rocket, Settings } from 'lucide-react'
 import { useEffect, useState } from 'react'
 
 const navItems = [
+  { to: '/logs', icon: FileSearch, label: '运行日志' },
   { to: '/', icon: LayoutDashboard, label: '工作台' },
   { to: '/jobs', icon: BriefcaseBusiness, label: '岗位池' },
   { to: '/conversations', icon: MessageSquare, label: 'HR 会话' },

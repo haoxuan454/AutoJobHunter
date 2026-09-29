@@ -250,6 +250,39 @@ class ConversationReplyApiTests(unittest.TestCase):
         send.assert_not_called()
         self.assertEqual(self.request("/api/conversations/boss-ambiguous")[1]["messages"], [])
 
+    def test_boss_history_card_uses_active_header_when_sidebar_omits_title(self):
+        local = {
+            "platform": "boss", "external_conversation_id": "", "hr_name": "",
+            "job_company": "Example Co", "job_title": "Python Engineer",
+        }
+        target = {"target_id": "boss-tab", "url": "https://www.zhipin.com/web/geek/chat"}
+        row = {
+            "target_id": "boss-tab", "hr_name": "Recruiter", "company": "Example Co",
+            "hr_title": "HR", "title": "", "active": True,
+        }
+        with patch.object(server, "_opened_platform_rows", return_value=([target], [row])), \
+             patch.object(server, "evaluate", return_value=json.dumps({
+                 "url": target["url"], "text": "Recruiter Example Co HR Python Engineer"
+             })):
+            selected_target, selected_row, error = server._reply_platform_candidate(local)
+        self.assertEqual(selected_target, target)
+        self.assertEqual(selected_row, row)
+        self.assertIsNone(error)
+
+    def test_boss_history_card_rejects_active_company_without_matching_header_title(self):
+        local = {
+            "platform": "boss", "external_conversation_id": "", "hr_name": "",
+            "job_company": "Example Co", "job_title": "Python Engineer",
+        }
+        target = {"target_id": "boss-tab", "url": "https://www.zhipin.com/web/geek/chat"}
+        row = {"target_id": "boss-tab", "hr_name": "Recruiter", "company": "Example Co", "active": True}
+        with patch.object(server, "_opened_platform_rows", return_value=([target], [row])), \
+             patch.object(server, "evaluate", return_value=json.dumps({"text": "Recruiter Example Co Other Role"})):
+            selected_target, selected_row, error = server._reply_platform_candidate(local)
+        self.assertIsNone(selected_target)
+        self.assertIsNone(selected_row)
+        self.assertEqual(error, "not_loaded")
+
     def test_unsupported_platform_never_queries_browser(self):
         for platform in ("liepin", "51job"):
             conversation_id = f"{platform}-reply"

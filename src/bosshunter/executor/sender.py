@@ -2,6 +2,7 @@
 
 import time
 import json
+import logging
 from threading import Event
 from urllib.parse import urljoin
 from rich.console import Console
@@ -30,6 +31,7 @@ from bosshunter.platform_delivery import DeliveryContext, get_delivery_adapter
 from bosshunter.conversation_bridge import record_verified_delivery
 
 console = Console()
+runtime_logger = logging.getLogger("bosshunter.runtime")
 
 CHAT_BUTTON_SELECTOR = (
     'a[redirect-url*="/web/geek/chat"], '
@@ -50,6 +52,16 @@ JOB_CLOSED_MARKERS = (
     "该职位已暂停招聘", "职位已暂停招聘", "职位暂停招聘", "停止招聘", "已停止招聘",
     "暂停招聘", "招聘已暂停", "该职位已招满", "职位已招满", "已招满",
     "该职位暂不招人", "暂不招人",
+)
+
+# Keep this independent from the legacy, mojibake-prone marker list above.
+# A missing chat control is not proof that a job is closed.
+JOB_CLOSED_MARKERS_SAFE = (
+    "职位已关闭", "该职位已关闭", "此职位已关闭", "职位已经关闭",
+    "职位已下线", "该职位已下线", "此职位已下线", "职位已经下线",
+    "职位不存在", "访问的页面不存在", "页面不存在", "岗位已关闭",
+    "岗位已下架", "岗位不存在", "招聘已结束", "停止招聘",
+    "暂停招聘", "已招满", "暂不招聘", "Oops!",
 )
 
 CHAT_BUTTON_SCRIPT_FOR_TESTS = """
@@ -421,6 +433,71 @@ def _chat_target_matches_job(target_id: str, job: dict) -> bool:
     return bool(result.get("success") and result.get("matches"))
 
 
+def _boss_delivery_metadata(target_id: str, job: dict) -> dict:
+    """Read the identity of the already-verified BOSS chat.
+
+    This is deliberately a read-only snapshot on the chat tab that has just
+    passed message verification.  It must never invent an external ID or use
+    a job URL as a conversation URL.  Missing fields remain empty so later
+    reply selection can fail closed instead of sending to the wrong recruiter.
+    """
+    try:
+        raw = evaluate(target_id, f"""
+    (() => {{
+        const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+        const selected = document.querySelector('li[role=listitem] .friend-content.selected')?.closest('li[role=listitem]');
+        const active = selected || document.querySelector('.friend-content.selected')?.closest('li[role=listitem]');
+        const name = active?.querySelector('.name-text')?.textContent || '';
+        const spans = active?.querySelectorAll('.name-box span') || [];
+        const attrs = active ? ['data-id', 'data-conversation-id', 'data-uid'] : [];
+        const external = active ? (attrs.map(key => active.getAttribute(key) || '').find(Boolean) || '') : '';
+        const link = active?.querySelector('a[href*="/chat"]')?.href || '';
+        const root = document.querySelector('.chat-conversation') || document.querySelector('.friend-content.selected');
+        const text = clean(root?.innerText || root?.textContent || '');
+        return JSON.stringify({{
+            success: true,
+            hr_name: clean(name),
+            company: clean(spans.length >= 2 ? spans[1].textContent : ''),
+            title: clean(spans.length >= 3 ? spans[spans.length - 1].textContent : ''),
+            external_conversation_id: clean(external),
+            hr_external_id: clean(active?.getAttribute('data-uid') || ''),
+            conversation_url: clean(link || (location.pathname.includes('/web/geek/chat') ? location.href : '')),
+            active_text: text.slice(0, 2000)
+        }});
+    }})()
+    """)
+        result = _parse_js_result(raw)
+    except Exception as exc:
+        # Metadata enrichment is best-effort.  The actual platform send has
+        # already passed its independent DOM verification; a snapshot failure
+        # must not turn that verified send into a false delivery failure.
+        runtime_logger.debug("BOSS delivery metadata snapshot failed: %s", exc)
+        return {}
+    if not result.get("success"):
+        return {}
+    metadata = {
+        "conversation": {
+            "hr_name": str(result.get("hr_name") or "").strip(),
+            "hr_external_id": str(result.get("hr_external_id") or "").strip(),
+            "external_conversation_id": str(result.get("external_conversation_id") or "").strip(),
+            "company": str(result.get("company") or "").strip(),
+            "title": str(result.get("title") or job.get("title") or "").strip(),
+            "conversation_url": str(result.get("conversation_url") or "").strip(),
+        }
+    }
+    return metadata
+
+
+def _boss_verified_result(target_id: str, job: dict, **fields) -> dict:
+    """Build a verified BOSS result with an observed chat identity snapshot."""
+    return {
+        "success": True,
+        "verified": True,
+        **fields,
+        "metadata": _boss_delivery_metadata(target_id, job),
+    }
+
+
 def _wait_for_chat_page(
     target_id: str,
     stop_event,
@@ -729,7 +806,7 @@ def _detect_job_closed_on_page(target_id: str) -> dict | None:
     so we can surface the real business conclusion ("job is closed") instead of only the
     technical step that failed. Returns a send-result dict when a closed marker is found.
     """
-    markers = list(JOB_CLOSED_MARKERS)
+    markers = list(JOB_CLOSED_MARKERS_SAFE)
     probe = _parse_js_result(evaluate(target_id, f"""
     (() => {{
         const text = document.body ? document.body.innerText : '';
@@ -828,7 +905,7 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
     (() => {{
         const text = document.body ? document.body.innerText : '';
         const title = document.title || '';
-        const closedMarkers = {json.dumps(list(JOB_CLOSED_MARKERS), ensure_ascii=False)};
+        const closedMarkers = {json.dumps(list(JOB_CLOSED_MARKERS_SAFE), ensure_ascii=False)};
         const loggedInMarker = /退出登录|我的消息|在线沟通|我的简历/.test(text);
         const loginWall = /登录\/注册|立即登录|扫码登录|手机号登录|请先登录|登录失效/.test(text);
         if (loginWall && !loggedInMarker) {{
@@ -955,12 +1032,9 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
                     close_tab(target_id)
                     return {"success": False, "error": "stopped", "history_detail": "用户已请求停止", "skip_backoff": True}, None
                 if _message_delivery_state(target_id, greeting) == "delivered":
+                    result = _boss_verified_result(target_id, job, first_contact=True)
                     close_tab(target_id)
-                    return {
-                        "success": True,
-                        "verified": True,
-                        "first_contact": True,
-                    }, None
+                    return result, None
                 if _verify_greeting_in_chat_list(job, greeting, stop_event):
                     close_tab(target_id)
                     return {
@@ -1039,8 +1113,9 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
                 close_tab(target_id)
                 return {"success": False, "error": "stopped", "history_detail": "用户已请求停止", "skip_backoff": True}, None
             if _message_delivery_state(target_id, greeting) == "delivered":
+                result = _boss_verified_result(target_id, job)
                 close_tab(target_id)
-                return {"success": True, "verified": True}, None
+                return result, None
             if _verify_greeting_in_chat_list(job, greeting, stop_event):
                 close_tab(target_id)
                 return {
@@ -1251,6 +1326,15 @@ def send_greetings(config: dict, force: bool = False, db_path=None) -> int:
             send_report["attempted_count"] += 1
 
             if not result_data.get("success"):
+                runtime_logger.warning(
+                    "delivery_failed platform=%s job_id=%s company=%s title=%s error=%s detail=%s",
+                    job.get("source_platform") or "boss",
+                    job.get("id"),
+                    job.get("company"),
+                    job.get("title"),
+                    result_data.get("error", "unknown"),
+                    result_data.get("history_detail", ""),
+                )
                 console.print(f"[yellow]    ! 发送失败，已记录并关闭任务页面: {result_data.get('error', 'unknown')}[/yellow]")
                 if failed_target_id:
                     close_tab(failed_target_id)

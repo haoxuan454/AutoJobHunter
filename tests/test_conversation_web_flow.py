@@ -303,7 +303,7 @@ class ConversationWebFlowTests(unittest.TestCase):
         detail_status, detail = self.request("/api/conversations/assistant-lab%3Aassistant-lab%3Adefault")
         self.assertTrue(detail_status.startswith("200"), detail)
         self.assertEqual(len(detail["messages"]), 4)
-    def test_batch_sync_allows_unique_company_fallback_for_history_card(self):
+    def test_batch_sync_rejects_boss_history_card_without_job_identity(self):
         self.request('/api/conversations', 'POST', {
             'id': 'boss-history', 'platform': 'boss', 'job_id': 'job-history',
             'company_id': 'Example Co', 'hr_name': '',
@@ -319,15 +319,14 @@ class ConversationWebFlowTests(unittest.TestCase):
             status, result = self.request('/api/conversations/sync', 'POST', {'platforms': ['boss']})
 
         self.assertTrue(status.startswith('200'), result)
-        self.assertTrue(result['success'])
-        self.assertTrue(result['complete'])
+        self.assertFalse(result['success'])
+        self.assertFalse(result['complete'])
         self.assertFalse(result['partial'])
-        self.assertEqual(result['status'], 'synced')
-        self.assertEqual(result['results'][0]['status'], 'synced')
-        self.assertEqual(result['results'][0]['message_count'], 1)
-        self.assertEqual(result['results'][0]['platform_message_count'], 2)
-        self.assertEqual(sync_target.call_count, 1)
-        self.assertEqual(sync_target.call_args.kwargs['row']['hr_name'], 'Recruiter')
+        self.assertEqual(result['status'], 'not_synced')
+        self.assertEqual(result['results'][0]['status'], 'not_loaded')
+        self.assertEqual(result['results'][0]['message_count'], 0)
+        self.assertEqual(result['results'][0]['inserted'], 0)
+        sync_target.assert_not_called()
 
     def test_boss_sync_persists_only_a_concrete_validated_conversation_url(self):
         conn = server._get_web_db()
@@ -407,8 +406,8 @@ class ConversationWebFlowTests(unittest.TestCase):
 
         self.assertTrue(status.startswith('200'), result)
         by_id = {item['conversation_id']: item for item in result['results']}
-        self.assertEqual(by_id['boss-a']['status'], 'ambiguous')
-        self.assertEqual(by_id['boss-b']['status'], 'ambiguous')
+        self.assertEqual(by_id['boss-a']['status'], 'not_loaded')
+        self.assertEqual(by_id['boss-b']['status'], 'not_loaded')
         sync_target.assert_not_called()
 
     def test_batch_sync_reports_loaded_contacts_without_active_chat(self):

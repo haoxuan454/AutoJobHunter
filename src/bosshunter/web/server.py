@@ -123,6 +123,8 @@ from bosshunter.web.tasks import (
 	WorkbenchTaskRunner,
 	wait_for_initial_monitor_cooldown,
 )
+from bosshunter.web.log_reader import read_logs
+from bosshunter.web.runtime_logging import configure_runtime_logging, runtime_logger
 from bosshunter.conversations import ConversationRepository, IncomingMessage, normalize_platform_external_url, utc_now
 from bosshunter.conversation_analytics import build_conversation_analytics
 from bosshunter.conversation_bridge import reconcile_verified_deliveries, sync_extracted_messages
@@ -270,6 +272,13 @@ def set_base_dir(base_dir: Path | str) -> None:
 def _get_web_db():
 	"""Open the dashboard database from the resolved runtime data directory."""
 	return get_db(DATA_DIR / "bosshunter.db")
+
+
+def _runtime_log(message: str, level: str = "info", **fields: Any) -> None:
+	"""Write a bounded, structured application event to the local runtime log."""
+	logger = runtime_logger()
+	payload = " ".join(f"{key}={str(value)[:300]}" for key, value in fields.items() if value not in (None, ""))
+	getattr(logger, level if level in {"debug", "info", "warning", "error"} else "info")(f"{message} {payload}".strip())
 
 
 def _conversation_repo():
@@ -1160,6 +1169,30 @@ task_runner._executors.update({
 @app.route("/api/health")
 def health():
 	return _json_response({"status": "ok", "version": __version__})
+
+
+@app.route("/api/logs")
+def api_logs():
+	"""Read only the project's fixed runtime logs, newest entries first."""
+	try:
+		page = int(request.params.get("page", "1"))
+		page_size = int(request.params.get("page_size", "50"))
+		tail = int(request.params.get("tail", str(2 * 1024 * 1024)))
+		data = read_logs(
+			DATA_DIR / "runtime",
+			source=str(request.params.get("source", "all") or "all"),
+			query=str(request.params.get("query", "") or ""),
+			page=page,
+			page_size=page_size,
+			tail_bytes=tail,
+			task_lines=[line for task in task_runner.status().get("tasks", []) for line in task.get("logs", [])],
+		)
+		return _json_response(data)
+	except (TypeError, ValueError) as exc:
+		return _json_response({"error": str(exc)}, 400)
+	except Exception as exc:
+		_runtime_log("logs_read_failed", "error", error=exc)
+		return _json_response({"error": "日志读取失败"}, 500)
 
 
 # ─── Dashboard APIs ──────────────────────────────────────
@@ -3460,11 +3493,14 @@ def _conversation_identity_score(local: dict, row: dict) -> int:
         return 0
     if not local_hr:
         # Historical delivery cards may predate HR snapshot persistence.  A
-        # company-only candidate is usable only when the caller proves that it
-        # is the sole rendered candidate; ties and cross-card reuse are rejected
-        # below.  Keep this score below HR/company matches so an exact card wins
-        # when one rendered row is shared by multiple local cards.
-        return 25
+        # company+title candidate is safe only when it is the sole rendered
+        # candidate; company-only matching remains forbidden because one
+        # recruiter can own several roles at the same company.
+        if not local_title or not row_title:
+            return 0
+        if local_title == row_title or local_title in row_title or row_title in local_title:
+            return 60
+        return 0
     if not row_hr or local_hr != row_hr:
         return 0
     if local_title and row_title and (local_title == row_title or local_title in row_title or row_title in local_title):
@@ -3472,6 +3508,35 @@ def _conversation_identity_score(local: dict, row: dict) -> int:
     # Company + HR is only a weak fallback.  It is acceptable only when this
     # platform has rendered one unique candidate; the caller rejects ties.
     return 40
+
+
+def _boss_active_chat_matches_job(target_id: str, local: dict, row: dict) -> bool:
+    """Read-only verify the active BOSS chat header for a title-less row.
+
+    BOSS keeps the recruiter/company in the sidebar but renders the applied
+    job title only in the active chat header.  A sidebar company match alone
+    is unsafe; this probe requires both the expected company and job title in
+    the already-open chat DOM.  It never selects a row or performs navigation.
+    """
+    if not row.get("active"):
+        return False
+    company = str(local.get("job_company") or local.get("company_id") or "").strip()
+    title = str(local.get("job_title") or "").strip()
+    if not company or not title:
+        return False
+    try:
+        raw = evaluate(target_id, """JSON.stringify({
+            url: location.href,
+            text: document.body ? (document.body.innerText || document.body.textContent || '') : ''
+        })""", timeout=10)
+        snapshot = _parse_browser_json(raw)
+        text = str(snapshot.get("text") or "") if isinstance(snapshot, dict) else ""
+    except Exception as exc:
+        _runtime_log("boss_active_chat_identity_probe_failed", "debug", error=str(exc)[:200])
+        return False
+    compact = lambda value: "".join(str(value or "").split()).casefold()
+    rendered = compact(text)
+    return compact(company) in rendered and compact(title) in rendered
 
 
 def _conversation_row_identity(row: dict) -> tuple[str, ...]:
@@ -4227,7 +4292,7 @@ def _reply_platform_candidate(local: dict[str, Any]) -> tuple[dict[str, Any] | N
 				return None, None, "identity_incomplete"
 		elif not all(
 			str(local.get(field) or "").strip()
-			for field in ("hr_name", "job_company", "job_title")
+			for field in ("job_company", "job_title")
 		):
 			return None, None, "identity_incomplete"
 	targets, rows = _opened_platform_rows(platform)
@@ -4239,6 +4304,18 @@ def _reply_platform_candidate(local: dict[str, Any]) -> tuple[dict[str, Any] | N
 		if local_external and row_external and row_external != local_external:
 			continue
 		score = _zhilian_reply_identity_score(local, row) if platform == "zhilian" else _conversation_identity_score(local, row)
+		if (
+			platform == "boss"
+			and not score
+			and not str(local.get("hr_name") or "").strip()
+			and str(row.get("active") or "").lower() == "true"
+		):
+			# BOSS omits the job title from the sidebar row. Only the already
+			# active chat header can complete this historical card's identity.
+			# Company equality is checked inside the probe together with title;
+			# company-only matching remains forbidden.
+			if _boss_active_chat_matches_job(row.get("target_id") or "", local, row):
+				score = 60
 		if score:
 			candidates.append((score, row))
 	candidates.sort(key=lambda item: item[0], reverse=True)
@@ -5487,6 +5564,7 @@ def error500(error):
 
 def run_server(host: str = "127.0.0.1", port: int = 8686, open_browser: bool = True):
 	"""Start the web server."""
+	configure_runtime_logging(DATA_DIR)
 	if not (FRONTEND_DIR / "index.html").is_file():
 		raise SystemExit(
 			"前端资源未构建：请在 src/bosshunter/web/frontend 下执行 "
