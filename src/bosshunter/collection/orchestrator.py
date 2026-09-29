@@ -246,12 +246,21 @@ class _SharedProcessor:
         self.stop_event = stop_event
         self.config = config
         self.emit = emit
+        try:
+            self.persist_interval = max(
+                1,
+                int(config.get("collection", {}).get("progress_persist_interval", 25) or 25),
+            )
+        except (TypeError, ValueError):
+            self.persist_interval = 25
+        self._last_persisted_new_count = 0
         self.progress = CollectionProgress(
             run_id=run_id, platform=request.platform, platform_index=platform_index,
             platform_total=platform_total, phase="queued", target=None,
             max_pages=request.max_pages,
         )
         self.new_job_ids: list[str] = []
+        self._last_persisted_new_count = 0
 
     def event(self, *, phase: str | None = None, **values: Any) -> None:
         if phase:
@@ -261,6 +270,8 @@ class _SharedProcessor:
         for key, value in values.items():
             if hasattr(self.progress, key):
                 setattr(self.progress, key, value)
+        if self.progress.seen <= 1 or self.progress.seen % self.persist_interval == 0:
+            self.conn.commit()
         self.emit(self.progress)
 
     def inspect(self, candidate: JobCandidate) -> bool:
@@ -293,6 +304,10 @@ class _SharedProcessor:
             self.event(message="JD 命中过滤规则")
             return True
         try:
+            # Keep each accepted candidate durable before control returns to a
+            # platform collector.  Collectors may stop or raise during the
+            # next detail/page; losing already verified candidates would make
+            # the persisted checkpoint and collected_job_ids disagree.
             inserted = insert_job_if_new(self.conn, candidate.as_job_record())
         except Exception as exc:
             self.progress.save_failed += 1
@@ -332,6 +347,13 @@ class CollectionOrchestrator:
         self.run_id = run_id or str(uuid4())
         self.task_id = task_id
         self.stop_event = config.get("_workbench_stop_event")
+        try:
+            self.persist_interval = max(
+                1,
+                int(config.get("collection", {}).get("progress_persist_interval", 25) or 25),
+            )
+        except (TypeError, ValueError):
+            self.persist_interval = 25
 
     def run(self, raw_options: dict[str, Any] | None = None) -> dict[str, Any]:
         resume_id = raw_options.get("resume_run_id") if isinstance(raw_options, dict) else None
@@ -370,6 +392,7 @@ class CollectionOrchestrator:
                     states[platform]["status"] = "stopped"
                     states[platform]["reason_code"] = "user_stopped"
                     break
+                self._last_persisted_new_count = 0
                 raw = options["platforms"][platform]
                 request = PlatformCollectionRequest(platform=platform, **raw)
                 states[platform]["status"] = "running"
@@ -414,9 +437,12 @@ class CollectionOrchestrator:
                         else self.registry.get(platform)
                     )
                     result = collector.collect(request, hooks)
+                    conn.commit()
                 except CollectionError as exc:
+                    conn.commit()
                     result = PlatformCollectionResult(platform, "blocked", exc.code, exc.message, error=str(exc))
                 except Exception as exc:
+                    conn.commit()
                     result = PlatformCollectionResult(platform, "failed", "network_error", f"{platform} 采集失败", error=str(exc)[:500])
                 result.new_job_ids = list(processor.new_job_ids)
                 result.counts = self._counts(processor.progress)
@@ -525,7 +551,16 @@ class CollectionOrchestrator:
         }
         if callable(callback):
             callback(state)
-        self._persist(states, [*all_new_ids, *platform_new_ids], platform)
+        # Keep the UI callback real-time, but avoid a SQLite write for every
+        # candidate. The final platform result is always persisted by run().
+        should_persist = (
+            progress.seen <= 1
+            or progress.seen % self.persist_interval == 0
+            or len(platform_new_ids) > self._last_persisted_new_count
+        )
+        if should_persist:
+            self._persist(states, [*all_new_ids, *platform_new_ids], platform)
+            self._last_persisted_new_count = len(platform_new_ids)
 
     def _emit_scoring(self, states: dict[str, dict[str, Any]], new_ids: list[str]) -> None:
         log = self.config.get("_workbench_log")

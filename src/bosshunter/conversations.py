@@ -474,9 +474,14 @@ class ConversationRepository:
             )
         else:
             display_name = "NULLIF(TRIM(c.hr_name), '') AS display_hr_name"
+        job_company = (
+            "COALESCE(NULLIF(TRIM(c.company_id), ''), NULLIF(TRIM(j.company), '')) AS job_company"
+            if "company" in columns
+            else "NULLIF(TRIM(c.company_id), '') AS job_company"
+        )
         return ", ".join([
             column("title", "job_title"),
-            column("company", "job_company"),
+            job_company,
             column("hr_name", "job_hr_name"),
             column("hr_title", "job_hr_title"),
             column("url", "job_url"),

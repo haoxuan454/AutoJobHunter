@@ -442,30 +442,66 @@ def _boss_delivery_metadata(target_id: str, job: dict) -> dict:
     reply selection can fail closed instead of sending to the wrong recruiter.
     """
     try:
-        raw = evaluate(target_id, f"""
-    (() => {{
+        expected_company = json.dumps(str(job.get("company") or ""), ensure_ascii=False)
+        expected_title = json.dumps(str(job.get("title") or ""), ensure_ascii=False)
+        script = """
+    (() => {
         const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
         const selected = document.querySelector('li[role=listitem] .friend-content.selected')?.closest('li[role=listitem]');
         const active = selected || document.querySelector('.friend-content.selected')?.closest('li[role=listitem]');
-        const name = active?.querySelector('.name-text')?.textContent || '';
-        const spans = active?.querySelectorAll('.name-box span') || [];
-        const attrs = active ? ['data-id', 'data-conversation-id', 'data-uid'] : [];
-        const external = active ? (attrs.map(key => active.getAttribute(key) || '').find(Boolean) || '') : '';
-        const link = active?.querySelector('a[href*="/chat"]')?.href || '';
         const root = document.querySelector('.chat-conversation') || document.querySelector('.friend-content.selected');
+        const nodes = [active, root].filter(Boolean);
+        const attrValue = (keys, sourceNodes = nodes) => sourceNodes.map(node => keys.map(key => node.getAttribute?.(key) || '').find(Boolean) || '').find(Boolean) || '';
+        const readRow = (row) => {
+            const spans = row?.querySelectorAll('.name-box span') || [];
+            const nameNode = row?.querySelector('.name-text, [data-name]');
+            const name = clean(nameNode?.getAttribute?.('data-name') || nameNode?.textContent || '');
+            const company = clean(spans.length >= 2 ? spans[1].textContent : row?.getAttribute?.('data-company') || '');
+            const title = clean(spans.length >= 3 ? spans[spans.length - 1].textContent : row?.getAttribute?.('data-job-title') || '');
+            return {
+                row,
+                name,
+                company,
+                title,
+                external: attrValue(['data-id', 'data-conversation-id', 'data-uid', 'data-user-id', 'data-geek-id', 'data-friend-id'], [row]),
+                link: row?.querySelector('a[href*="/chat"], a[href*="geek"], [data-url*="/chat"]')?.href || row?.getAttribute('data-url') || ''
+            };
+        };
+        let identity = readRow(active);
+        const expectedCompany = clean(__EXPECTED_COMPANY__);
+        const expectedTitle = clean(__EXPECTED_TITLE__);
+        const normalize = value => clean(value).replace(/\\s+/g, '').toLowerCase();
+        const same = (left, right) => !!left && !!right && (normalize(left) === normalize(right) || normalize(left).includes(normalize(right)) || normalize(right).includes(normalize(left)));
+        // The BOSS chat page can keep the selected row mounted without exposing
+        // its identity in the chat panel.  Fall back to the list only when the
+        // company identifies exactly one row; never bind an ambiguous recruiter.
+        if (!identity.name || !identity.company) {
+            const matches = Array.from(document.querySelectorAll('li[role=listitem]'))
+                .map(readRow)
+                .filter(candidate => same(candidate.company, __EXPECTED_COMPANY__))
+                .filter(candidate => !__EXPECTED_TITLE__ || !candidate.title || same(candidate.title, __EXPECTED_TITLE__));
+            if (matches.length === 1) identity = matches[0];
+        }
+        const name = identity.name;
+        const company = identity.company;
+        const title = identity.title;
+        const external = identity.external || attrValue(['data-id', 'data-conversation-id', 'data-uid', 'data-user-id', 'data-geek-id', 'data-friend-id']);
+        const link = identity.link;
         const text = clean(root?.innerText || root?.textContent || '');
-        return JSON.stringify({{
+        return JSON.stringify({
             success: true,
-            hr_name: clean(name),
-            company: clean(spans.length >= 2 ? spans[1].textContent : ''),
-            title: clean(spans.length >= 3 ? spans[spans.length - 1].textContent : ''),
+            hr_name: name,
+            company: company,
+            title: title,
             external_conversation_id: clean(external),
-            hr_external_id: clean(active?.getAttribute('data-uid') || ''),
+            hr_external_id: clean(attrValue(['data-uid', 'data-user-id', 'data-geek-id'])),
             conversation_url: clean(link || (location.pathname.includes('/web/geek/chat') ? location.href : '')),
             active_text: text.slice(0, 2000)
-        }});
-    }})()
-    """)
+        });
+    })()
+    """
+        script = script.replace("__EXPECTED_COMPANY__", expected_company).replace("__EXPECTED_TITLE__", expected_title)
+        raw = evaluate(target_id, script)
         result = _parse_js_result(raw)
     except Exception as exc:
         # Metadata enrichment is best-effort.  The actual platform send has

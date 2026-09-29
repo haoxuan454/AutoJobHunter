@@ -65,6 +65,11 @@ export interface WorkbenchTask {
   stop_requested: boolean
   metrics?: Record<string, number | string>
   progress?: CollectionProgress & { conflict_ids?: string[] }
+  confirmation?: {
+    waiting_confirmation: boolean
+    confirmation_complete: boolean
+    confirmed_job_ids: string[]
+  }
 }
 
 export interface CollectionPlatformProgress {

@@ -91,17 +91,24 @@ JS_EXTRACT_CHAT_LIST = r"""
     const items = document.querySelectorAll('li[role=listitem]');
     const results = [];
     items.forEach(item => {
-        const nameText = item.querySelector('.name-text');
+        // Prefer the recruiter-only node.  A broad ``[class*="name"]``
+        // fallback can select ``.name-box`` before its nested
+        // ``.name-text`` and concatenate recruiter + company + role.  That
+        // value cannot be used to safely re-select the same conversation.
+        const nameText = item.querySelector('.name-text')
+            || item.querySelector('[data-name]')
+            || item.querySelector('.name')
+            || item.querySelector('[class*="name"]');
         const nameBox = item.querySelector('.name-box');
         const lastMsgEl = item.querySelector('.last-msg-text');
         const msgStatus = item.querySelector('.message-status');
         const unreadEl = item.querySelector('.unread-count, .badge-count, .notice-badge, [class*="unread"]');
 
-        if (!nameText) return;
+        if (!nameText && !item.getAttribute('data-name')) return;
 
         const spans = nameBox ? nameBox.querySelectorAll('span') : [];
-        const company = spans.length >= 2 ? spans[1].textContent.trim() : '';
-        const hrTitle = spans.length >= 3 ? spans[spans.length - 1].textContent.trim() : '';
+        const company = spans.length >= 2 ? spans[1].textContent.trim() : (item.getAttribute('data-company') || '');
+        const hrTitle = spans.length >= 3 ? spans[spans.length - 1].textContent.trim() : (item.getAttribute('data-job-title') || '');
 
         // A missing delivery marker is not enough to prove the message came from HR.
         // Treat uncertain rows as candidates and verify direction from the full chat.
@@ -130,11 +137,14 @@ JS_EXTRACT_CHAT_LIST = r"""
         const conversationId = item.getAttribute('data-id')
             || item.getAttribute('data-conversation-id')
             || item.getAttribute('data-uid')
+            || item.getAttribute('data-user-id')
+            || item.getAttribute('data-geek-id')
             || '';
-        const conversationLink = item.querySelector('a[href*="/chat"]')?.href || '';
+        const conversationLink = item.querySelector('a[href*="/chat"], a[href*="geek"], [data-url*="/chat"]')?.href
+            || item.getAttribute('data-url') || '';
 
         results.push({
-            hr_name: nameText.textContent.trim(),
+            hr_name: (nameText?.getAttribute('data-name') || nameText?.textContent || item.getAttribute('data-name') || '').trim(),
             company: company,
             hr_title: hrTitle,
             last_message: lastMessage,

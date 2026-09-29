@@ -65,6 +65,52 @@ class ConversationWebFlowTests(unittest.TestCase):
         self.assertEqual(rows[0]["conversation_id"], "boss-1")
         self.assertNotIn("_scan_complete", rows[0])
 
+    def test_zhilian_rows_with_same_visible_identity_are_deduplicated_across_tabs(self):
+        row_a = {
+            "target_id": "zhilian-tab-a",
+            "hr_name": "HR",
+            "company": "Example Co",
+            "title": "Python Engineer",
+            "preview": "不会强制晚班",
+            "time": "19:07",
+        }
+        row_b = {**row_a, "target_id": "zhilian-tab-b"}
+
+        self.assertEqual(
+            server._conversation_row_identity(row_a, platform="zhilian"),
+            server._conversation_row_identity(row_b, platform="zhilian"),
+        )
+
+    def test_zhilian_rows_with_different_visible_preview_remain_distinct(self):
+        row_a = {
+            "target_id": "zhilian-tab-a",
+            "hr_name": "HR",
+            "company": "Example Co",
+            "title": "Python Engineer",
+            "preview": "不会强制晚班",
+            "time": "19:07",
+        }
+        row_b = {**row_a, "target_id": "zhilian-tab-b", "preview": "欢迎添加微信"}
+
+        self.assertNotEqual(
+            server._conversation_row_identity(row_a, platform="zhilian"),
+            server._conversation_row_identity(row_b, platform="zhilian"),
+        )
+
+    def test_boss_rows_without_external_id_keep_tab_scoped_identity(self):
+        row_a = {
+            "target_id": "boss-tab-a",
+            "hr_name": "HR",
+            "company": "Example Co",
+            "title": "Python Engineer",
+        }
+        row_b = {**row_a, "target_id": "boss-tab-b"}
+
+        self.assertNotEqual(
+            server._conversation_row_identity(row_a, platform="boss"),
+            server._conversation_row_identity(row_b, platform="boss"),
+        )
+
     def test_zhilian_sync_identity_requires_matching_job_title(self):
         local = {
             "hr_name": "刘先生", "job_company": "Example Co", "job_title": "Python Engineer",
@@ -458,6 +504,38 @@ class ConversationWebFlowTests(unittest.TestCase):
         self.assertEqual(by_id["boss-a"]["status"], "synced")
         self.assertEqual(by_id["boss-b"]["status"], "not_loaded")
         self.assertEqual(sync_target.call_count, 1)
+
+    def test_batch_sync_collapses_same_zhilian_row_repeated_in_multiple_tabs(self):
+        self.request("/api/conversations", "POST", {
+            "id": "zhilian-duplicate-tabs", "platform": "zhilian",
+            "job_id": "job-zhilian-duplicate", "company_id": "Example Co",
+            "hr_name": "Recruiter", "job_title": "Python Engineer",
+        })
+        synced_payload = {
+            "status": "synced", "message_count": 1,
+            "platform_message_count": 1, "synced": {"inserted": []},
+        }
+        row = {
+            "hr_name": "Recruiter", "company": "Example Co",
+            "title": "Python Engineer", "preview": "已读",
+            "time": "19:07", "session_id": "",
+        }
+        with patch.object(server, "_opened_platform_rows", return_value=(
+            [
+                {"target_id": "zhilian-tab-a", "url": "https://i.zhaopin.com/im"},
+                {"target_id": "zhilian-tab-b", "url": "https://i.zhaopin.com/im"},
+            ],
+            [{**row, "target_id": "zhilian-tab-a"}, {**row, "target_id": "zhilian-tab-b"}],
+        )), patch.object(server, "_zhilian_identity_score", return_value=90), \
+             patch.object(server, "_sync_platform_target", return_value=synced_payload) as sync_target:
+            status, result = self.request(
+                "/api/conversations/sync", "POST", {"platforms": ["zhilian"]}
+            )
+
+        self.assertTrue(status.startswith("200"), result)
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["results"][0]["status"], "synced")
+        sync_target.assert_called_once()
 
     def test_batch_sync_persists_hr_unread_marker_for_the_card(self):
         """Global sync must reuse card sync persistence, including the red dot."""

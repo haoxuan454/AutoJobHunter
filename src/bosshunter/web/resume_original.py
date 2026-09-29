@@ -5,6 +5,19 @@ from __future__ import annotations
 from pathlib import Path
 
 
+_WINDOWS_RESERVED_STEMS = {
+	"CON", "PRN", "AUX", "NUL",
+	*(f"COM{i}" for i in range(1, 10)),
+	*(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _is_windows_reserved_path(path: Path) -> bool:
+	"""Return whether Windows treats this filename as a device path."""
+	stem = path.stem.split(".", 1)[0].upper()
+	return stem in _WINDOWS_RESERVED_STEMS
+
+
 def upload_keeps_original_pdf(raw_filename: str) -> bool:
 	"""Return True when the uploaded file should keep a companion PDF. Pure."""
 	return Path(str(raw_filename)).suffix.lower() == ".pdf"
@@ -43,6 +56,8 @@ def remove_companion_pdf(configured_path: Path) -> bool:
 	"""
 	path = Path(configured_path)
 	markdown_path, pdf_path = resolve_configured_resume_files(path)
+	if _is_windows_reserved_path(pdf_path):
+		return False
 	if path.suffix.lower() == ".pdf" and not markdown_path.is_file():
 		return False
 	if not pdf_path.is_file():
@@ -67,6 +82,8 @@ def write_resume_artifacts(
 
 	pdf_path = companion_pdf_path(markdown_path)
 	if original_pdf_bytes is None:
+		if _is_windows_reserved_path(pdf_path):
+			return None
 		if pdf_path.exists():
 			pdf_path.unlink()
 		return None

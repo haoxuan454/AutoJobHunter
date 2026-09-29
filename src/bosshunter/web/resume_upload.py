@@ -16,6 +16,11 @@ from bosshunter.web.resume_text import sanitize_resume_text
 
 MAX_DOCX_XML_SIZE = 20 * 1024 * 1024
 SUPPORTED_RESUME_EXTENSIONS = {".md", ".docx", ".pdf"}
+_WINDOWS_RESERVED_STEMS = {
+	"CON", "PRN", "AUX", "NUL",
+	*(f"COM{i}" for i in range(1, 10)),
+	*(f"LPT{i}" for i in range(1, 10)),
+}
 _WORD_NAMESPACE = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _W = f"{{{_WORD_NAMESPACE}}}"
 
@@ -43,6 +48,11 @@ def safe_resume_filename(raw_filename: str) -> str:
 	stem = name[: -len(Path(name).suffix)].strip().strip(".")
 	if not stem:
 		stem = "resume"
+	# Windows device names (including NUL.md) are not ordinary files.  A
+	# multipart upload must never resolve to a device path, otherwise the
+	# write can succeed while no readable resume is persisted.
+	if stem.split(".", 1)[0].upper() in _WINDOWS_RESERVED_STEMS:
+		stem = f"{stem}-resume"
 
 	# Keep the final name comfortably below common 255-byte filesystem limits.
 	return f"{_truncate_utf8(stem, 200 - len(suffix.encode('utf-8')))}{suffix}"

@@ -614,11 +614,11 @@ def _report_checkpoint(
         })
 
 
-def _record_score_failure(db, job: dict, detail: str) -> None:
+def _record_score_failure(db, job: dict, detail: str, *, commit: bool = True) -> None:
     """Keep a failed job pending while exposing a safe, retryable failure reason."""
     safe_detail = str(detail or "AI 未返回完整评分").strip()[:240]
-    update_job_score(db, job["id"], 0, f"AI评分失败: {safe_detail}")
-    add_history(db, job["id"], "score_failed", safe_detail)
+    update_job_score(db, job["id"], 0, f"AI评分失败: {safe_detail}", commit=False)
+    add_history(db, job["id"], "score_failed", safe_detail, commit=commit)
 
 
 def _request_score(
@@ -770,16 +770,27 @@ def score_jobs(
             console.print("[yellow]没有待评分的岗位[/yellow]")
             return 0, 0
 
+        ai_cfg = config.get("ai", {}) if isinstance(config.get("ai"), dict) else {}
         threshold = config.get("scoring", {}).get("threshold", 60)
         remaining_job_ids = [str(job["id"]) for job in pending_jobs]
         _report_checkpoint(config, remaining_job_ids, status="running")
 
+        try:
+            checkpoint_interval = max(1, int(ai_cfg.get("scoring_checkpoint_interval", 25) or 25))
+        except (TypeError, ValueError):
+            checkpoint_interval = 25
+        completed_since_checkpoint = 0
+
         def mark_completed(job_id: str) -> None:
+            nonlocal completed_since_checkpoint
             if job_id in remaining_job_ids:
                 remaining_job_ids.remove(job_id)
-            _report_checkpoint(config, remaining_job_ids, status="running")
+            completed_since_checkpoint += 1
+            if completed_since_checkpoint >= checkpoint_interval:
+                db.commit()
+                _report_checkpoint(config, remaining_job_ids, status="running")
+                completed_since_checkpoint = 0
 
-        ai_cfg = config.get("ai", {}) if isinstance(config.get("ai"), dict) else {}
         try:
             max_attempts = max(1, min(int(ai_cfg.get("scoring_max_attempts", 2) or 2), 3))
         except (TypeError, ValueError):
@@ -804,10 +815,10 @@ def score_jobs(
                 if stop_event is not None and stop_event.is_set():
                     break
                 qs, qs_reason = quick_score(job, config)
-                update_job_quick_score(db, job["id"], qs)
+                update_job_quick_score(db, job["id"], qs, commit=False)
                 if qs == 0:
-                    update_job_score(db, job["id"], qs, f"预筛不通过: {qs_reason}")
-                    update_job_status(db, job["id"], "filtered")
+                    update_job_score(db, job["id"], qs, f"预筛不通过: {qs_reason}", commit=False)
+                    update_job_status(db, job["id"], "filtered", commit=False)
                     filtered += 1
                     prefiltered += 1
                     processed += 1
@@ -874,11 +885,12 @@ def score_jobs(
                                     result.score,
                                     result.reason,
                                     build_score_trace(result),
+                                    commit=False,
                                 )
                             except ValueError:
                                 job_missing = True
                         else:
-                            update_job_score(db, job["id"], result.score, result.reason)
+                            update_job_score(db, job["id"], result.score, result.reason, commit=False)
                         if job_missing:
                             _notify(
                                 config,
@@ -886,15 +898,15 @@ def score_jobs(
                             )
                         else:
                             if result.score >= threshold:
-                                update_job_status(db, job["id"], "ready")
+                                update_job_status(db, job["id"], "ready", commit=False)
                                 scored += 1
                             else:
-                                update_job_status(db, job["id"], "filtered")
+                                update_job_status(db, job["id"], "filtered", commit=False)
                                 filtered += 1
                         completed_job = True
                     elif outcome.failure_detail:
                         failed += 1
-                        _record_score_failure(db, job, outcome.failure_detail)
+                        _record_score_failure(db, job, outcome.failure_detail, commit=False)
                         _notify(config, f"已跳过 {job['company']}｜{job['title']}：{outcome.failure_detail}。")
                         completed_job = True
 
@@ -923,6 +935,7 @@ def score_jobs(
             else:
                 executor.shutdown(wait=True)
 
+        db.commit()
         if prefiltered > 0:
             console.print(f"[dim]  预筛阶段淘汰 {prefiltered} 个岗位（节省 {prefiltered} 次 API 调用）[/dim]")
         if pause_reason:

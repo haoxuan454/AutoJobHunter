@@ -416,7 +416,12 @@ def permanent_delete_jobs(
     return {"requested_count": len(ids), "affected_count": len(ids)}
 
 
-def insert_job_if_new(conn: sqlite3.Connection, job: dict[str, Any]) -> bool:
+def insert_job_if_new(
+    conn: sqlite3.Connection,
+    job: dict[str, Any],
+    *,
+    commit: bool = True,
+) -> bool:
     """Insert a job atomically and return True only when a row was inserted."""
     values = {
         "id": str(job.get("id") or ""),
@@ -457,7 +462,8 @@ def insert_job_if_new(conn: sqlite3.Connection, job: dict[str, Any]) -> bool:
         """,
         values,
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return cursor.rowcount == 1
 
 
@@ -466,13 +472,21 @@ def insert_job(conn: sqlite3.Connection, job: dict[str, Any]) -> bool:
     return insert_job_if_new(conn, job)
 
 
-def update_job_score(conn: sqlite3.Connection, job_id: str, score: int, reason: str) -> None:
+def update_job_score(
+    conn: sqlite3.Connection,
+    job_id: str,
+    score: int,
+    reason: str,
+    *,
+    commit: bool = True,
+) -> None:
     """Update job matching score."""
     conn.execute(
         "UPDATE jobs SET score = ?, score_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND deleted_at IS NULL",
         (score, reason, job_id)
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def persist_job_score_and_trace(
@@ -481,10 +495,12 @@ def persist_job_score_and_trace(
     score: int,
     reason: str,
     trace: dict[str, Any],
+    *,
+    commit: bool = True,
 ) -> None:
     """Atomically persist a completed structured score and its safe explanation trace."""
     trace_json = json.dumps(trace, ensure_ascii=False, separators=(",", ":"))
-    with conn:
+    def persist() -> None:
         cursor = conn.execute(
             "UPDATE jobs SET score = ?, score_reason = ?, updated_at = CURRENT_TIMESTAMP "
             "WHERE id = ? AND deleted_at IS NULL",
@@ -503,6 +519,11 @@ def persist_job_score_and_trace(
             """,
             (job_id, int(trace.get("schema_version", 1)), trace_json),
         )
+    if commit:
+        with conn:
+            persist()
+    else:
+        persist()
 
 
 def persist_agent_evaluations(conn: sqlite3.Connection, evaluations: list[dict[str, Any]]) -> dict[str, list[str]]:
@@ -844,22 +865,37 @@ def reject_jobs(
     return {"affected_count": len(ids), "invalid_ids": []}
 
 
-def update_job_status(conn: sqlite3.Connection, job_id: str, status: str) -> None:
+def update_job_status(
+    conn: sqlite3.Connection,
+    job_id: str,
+    status: str,
+    *,
+    commit: bool = True,
+) -> None:
     """Update job status."""
     conn.execute(
         "UPDATE jobs SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND deleted_at IS NULL",
         (status, job_id)
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
-def add_history(conn: sqlite3.Connection, job_id: str, action: str, detail: str = "") -> None:
+def add_history(
+    conn: sqlite3.Connection,
+    job_id: str,
+    action: str,
+    detail: str = "",
+    *,
+    commit: bool = True,
+) -> None:
     """Add a history record."""
     conn.execute(
         "INSERT INTO history (job_id, action, detail) VALUES (?, ?, ?)",
         (job_id, action, detail)
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def update_job_last_error(
@@ -1015,10 +1051,25 @@ def _migrate_v1_3(conn: sqlite3.Connection) -> None:
 def _migrate_v1_4(conn: sqlite3.Connection) -> None:
     """Add education and recruitment-type fields without aggressive inference."""
     cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    added_education = False
+    added_recruitment_type = False
     if "education" not in cols:
         conn.execute("ALTER TABLE jobs ADD COLUMN education TEXT")
+        added_education = True
     if "recruitment_type" not in cols:
         conn.execute("ALTER TABLE jobs ADD COLUMN recruitment_type TEXT DEFAULT 'unknown'")
+        added_recruitment_type = True
+
+    # This migration is called from get_db() for every connection.  The
+    # schema additions are idempotent, but the historical backfill is not
+    # cheap on a large jobs table.  Only run it when this database is actually
+    # receiving the v1.4 columns; otherwise every progress/checkpoint
+    # connection would rescan and rewrite the entire table.
+    if not (added_education or added_recruitment_type):
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_recruitment_type ON jobs(recruitment_type)")
+        conn.commit()
+        return
+
     searchable = "COALESCE(title, '') || ' ' || COALESCE(jd, '') || ' ' || COALESCE(experience, '')"
     conn.execute(f"""
         UPDATE jobs SET education = CASE
@@ -1146,13 +1197,20 @@ def _init_score_traces(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def update_job_quick_score(conn: sqlite3.Connection, job_id: str, quick_score: int) -> None:
+def update_job_quick_score(
+    conn: sqlite3.Connection,
+    job_id: str,
+    quick_score: int,
+    *,
+    commit: bool = True,
+) -> None:
     """Update job quick (pre-filter) score."""
     conn.execute(
         "UPDATE jobs SET quick_score = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND deleted_at IS NULL",
         (quick_score, job_id)
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def reset_ai_filtered_jobs(conn: sqlite3.Connection) -> int:

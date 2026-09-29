@@ -195,6 +195,27 @@ task_runner = WorkbenchTaskRunner()
 job_mutation_lock = Lock()
 
 
+@app.hook("before_request")
+def _start_request_audit():
+	request.environ["bosshunter.request_started"] = time.perf_counter()
+
+
+@app.hook("after_request")
+def _finish_request_audit():
+	started = request.environ.get("bosshunter.request_started")
+	duration_ms = round((time.perf_counter() - started) * 1000, 1) if isinstance(started, float) else None
+	# Query strings and request bodies are intentionally excluded: they can
+	# contain remember tokens, credentials, resume text, or chat content.
+	_runtime_log(
+		"http_request",
+		"warning" if response.status_code >= 400 else "info",
+		method=request.method,
+		path=request.path,
+		status=response.status_code,
+		duration_ms=duration_ms,
+	)
+
+
 def _is_loopback_address(value: str) -> bool:
 	try:
 		address = ip_address(value)
@@ -525,6 +546,7 @@ def _write_manual_monitor_state(now: float) -> None:
 
 def _log(task: WorkbenchTask, message: str) -> None:
 	task.logs.append(message)
+	_runtime_log("task_event", task_id=getattr(task, "id", ""), event_message=message)
 
 
 def _record_collect_progress(task: WorkbenchTask, state: dict) -> None:
@@ -549,6 +571,10 @@ def _record_score_progress(task: WorkbenchTask, state: dict) -> None:
 		"ai_filtered": int(state.get("filtered") or 0),
 		"ai_failed": int(state.get("failed") or 0),
 	})
+	completed = int(state.get("completed") or 0)
+	total = int(state.get("total") or 0)
+	if completed != total and completed % 25 != 0:
+		return
 	_log(
 		task,
 		f"AI 评分进度 {state['completed']}/{state['total']}：通过 {state['scored']}，过滤 {state['filtered']}，失败 {state['failed']}",
@@ -3492,10 +3518,15 @@ def _conversation_identity_score(local: dict, row: dict) -> int:
     if not local_company or not row_company or local_company != row_company:
         return 0
     if not local_hr:
-        # Historical delivery cards may predate HR snapshot persistence.  A
-        # company+title candidate is safe only when it is the sole rendered
-        # candidate; company-only matching remains forbidden because one
-        # recruiter can own several roles at the same company.
+        # Historical BOSS delivery cards may predate HR snapshot persistence,
+        # while the BOSS sidebar exposes the recruiter name and company but
+        # not the applied job title (the third span is usually ``HR`` or
+        # ``招聘者``).  Company-only matching is therefore allowed as a
+        # candidate, but the caller must still reject ties before opening or
+        # persisting the chat.  This repairs old cards without binding an
+        # arbitrary recruiter when the company has several visible rows.
+        if str(local.get("platform") or "").lower() == "boss":
+            return 30
         if not local_title or not row_title:
             return 0
         if local_title == row_title or local_title in row_title or row_title in local_title:
@@ -3539,18 +3570,36 @@ def _boss_active_chat_matches_job(target_id: str, local: dict, row: dict) -> boo
     return compact(company) in rendered and compact(title) in rendered
 
 
-def _conversation_row_identity(row: dict) -> tuple[str, ...]:
-    """Return a stable identity for one rendered row within an open tab.
+def _conversation_row_identity(row: dict, *, platform: str = "") -> tuple[str, ...]:
+    """Return a stable identity for one rendered row across open tabs.
 
-    BOSS often omits an external conversation id from the sidebar DOM.  In
-    that case the target tab plus normalized visible fields are the safest
-    local identity.  Keeping the tab id prevents silently merging two equal
-    looking rows from different open tabs.
+    Most platforms expose a native conversation id.  When they do not, BOSS
+    keeps the target tab in the identity because its rendered rows can be
+    incomplete.  Zhilian's IM sidebar is different: the same complete row is
+    rendered in every already-open IM tab, but the DOM does not expose a
+    session id on the row.  Including the tab id there turns one real thread
+    into multiple candidates and makes global sync incorrectly ambiguous.
     """
     compact = lambda value: "".join(str(value or "").split()).casefold()
     external = str(row.get("conversation_id") or row.get("contact_id") or row.get("session_id") or "").strip()
     if external:
-        return (str(row.get("target_id") or ""), "external", external)
+        # Zhilian may expose the same session in several already-open IM
+        # tabs.  The platform session id is the stable identity across those
+        # tabs; including target_id here incorrectly turns one conversation
+        # into multiple candidates and makes global sync report ambiguous.
+        return ("external", external)
+    if str(platform or "").strip().lower() == "zhilian":
+        # The full visible signature is intentional.  If preview/time differs
+        # between rows, they remain different candidates instead of being
+        # silently merged into the wrong local conversation.
+        return (
+            "zhilian-visible",
+            compact(row.get("hr_name") or row.get("name")),
+            compact(row.get("company") or row.get("company_role")),
+            compact(row.get("title") or row.get("job_title")),
+            compact(row.get("preview")),
+            compact(row.get("time")),
+        )
     return (
         str(row.get("target_id") or ""),
         "visible",
@@ -3806,9 +3855,21 @@ def api_conversations_sync():
                         if platform == "zhilian"
                         else _conversation_identity_score(candidate_card, candidate_row)
                     )
+                    # A historical BOSS card without a persisted recruiter
+                    # name can only be recovered from the currently selected
+                    # chat. The sidebar's company-only row is not enough to
+                    # prove ownership, and must not be used by batch sync.
+                    if (
+                        platform == "boss"
+                        and candidate_score == 30
+                        and not bool(candidate_row.get("active"))
+                    ):
+                        continue
                     if not candidate_score:
                         continue
-                    candidate_identity = _conversation_row_identity(candidate_row)
+                    candidate_identity = _conversation_row_identity(
+                        candidate_row, platform=platform
+                    )
                     previous = by_identity.get(candidate_identity)
                     if previous is None or candidate_score > previous[0]:
                         by_identity[candidate_identity] = (
@@ -3841,6 +3902,12 @@ def api_conversations_sync():
                         if platform == "zhilian"
                         else _conversation_identity_score(card, row)
                     )
+                    if (
+                        platform == "boss"
+                        and score == 30
+                        and not bool(row.get("active"))
+                    ):
+                        continue
                     if score:
                         candidates.append((score, row))
                 candidates.sort(key=lambda item: item[0], reverse=True)
@@ -3850,11 +3917,15 @@ def api_conversations_sync():
                 unique = []
                 seen = set()
                 for score, row in candidates:
-                    identity = (str(row.get("target_id")), str(row.get("conversation_id") or row.get("contact_id") or ""), str(row.get("hr_name") or row.get("name") or ""))
+                    identity = _conversation_row_identity(row, platform=platform)
                     if identity not in seen:
                         seen.add(identity)
                         unique.append((score, row))
-                if len(unique) != 1 or (len(unique) == 1 and len(candidates) > 1 and candidates[0][0] == candidates[1][0]):
+                # Multiple rendered copies of the same stable identity are
+                # expected when the user has the same Zhilian IM open in
+                # several tabs.  ``unique`` has already collapsed those
+                # copies; only distinct identities remain ambiguous.
+                if len(unique) != 1:
                     results.append({
                         "conversation_id": str(card["id"]), "platform": platform,
                         "status": "ambiguous" if unique else "not_loaded",
@@ -4306,16 +4377,17 @@ def _reply_platform_candidate(local: dict[str, Any]) -> tuple[dict[str, Any] | N
 		score = _zhilian_reply_identity_score(local, row) if platform == "zhilian" else _conversation_identity_score(local, row)
 		if (
 			platform == "boss"
-			and not score
 			and not str(local.get("hr_name") or "").strip()
 			and str(row.get("active") or "").lower() == "true"
 		):
-			# BOSS omits the job title from the sidebar row. Only the already
-			# active chat header can complete this historical card's identity.
-			# Company equality is checked inside the probe together with title;
-			# company-only matching remains forbidden.
+			# BOSS omits the job title from the sidebar row. Even when the row
+			# scores by company, only the already active chat header can complete
+			# this historical card's identity. Company-only matching remains
+			# forbidden for reply sending.
 			if _boss_active_chat_matches_job(row.get("target_id") or "", local, row):
-				score = 60
+				score = max(score, 60)
+			else:
+				score = 0
 		if score:
 			candidates.append((score, row))
 	candidates.sort(key=lambda item: item[0], reverse=True)

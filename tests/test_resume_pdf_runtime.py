@@ -616,8 +616,13 @@ class ResumePdfRuntimeTests(unittest.TestCase):
         print_pdf.side_effect = write_pdf
         with tempfile.TemporaryDirectory() as tmp:
             expected_output = (Path(tmp) / "resume.pdf").resolve()
-            output = Path(os.path.relpath(expected_output, Path.cwd()))
-            self.assertFalse(output.is_absolute())
+            try:
+                relative_output = os.path.relpath(expected_output, Path.cwd())
+            except ValueError:
+                relative_output = str(expected_output)
+            output = Path(relative_output)
+            if output.is_absolute():
+                self.assertNotEqual(expected_output.drive, Path.cwd().drive)
             result = _render_pdf_via_cdp("<html><body>中文</body></html>", output)
 
         self.assertTrue(result)

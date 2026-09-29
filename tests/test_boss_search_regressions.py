@@ -109,9 +109,12 @@ class BossSearchRegressionTests(TestCase):
                 }},
             })
             self.assertEqual(result["collected_job_ids"], ["new-job"])
-            with get_db(path) as conn:
+            conn = get_db(path)
+            try:
                 row = conn.execute("SELECT salary FROM jobs WHERE id='new-job'").fetchone()
                 self.assertEqual(row["salary"], "25-50K·15薪")
+            finally:
+                conn.close()
         self.assertEqual(decode_boss_text("\ue031\ue032\ue033\ue034\ue035\ue036\ue037\ue038\ue039\ue03a"), "0123456789")
         self.assertEqual(decode_boss_text("面议"), "面议")
 
@@ -179,6 +182,7 @@ class BossSearchRegressionTests(TestCase):
             self.assertEqual(count_platform_access_today(conn, stage="collection", action="search_page"), 3)
             self.assertEqual([x[2] for x in self.checkpoints], [1, 2, 3])
             self.assertEqual(len(browser.closed), 2)
+            conn.close()
 
     def test_ignored_page_parameter_does_not_count_same_cards_seven_times(self):
         browser = SearchBrowser([[card("a"), card("b")]], scrolling=False)
@@ -220,6 +224,7 @@ class BossSearchRegressionTests(TestCase):
             self.assertEqual(result.reason_code, "daily_search_page_limit")
             self.assertEqual(browser.scrolls, 0)
             self.assertEqual(len(self.seen), 1)
+            conn.close()
 
     def test_stalled_run_remains_resumable_and_saves_only_remaining_new_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -77,6 +77,7 @@ credentials.json
 .codex-*.log
 .codex-*.patch
 .codex-*.json
+.codex-*
 
 # 误创建的文件
 tuple[list[dict]

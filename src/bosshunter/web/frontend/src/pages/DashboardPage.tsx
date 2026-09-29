@@ -911,6 +911,17 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
               <div className="text-xs font-black text-primary">{taskStatusTitle(visibleTask.status)}</div>
               <div className="mt-1 whitespace-pre-line text-lg font-black leading-7 text-foreground">{currentTaskStage(visibleTask)}</div>
               <div className="mt-1 text-xs font-bold text-muted">任务状态：{taskStatusText(visibleTask.status)}</div>
+              {visibleTask.confirmation?.waiting_confirmation && (
+                <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm leading-6 text-amber-900">
+                  <div className="font-black">等待人工确认投递</div>
+                  <p className="text-xs">采集和评分已完成，系统会在你确认岗位后才进入投递阶段；当前不会自动发送消息。</p>
+                </div>
+              )}
+              {visibleTask.confirmation?.confirmation_complete && (
+                <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs leading-5 text-emerald-900">
+                  已完成投递前确认：{visibleTask.confirmation.confirmed_job_ids.length} 个岗位已进入后续流程。
+                </div>
+              )}
               {visibleTask.deadline_at && (
                 <p className="text-muted">自动截止：{new Date(visibleTask.deadline_at).toLocaleString('zh-CN', { hour12: false })}</p>
               )}

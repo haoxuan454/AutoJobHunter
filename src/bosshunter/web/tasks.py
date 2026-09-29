@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from threading import Event, Lock, Thread, Timer
+from time import monotonic
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -49,6 +50,15 @@ class WorkbenchTask:
     context: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def snapshot(self) -> dict:
+        confirmation = {
+            "waiting_confirmation": bool(self.context.get("waiting_confirmation")),
+            "confirmation_complete": bool(self.context.get("confirmation_complete")),
+            "confirmed_job_ids": [
+                str(job_id)
+                for job_id in self.context.get("confirmed_job_ids", [])
+                if str(job_id)
+            ],
+        }
         return {
             "id": self.id,
             "mode": self.mode,
@@ -63,6 +73,7 @@ class WorkbenchTask:
             "stop_requested": self.stop_requested.is_set(),
             "metrics": dict(self.metrics),
             "progress": dict(self.progress),
+            "confirmation": confirmation,
         }
 
 
@@ -176,8 +187,10 @@ class WorkbenchTaskRunner:
 
     def wait(self, timeout: float | None = None) -> None:
         threads = list(self._threads.values())
+        deadline = None if timeout is None else monotonic() + max(float(timeout), 0.0)
         for thread in threads:
-            thread.join(timeout=timeout)
+            remaining = None if deadline is None else max(deadline - monotonic(), 0.0)
+            thread.join(timeout=remaining)
 
     def _run(self, task: WorkbenchTask, config: dict) -> None:
         try:
