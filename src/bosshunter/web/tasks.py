@@ -14,7 +14,7 @@ from bosshunter.throttle import SendWindowChecker
 
 
 MODE_LABELS = {
-    "full": "运行全流程",
+	"auto_full": "Automatic full workflow",
     "collect": "单独采集",
     "score": "单独 AI 评分",
     "rescore": "重新评分",
@@ -25,7 +25,7 @@ MODE_LABELS = {
 
 TERMINAL_STATUSES = {"completed", "failed", "stopped"}
 ACTIVE_STATUSES = {"running", "stopping"}
-DEADLINE_MODES = {"full", "monitor", "deliver"}
+DEADLINE_MODES = {"auto_full", "monitor", "deliver"}
 
 
 class TaskAlreadyRunningError(RuntimeError):
@@ -53,6 +53,11 @@ class WorkbenchTask:
         confirmation = {
             "waiting_confirmation": bool(self.context.get("waiting_confirmation")),
             "confirmation_complete": bool(self.context.get("confirmation_complete")),
+            "eligible_job_ids": [
+                str(job_id)
+                for job_id in self.context.get("confirmation_eligible_ids", [])
+                if str(job_id)
+            ],
             "confirmed_job_ids": [
                 str(job_id)
                 for job_id in self.context.get("confirmed_job_ids", [])
@@ -74,6 +79,21 @@ class WorkbenchTask:
             "metrics": dict(self.metrics),
             "progress": dict(self.progress),
             "confirmation": confirmation,
+            "automatic_delivery_scope": [
+                {
+                    "platform": str(item.get("platform") or ""),
+                    "job_id": str(item.get("job_id") or ""),
+                }
+                for item in self.context.get("automatic_delivery_scope", [])
+                if isinstance(item, dict)
+            ],
+            "automatic_reply_enabled": bool(self.context.get("automatic_reply_enabled", False)),
+            "automatic_monitoring": bool(self.context.get("automatic_monitoring", False)),
+            "monitoring": bool(self.context.get("monitoring", False)),
+            "monitor_state": str(self.context.get("monitor_state") or "idle"),
+            "monitor_cycle_started_at": self.context.get("monitor_cycle_started_at"),
+            "monitor_last_cycle_at": self.context.get("monitor_last_cycle_at"),
+            "monitor_next_cycle_at": self.context.get("monitor_next_cycle_at"),
         }
 
 

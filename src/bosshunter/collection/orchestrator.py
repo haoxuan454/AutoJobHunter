@@ -25,7 +25,7 @@ from bosshunter.collection_run_store import (
     save_boss_checkpoint, update_collection_run,
 )
 from bosshunter.config import CITY_CODES
-from bosshunter.db import get_db, insert_job_if_new, job_identity_exists
+from bosshunter.db import enrich_existing_job_metadata, get_db, insert_job_if_new, job_identity_exists
 from bosshunter.job_filters import matching_blocked_company, matching_deal_breaker
 
 
@@ -260,6 +260,9 @@ class _SharedProcessor:
             max_pages=request.max_pages,
         )
         self.new_job_ids: list[str] = []
+        # Keep search scope separate from newly inserted rows. Automatic
+        # scoring may use this list without widening to the whole job pool.
+        self.matched_job_ids: list[str] = []
         self._last_persisted_new_count = 0
 
     def event(self, *, phase: str | None = None, **values: Any) -> None:
@@ -282,6 +285,16 @@ class _SharedProcessor:
             candidate.source_job_id,
             legacy_job_id=candidate.storage_id,
         ):
+            # A duplicate search result may contain detail-page fields that
+            # were absent from the first snapshot.  Enrich the existing row
+            # before counting it as a duplicate; this keeps collection
+            # idempotent while allowing BOSS recruiter metadata to recover.
+            try:
+                enrich_existing_job_metadata(self.conn, candidate.as_job_record())
+            except Exception as exc:
+                self.progress.save_failed += 1
+                self.event(message=f"重复岗位元数据补齐失败：{type(exc).__name__}")
+            self.matched_job_ids.append(candidate.storage_id)
             self.progress.duplicate += 1
             self.event()
             return False
@@ -294,12 +307,14 @@ class _SharedProcessor:
             self.progress.filtered += 1
             self.event(message="公司命中过滤规则")
             return False
+        self.matched_job_ids.append(candidate.storage_id)
         self.event()
         return True
 
     def save(self, candidate: JobCandidate) -> bool:
         profile = self.config.get("profile", {}) if isinstance(self.config.get("profile"), dict) else {}
         if matching_deal_breaker(candidate.jd, profile.get("jd_deal_breakers") or []):
+            self.matched_job_ids = [value for value in self.matched_job_ids if value != candidate.storage_id]
             self.progress.filtered += 1
             self.event(message="JD 命中过滤规则")
             return True
@@ -310,6 +325,7 @@ class _SharedProcessor:
             # the persisted checkpoint and collected_job_ids disagree.
             inserted = insert_job_if_new(self.conn, candidate.as_job_record())
         except Exception as exc:
+            self.matched_job_ids = [value for value in self.matched_job_ids if value != candidate.storage_id]
             self.progress.save_failed += 1
             self.event(message=f"保存岗位失败：{type(exc).__name__}")
             return True
@@ -445,6 +461,7 @@ class CollectionOrchestrator:
                     conn.commit()
                     result = PlatformCollectionResult(platform, "failed", "network_error", f"{platform} 采集失败", error=str(exc)[:500])
                 result.new_job_ids = list(processor.new_job_ids)
+                result.matched_job_ids = list(dict.fromkeys(processor.matched_job_ids))
                 result.counts = self._counts(processor.progress)
                 if platform == "boss" and result.status in {"completed", "completed_with_shortage"}:
                     if result.status == "completed" and not result.new_job_ids:
@@ -500,7 +517,15 @@ class CollectionOrchestrator:
 
                 score_config = dict(self.config)
                 score_config["_workbench_stop_event"] = self.stop_event
-                score_jobs(score_config, scope="selected", job_ids=unique_new_ids, limit=None, force_rescore=False)
+                score_config["_workbench_automatic_scoring"] = True
+                score_jobs(
+                    score_config,
+                    scope="selected",
+                    job_ids=unique_new_ids,
+                    limit=None,
+                    force_rescore=False,
+                    db_path=self.db_path,
+                )
             except Exception as exc:
                 outcome = "completed_with_errors"
                 self._persist(states, unique_new_ids, "", error=f"自动评分失败：{str(exc)[:500]}")
@@ -510,6 +535,12 @@ class CollectionOrchestrator:
             "status": outcome,
             "platforms": states,
             "collected_job_ids": unique_new_ids,
+            "matched_job_ids": list(dict.fromkeys(
+                str(job_id)
+                for platform_result in platform_results
+                for job_id in platform_result.matched_job_ids
+                if str(job_id)
+            )),
             "results": [result.__dict__ for result in platform_results],
         }
 

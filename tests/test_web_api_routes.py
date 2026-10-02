@@ -734,6 +734,22 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertIn("application/json", headers["Content-Type"])
         self.assertEqual(json.loads(body), {"ok": True, "messages": [], "checks": ready_checks})
 
+    def test_web_api_workbench_preflight_auto_full_forces_scoring_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            (base_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
+            server.set_base_dir(base_dir)
+            with patch.object(server, "collect_preflight_checks", return_value=[]) as collect:
+                status, _, body = self._request(
+                    "/api/workbench/preflight",
+                    "POST",
+                    {"mode": "auto_full", "options": {"platform_order": ["boss"]}},
+                )
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertTrue(json.loads(body)["ok"])
+        self.assertTrue(collect.call_args.args[2]["auto_score"])
+
     def test_web_api_workbench_preflight_supports_rescore_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             base_dir = Path(tmp)
@@ -4086,6 +4102,113 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertEqual(task_config["_collection_options"]["platforms"]["boss"]["cities"], ["上海"])
         self.assertNotIn("target_count", task_config["_collection_options"]["platforms"]["boss"])
         self.assertTrue(task_config["_collection_options"]["auto_score"])
+
+    def test_auto_full_passes_per_platform_delivery_limit_to_runner(self):
+        config = {
+            "profile": {"resume_path": "C:/resume.md"},
+            "ai": {"api_key": "test-key"},
+            "platforms": {"boss": {"enabled": True, "search": {}}},
+        }
+        options = {
+            "platform_order": ["boss"],
+            "platforms": {"boss": {"keywords": ["工程师"], "cities": ["东莞"], "max_pages": 1}},
+            "auto_settings": {
+                "score_threshold": 60,
+                "max_deliveries_per_platform": 2,
+                "boss_greeting": "您好",
+                "interval_min": 60,
+                "interval_max": 180,
+            },
+        }
+        with patch.object(server, "load_config", return_value=config), \
+             patch.object(server, "_preflight_messages", return_value=[]), \
+             patch.object(server, "_write_config"), \
+             patch.object(server.task_runner, "start", return_value={"id": "auto-full-limit"}) as start:
+            status, _, body = self._request(
+                "/api/workbench/task",
+                "POST",
+                {"mode": "auto_full", "options": options},
+            )
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(
+            start.call_args.args[1]["_collection_options"]["max_deliveries_per_platform"],
+            2,
+        )
+
+    def test_auto_full_does_not_overwrite_manual_collection_defaults(self):
+        config = {
+            "collection": {"default_order": ["boss"], "auto_score_default": False},
+            "profile": {"resume_path": "C:/resume.md"},
+            "ai": {"api_key": "test-key"},
+            "platforms": {
+                "boss": {"enabled": True, "search": {"keywords": ["manual-keyword"], "cities": ["深圳"]}},
+                "zhilian": {"enabled": False, "search": {"keywords": ["old-zhilian-keyword"], "cities": ["广州"]}},
+                "51job": {"enabled": True, "search": {"keywords": ["manual-51job"], "cities": ["上海"]}},
+            },
+        }
+        before = deepcopy(config)
+        options = {
+            "platform_order": ["boss", "zhilian"],
+            "platforms": {
+                "boss": {"keywords": ["auto-keyword"], "cities": ["东莞"], "max_pages": 1},
+                "zhilian": {"keywords": ["auto-keyword"], "cities": ["东莞"], "max_pages": 1},
+            },
+            "auto_settings": {
+                "score_threshold": 60,
+                "max_deliveries_per_platform": 2,
+                "boss_greeting": "您好",
+                "interval_min": 120,
+                "interval_max": 180,
+            },
+        }
+        with patch.object(server, "load_config", return_value=config), \
+             patch.object(server, "_preflight_messages", return_value=[]), \
+             patch.object(server, "_write_config") as write_config, \
+             patch.object(server.task_runner, "start", return_value={"id": "auto-full-isolated"}) as start:
+            status, _, body = self._request(
+                "/api/workbench/task",
+                "POST",
+                {"mode": "auto_full", "options": options},
+            )
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(config["collection"], before["collection"])
+        self.assertEqual(config["platforms"], before["platforms"])
+        write_config.assert_not_called()
+        self.assertIsNone(start.call_args.kwargs["before_start"])
+        runtime_options = start.call_args.args[1]["_collection_options"]
+        self.assertEqual(runtime_options["platform_order"], ["boss", "zhilian"])
+        self.assertEqual(runtime_options["platforms"]["boss"]["keywords"], ["auto-keyword"])
+
+    def test_auto_full_rejects_malformed_delivery_limit_before_start(self):
+        config = {
+            "profile": {"resume_path": "C:/resume.md"},
+            "ai": {"api_key": "test-key"},
+            "platforms": {"boss": {"enabled": True, "search": {}}},
+        }
+        for limit in (0, 4, 1.5, True, "3x"):
+            with self.subTest(limit=limit), \
+                 patch.object(server, "load_config", return_value=config), \
+                 patch.object(server, "_write_config"), \
+                 patch.object(server.task_runner, "start") as start:
+                status, _, body = self._request(
+                    "/api/workbench/task",
+                    "POST",
+                    {
+                        "mode": "auto_full",
+                        "options": {
+                            "platform_order": ["boss"],
+                            "platforms": {"boss": {"keywords": ["工程师"], "cities": ["东莞"], "max_pages": 1}},
+                            "auto_settings": {
+                                "max_deliveries_per_platform": limit,
+                                "boss_greeting": "您好",
+                            },
+                        },
+                    },
+                )
+                self.assertTrue(status.startswith("400"), body)
+                start.assert_not_called()
 
     def test_full_task_rejects_collection_only_platform_from_saved_config(self):
         config = {

@@ -126,16 +126,19 @@ def build_boss_filter_query(filters: Any) -> str:
 
 JS_EXTRACT_LIST = """
 (() => {
-    const wraps = document.querySelectorAll('.job-card-wrap');
+    const roots = Array.from(document.querySelectorAll('.job-card-wrap, .job-card-box'))
+        .filter((node) => node.matches('.job-card-wrap') || !node.closest('.job-card-wrap'));
     const jobs = [];
-    wraps.forEach((wrap) => {
-        const box = wrap.querySelector('.job-card-box') || wrap;
-        const nameEl = box.querySelector('.job-name');
-        const salaryEl = box.querySelector('.job-salary');
-        const tags = box.querySelectorAll('.tag-list li');
-        const companyEl = box.querySelector('.boss-name') || box.querySelector('.company-name');
-        const locationEl = box.querySelector('.company-location');
-        const href = nameEl ? nameEl.getAttribute('href') : '';
+    roots.forEach((root) => {
+        const box = root.matches('.job-card-wrap') ? (root.querySelector('.job-card-box') || root) : root;
+        const nameEl = box.querySelector('a.job-name, a[href*="/job_detail/"]');
+        const salaryEl = box.querySelector('.job-salary, [class*="salary"]');
+        const tags = box.querySelectorAll('.tag-list li, .job-limit p, .job-limit li');
+        const companyEl = box.querySelector('.boss-name, .company-name, .company');
+        const locationEl = box.querySelector('.company-location, .job-location, [class*="location"]');
+        const hrefValue = nameEl ? nameEl.getAttribute('href') : '';
+        let href = '';
+        try { href = hrefValue ? new URL(hrefValue, window.location.origin).pathname : ''; } catch (_) { href = hrefValue || ''; }
         if (!nameEl || !href) return;
         jobs.push({
             title: nameEl.textContent.trim(), salary: salaryEl ? salaryEl.textContent.trim() : '',
@@ -146,22 +149,25 @@ JS_EXTRACT_LIST = """
         });
     });
     if (jobs.length) return JSON.stringify(jobs);
-    if (location.pathname !== '/web/geek/jobs') return JSON.stringify(jobs);
+    if (!/\/web\/geek\/jobs\/?$/i.test(location.pathname)) return JSON.stringify(jobs);
 
     const seen = new Set();
-    document.querySelectorAll('a.job-info[href*="/job_detail/"]').forEach((link) => {
-        const href = link.getAttribute('href') || '';
+    document.querySelectorAll('a.job-info[href*="/job_detail/"], a.job-name[href*="/job_detail/"]').forEach((link) => {
+        const hrefValue = link.getAttribute('href') || '';
+        let href = hrefValue;
+        try { href = new URL(hrefValue, window.location.origin).pathname; } catch (_) {}
         if (!href || seen.has(href)) return;
         seen.add(href);
 
-        const row = link.closest('.sub-li') || link.closest('li') || link.parentElement;
-        const title = link.querySelector('.sub-li-top .name')?.textContent?.trim() || '';
-        const salary = link.querySelector('.sub-li-top .salary')?.textContent?.trim() || '';
-        const tags = Array.from(link.querySelectorAll('.job-text span, .job-text'))
+        const row = link.closest('.sub-li') || link.closest('.job-card-wrap') || link.closest('li') || link.parentElement;
+        const title = link.querySelector('.sub-li-top .name')?.textContent?.trim() || link.textContent.trim();
+        const salary = link.querySelector('.sub-li-top .salary')?.textContent?.trim()
+            || row?.querySelector('.job-salary, [class*="salary"]')?.textContent?.trim() || '';
+        const tags = Array.from((row || link).querySelectorAll('.job-text span, .job-text, .tag-list li'))
             .map((item) => item.textContent.trim()).filter(Boolean);
-        const company = row?.querySelector('.sub-li-bottom .user-info .name')?.textContent?.trim() || '';
+        const company = row?.querySelector('.sub-li-bottom .user-info .name, .boss-name, .company-name, .company')?.textContent?.trim() || '';
         const location = row?.querySelector('.sub-li-bottom-commany-place .name')?.textContent?.trim()
-            || row?.querySelector('.job-card-location')?.parentElement?.textContent?.trim() || '';
+            || row?.querySelector('.job-card-location, .company-location, .job-location, [class*="location"]')?.textContent?.trim() || '';
         const experience = tags.find((value) => /(?:\d+年|经验不限|在校生|应届生)/.test(value)) || '';
         const education = tags.find((value) => /(?:学历不限|大专|本科|硕士|博士|中专|高中)/.test(value)) || '';
         jobs.push({
@@ -206,9 +212,21 @@ JS_EXTRACT_DETAIL = """
         if (text.includes('人')) info.company_size = text;
         else if (!info.company_industry) info.company_industry = text;
     });
-    const bossSection = document.querySelector('.boss-info-attr') || document.querySelector('.job-boss-info');
-    info.hr_name = bossSection?.querySelector('.name')?.textContent?.trim() || '';
-    info.hr_title = bossSection?.querySelector('.title')?.textContent?.trim() || '';
+    // The current BOSS detail DOM puts the recruiter name in the parent
+    // `.job-boss-info .name`, while `.boss-info-attr` contains only company
+    // and title text.  Querying `.name` below `.boss-info-attr` therefore
+    // always returned an empty HR name on real detail pages.
+    const bossCard = document.querySelector('.job-boss-info');
+    const bossInfo = document.querySelector('.job-boss-info .boss-info-attr')
+        || document.querySelector('.boss-info-attr');
+    info.hr_name = bossCard?.querySelector('.name')?.textContent?.trim()
+        || document.querySelector('.boss-info-attr .name')?.textContent?.trim() || '';
+    info.hr_title = bossCard?.querySelector('.title')?.textContent?.trim()
+        || bossInfo?.querySelector('.title')?.textContent?.trim() || '';
+    if (!info.hr_title && bossInfo) {
+        const attrs = (bossInfo.textContent || '').split(/[·|]/).map(value => value.trim()).filter(Boolean);
+        info.hr_title = attrs.length > 1 ? attrs[attrs.length - 1] : '';
+    }
     info.hr_active = document.querySelector('.boss-active-time')?.textContent?.trim() || '';
     info.url = window.location.pathname;
     return JSON.stringify(info);
@@ -221,7 +239,7 @@ JS_DETECT_COLLECTION_RISK = """
     const url = String(location.href || '');
     const title = String(document.title || '');
     const hasExpectedContent = Boolean(document.querySelector(
-        '.job-card-wrap, a.job-info[href*="/job_detail/"], .job-sec-text, .job-detail, .job-primary'
+        '.job-card-wrap, .job-card-box, a.job-info[href*="/job_detail/"], .job-sec-text, .job-detail, .job-primary'
     ));
     const captcha = document.querySelector(
         '.geetest_panel, .captcha, [class*="captcha"], [id*="captcha"], iframe[src*="captcha"], iframe[src*="verify"]'
@@ -261,6 +279,35 @@ def _wait_or_stop(stop_event, seconds: float, sleep: Callable[[float], None] = t
         return stop_event.wait(seconds)
     sleep(seconds)
     return False
+
+def _wait_for_rendered_list(
+    read_list: Callable[[], list | None],
+    *,
+    stop_event: Any = None,
+    sleep: Callable[[float], None] = time.sleep,
+    timeout: float = 8.0,
+    poll_interval: float = 0.4,
+) -> list | None:
+    """Wait for BOSS's asynchronously rendered list without another request.
+
+    BOSS can report ``document.readyState === 'complete'`` before its React
+    list has mounted. The browser page is already open at this point, so the
+    safe recovery is a bounded DOM poll rather than a reload or another
+    platform request. An empty list is returned after the deadline so callers
+    can still distinguish a genuine empty result from a parse error.
+    """
+    deadline = time.monotonic() + max(float(timeout), 0.0)
+    last: list | None = None
+    while True:
+        value = read_list()
+        if isinstance(value, list):
+            last = value
+            if value:
+                return value
+        if time.monotonic() >= deadline:
+            return last
+        if _wait_or_stop(stop_event, max(float(poll_interval), 0.05), sleep):
+            return None
 
 
 def _positive_int(value: object, default: int) -> int:
@@ -327,6 +374,12 @@ class BossCollector:
         search_limit = _positive_int(collection_cfg.get("daily_search_page_limit", 60), 60)
         detail_limit = _positive_int(collection_cfg.get("daily_detail_page_limit", 150), 150)
         failure_limit = _positive_int(collection_cfg.get("max_consecutive_page_failures", 3), 3)
+        list_render_timeout = _bounded_float(
+            collection_cfg.get("list_render_timeout_seconds", 8.0),
+            8.0,
+            1.0,
+            15.0,
+        )
         risk_pause_min = _positive_int(collection_cfg.get("risk_pause_min_minutes", 5), 5)
         risk_pause_max = max(
             risk_pause_min,
@@ -520,7 +573,11 @@ class BossCollector:
                                 continue
                             if _wait_or_stop(hooks.stop_event, 3 * delay_multiplier, self.sleep):
                                 return PlatformCollectionResult(self.platform, "stopped", "user_stopped", "用户已停止")
-                            if not self.browser.wait_for_load(worker_target, timeout=10):
+                            if not self.browser.wait_for_load(
+                                worker_target,
+                                timeout=10,
+                                expected_host="www.zhipin.com",
+                            ):
                                 combo_complete = False
                                 page_failures += 1
                                 hooks.on_parse_failed("BOSS 搜索页加载超时")
@@ -531,7 +588,24 @@ class BossCollector:
                                 return PlatformCollectionResult(self.platform, "stopped", "user_stopped", "用户已停止")
                             if signal: return risk(signal["kind"], signal["evidence"])
                             scroll_list = self.browser.evaluate(worker_target, JS_IS_SCROLL_LIST) is True
-                            jobs = read_list()
+                            # ``readyState=complete`` and the scroll-list marker are
+                            # both observable before the SPA has mounted its first
+                            # batch.  Always use the bounded same-page DOM poll here;
+                            # it never reloads or issues another platform request and
+                            # prevents a transient empty DOM from being reported as
+                            # ``no_jobs_extracted``.
+                            jobs = _wait_for_rendered_list(
+                                read_list,
+                                stop_event=hooks.stop_event,
+                                sleep=self.sleep,
+                                timeout=list_render_timeout,
+                            )
+                            # The marker itself can be mounted by the same SPA
+                            # update as the first job batch. Re-check it after the
+                            # DOM poll so a delayed marker does not disable the
+                            # existing scroll-pagination path.
+                            if not scroll_list:
+                                scroll_list = self.browser.evaluate(worker_target, JS_IS_SCROLL_LIST) is True
                             if scroll_list and jobs:
                                 loaded_page = 1
                                 loaded_ids = list_ids(jobs)

@@ -44,7 +44,7 @@ import {
   XCircle,
 } from 'lucide-react'
 
-type WorkbenchMode = 'full' | 'collect' | 'rescore' | 'monitor'
+type WorkbenchMode = 'auto_full' | 'collect' | 'rescore' | 'monitor'
 type DashboardView = 'workbench' | 'jobs' | 'monitor'
 type StatsScope = 'today' | 'total'
 
@@ -200,9 +200,9 @@ interface PreflightCheck {
 
 const modes: Array<{ mode: WorkbenchMode; title: string; description: string }> = [
   {
-    mode: 'full',
-    title: '运行全流程',
-    description: '采集、评分、监测，投递前由你确认',
+    mode: 'auto_full',
+    title: '自动运行全流程',
+    description: '按配置采集、评分，达标后自动安全投递并持续监测',
   },
   {
     mode: 'collect',
@@ -418,7 +418,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
   const [topCompanies, setTopCompanies] = useState<TopCompany[]>([])
   const [recentActivity, setRecentActivity] = useState<HistoryItem[]>([])
   const [preflightChecks, setPreflightChecks] = useState<PreflightCheck[]>([])
-  const [preflightMode, setPreflightMode] = useState<WorkbenchMode>('full')
+  const [preflightMode, setPreflightMode] = useState<WorkbenchMode>('auto_full')
   const [selectedJob, setSelectedJob] = useState<Job | null>(null)
   const [modePending, setModePending] = useState<WorkbenchMode | null>(null)
   const [sendingGreetingIds, setSendingGreetingIds] = useState<Set<string>>(new Set())
@@ -435,7 +435,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
   const [todayFilters, setTodayFilters] = useState<JobFilters>({ ...EMPTY_JOB_FILTERS })
   const [statsScope, setStatsScope] = useState<StatsScope>('today')
   const [collectDialogOpen, setCollectDialogOpen] = useState(false)
-  const [collectDialogMode, setCollectDialogMode] = useState<'collect' | 'full'>('collect')
+  const [collectDialogMode, setCollectDialogMode] = useState<'collect' | 'auto_full'>('collect')
   const [preflightRunning, setPreflightRunning] = useState(false)
   const [generatingGreetings, setGeneratingGreetings] = useState(false)
   const startedGreetTaskIdRef = useRef<string | null>(null)
@@ -566,8 +566,8 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
         )
         return
       }
-      if (mode === 'full') {
-        setCollectDialogMode('full')
+      if (mode === 'auto_full') {
+        setCollectDialogMode(mode)
         setCollectDialogOpen(true)
         return
       }
@@ -604,8 +604,8 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
     try {
       setPreflightRunning(true)
       setNotice('正在检查全流程运行环境...')
-      const ok = await runPreflight('full')
-      setNotice(ok ? '全流程预检通过，可以开始任务。' : '')
+      const ok = await runPreflight('auto_full')
+      setNotice(ok ? '自动全流程预检通过，可以开始任务。' : '')
     } catch {
       setNotice('预检失败，请确认 BossHunter 后端仍在运行。')
     } finally {
@@ -616,7 +616,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
   const startCollection = async (options: Record<string, unknown>): Promise<{ ok: boolean; error?: string }> => {
     const mode = collectDialogMode
     setModePending(mode)
-    setNotice(mode === 'full' ? '全流程启动前预检中...' : '岗位采集启动前预检中...')
+    setNotice(mode === 'auto_full' ? '自动全流程启动前预检中...' : '岗位采集启动前预检中...')
     try {
       if (!(await runPreflight(mode, options))) {
         setNotice('启动前预检未通过：请按下方检查提示修复后，再重新启动。')
@@ -624,7 +624,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
       }
       setNotice('启动前预检通过，正在启动任务...')
       await startTask(mode, options)
-      setNotice(mode === 'full' ? '全流程已启动，进度会在下方更新。' : '岗位采集已启动，进度会在下方更新。')
+      setNotice(mode === 'auto_full' ? '自动全流程已启动：采集、评分、达标投递、会话补齐和持续监控会按安全队列执行。' : '岗位采集已启动，进度会在下方更新。')
       return { ok: true }
     } catch (err) {
       const message = err instanceof Error ? err.message : '岗位采集启动失败'
@@ -658,6 +658,20 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
       setSelected(prev => prev.filter(id => !new Set(ids).has(id)))
     } catch (err) {
       setNotice(err instanceof Error ? err.message : '投递失败')
+    }
+  }
+
+  const confirmAutomaticDelivery = async () => {
+    const ids = visibleTask?.confirmation?.eligible_job_ids || []
+    if (!ids.length) return
+    if (!window.confirm(`是否确认本轮 ${ids.length} 个达标岗位并进入安全投递队列？`)) return
+    try {
+      const data = await submitDeliveryWithConfirmations(ids)
+      if (!data) return
+      await refresh()
+      setNotice(`已确认 ${ids.length} 个达标岗位，后端将按平台队列和安全间隔继续执行。`)
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '确认自动投递失败')
     }
   }
 
@@ -837,7 +851,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
                     setNotice(`当前正在运行${activeTask?.label || '其他任务'}，请先停止后再启动岗位采集。`)
                     return
                   }
-                  if (item.mode === 'collect' || item.mode === 'full') {
+                  if (item.mode === 'collect' || item.mode === 'auto_full') {
                     setCollectDialogMode(item.mode)
                     setCollectDialogOpen(true)
                   }
@@ -846,7 +860,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
                 aria-disabled={disabled}
                 className={cn(
                   'min-w-0 rounded-xl border p-4 text-left transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary md:min-h-32 md:p-5',
-                  item.mode === 'full' ? 'col-span-2 min-h-28 md:col-span-1' : 'min-h-24',
+                   item.mode === 'auto_full' ? 'col-span-2 min-h-28 md:col-span-1' : 'min-h-24',
                   isActive
                     ? 'border-primary bg-primary text-white'
                     : disabled
@@ -855,7 +869,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
                 )}
               >
                 <div className="mb-2 flex items-center justify-between gap-2">
-                  <div className={cn('font-bold tracking-tight', item.mode === 'full' ? 'text-2xl' : 'text-xl')}>
+                  <div className={cn('font-bold tracking-tight', item.mode === 'auto_full' ? 'text-2xl' : 'text-xl')}>
                     {modePending === item.mode
                       ? isActive ? '任务停止中' : '任务启动中'
                       : isActive ? `${item.title}中` : item.title}
@@ -915,6 +929,9 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
                 <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm leading-6 text-amber-900">
                   <div className="font-black">等待人工确认投递</div>
                   <p className="text-xs">采集和评分已完成，系统会在你确认岗位后才进入投递阶段；当前不会自动发送消息。</p>
+                  <Button className="mt-2" size="sm" onClick={() => void confirmAutomaticDelivery()}>
+                    确认本轮达标岗位并投递
+                  </Button>
                 </div>
               )}
               {visibleTask.confirmation?.confirmation_complete && (
@@ -1152,7 +1169,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
               <GreetingReviewCard
                 key={job.id}
                 job={job}
-                busy={sendingGreetingIds.has(job.id) || Boolean(activeTask && ['greet', 'deliver', 'full', 'monitor'].includes(activeTask.mode))}
+                busy={sendingGreetingIds.has(job.id) || Boolean(activeTask && ['greet', 'deliver', 'full', 'auto_full', 'monitor'].includes(activeTask.mode))}
                 onBusyChange={onGreetingBusyChange}
                 onSelect={(selection, greeting) => selectGreeting(job, selection, greeting)}
                 onSend={() => sendReadyGreetings([job.id])}
@@ -1230,7 +1247,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
       <CollectJobsDialog
         open={collectDialogOpen}
         mode={collectDialogMode}
-        activeTask={activeTask && (activeTask.mode === 'collect' || activeTask.mode === 'full') ? activeTask : null}
+         activeTask={activeTask && (activeTask.mode === 'collect' || activeTask.mode === 'auto_full') ? activeTask : null}
         onClose={() => setCollectDialogOpen(false)}
         onStart={startCollection}
       />

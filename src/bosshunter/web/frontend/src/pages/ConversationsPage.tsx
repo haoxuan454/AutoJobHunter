@@ -5,6 +5,7 @@ import {
   BriefcaseBusiness,
   MessageCircle,
   PauseCircle,
+  PlayCircle,
   RefreshCw,
   Trash2,
 } from 'lucide-react'
@@ -160,6 +161,27 @@ export default function ConversationsPage() {
     }
   }
 
+  const toggleAutomaticMonitoring = async (item: Conversation) => {
+    const paused = item.status === 'paused_manual'
+    const nextStatus = paused ? 'active' : 'paused_manual'
+    try {
+      const response = await fetch(`/api/conversations/${encodeURIComponent(item.id)}/status`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          status: nextStatus,
+          reason: paused ? '用户人工恢复自动处理' : '用户暂停自动处理',
+        }),
+      })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(data.error || '会话自动处理状态更新失败')
+      setNotice(paused ? '会话已恢复自动处理' : '会话已暂停自动处理')
+      await load()
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '会话自动处理状态更新失败')
+    }
+  }
+
   useEffect(() => {
     void load().catch(error => setNotice(error instanceof Error ? error.message : '会话加载失败'))
   }, [sort])
@@ -247,6 +269,18 @@ export default function ConversationsPage() {
                       <RefreshCw className={`h-3.5 w-3.5 ${syncingId === item.id ? 'animate-spin' : ''}`} />
                       <span>{syncingId === item.id ? '同步中' : '同步当前会话'}</span>
                     </Button>
+                    {item.status === 'active' && (
+                      <Button className="gap-2" size="sm" variant="secondary" onClick={() => void toggleAutomaticMonitoring(item)}>
+                        <PauseCircle className="h-3.5 w-3.5" />
+                        <span>暂停自动处理</span>
+                      </Button>
+                    )}
+                    {item.status === 'paused_manual' && (
+                      <Button className="gap-2" size="sm" variant="secondary" onClick={() => void toggleAutomaticMonitoring(item)}>
+                        <PlayCircle className="h-3.5 w-3.5" />
+                        <span>恢复自动处理</span>
+                      </Button>
+                    )}
                     <Link to={`/conversations/${encodeURIComponent(item.id)}`}>
                       <Button className="gap-2" size="sm" variant="ghost"><MessageCircle className="h-3.5 w-3.5" /><span>查看本地会话</span></Button>
                     </Link>

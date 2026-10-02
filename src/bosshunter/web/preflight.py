@@ -22,13 +22,13 @@ from bosshunter.ai.credentials import (
 from bosshunter.browser.diagnostics import run_browser_diagnostics
 from bosshunter.collection.orchestrator import normalize_collection_options
 
-VALID_MODES = {"full", "collect", "rescore", "monitor"}
+VALID_MODES = {"auto_full", "collect", "rescore", "monitor"}
 
 
 def collect_preflight_checks(mode: str, config: dict, options: dict | None = None) -> list[dict[str, str]]:
 	"""Collect configuration, AI connectivity, and browser readiness checks."""
 	collection_options = None
-	if mode == "collect":
+	if mode in {"collect", "auto_full"}:
 		try:
 			collection_options = normalize_collection_options(config, options)
 		except ValueError as exc:
@@ -40,8 +40,8 @@ def collect_preflight_checks(mode: str, config: dict, options: dict | None = Non
 		checks = _configuration_checks(mode, config, options)
 	if mode not in VALID_MODES:
 		return checks
-	ai_required = mode in {"full", "rescore"} or (
-		mode == "collect" and bool(collection_options and collection_options.get("auto_score"))
+	ai_required = mode in {"auto_full", "rescore"} or (
+		mode in {"collect", "auto_full"} and bool(collection_options and collection_options.get("auto_score"))
 	)
 
 	if not ai_required:
@@ -75,7 +75,7 @@ def collect_preflight_checks(mode: str, config: dict, options: dict | None = Non
 				checks.extend(future.result())
 			except Exception:
 				checks.append(fallback)
-	if mode == "full":
+	if mode == "auto_full":
 		try:
 			full_options = normalize_collection_options(config, options)
 		except ValueError as exc:
@@ -458,7 +458,7 @@ def _configuration_checks(mode: str, config: dict, options: dict | None = None) 
 		)
 		return checks
 
-	ai_required = mode in {"full", "rescore"} or (mode == "collect" and bool(options and options.get("auto_score")))
+	ai_required = mode in {"auto_full", "rescore"} or (mode == "collect" and bool(options and options.get("auto_score")))
 	if ai_required:
 		resume_path = config.get("profile", {}).get("resume_path", "")
 		# Upload writes an absolute path under data/resumes/; check that file directly.
@@ -476,7 +476,7 @@ def _configuration_checks(mode: str, config: dict, options: dict | None = None) 
 		else:
 			checks.append(_check("resume", "简历文件", "pass", "简历文件已就绪", Path(str(resume_path)).name))
 
-	if mode in {"full", "collect"}:
+	if mode in {"auto_full", "collect"}:
 		if options:
 			platforms = options.get("platforms", {})
 			keywords = [

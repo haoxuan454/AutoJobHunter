@@ -170,9 +170,10 @@ platforms:
                      json.dumps({"risk": "blocked", "evidence": "blocked_page"}),
                      json.dumps({"risk": None}),
                      False,
-                     json.dumps([]),
+                     False,
                  ],
              ), \
+             patch("bosshunter.collection.platforms.boss._wait_for_rendered_list", return_value=[]), \
              patch("bosshunter.scraper.jobs.scroll"), \
              patch("bosshunter.scraper.jobs.close_tab"), \
              patch("bosshunter.scraper.jobs.time.sleep"):

@@ -35,7 +35,7 @@ interface ResumableRun {
 
 interface CollectJobsDialogProps {
   open: boolean
-  mode?: 'collect' | 'full'
+  mode?: 'collect' | 'auto_full'
   activeTask: WorkbenchTask | null
   onClose: () => void
   /** 返回启动结果：成功返回 ok:true（弹窗自动关闭），失败返回错误信息（弹窗保留并展示）。 */
@@ -102,6 +102,8 @@ function draftFromConfig(config: Record<string, any> | null, platform: PlatformI
 }
 
 export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose, onStart }: CollectJobsDialogProps) {
+  const isAutoFull = mode === 'auto_full'
+  const isFullFlow = isAutoFull
   const [drafts, setDrafts] = useState(initialDrafts)
   const [order, setOrder] = useState<PlatformId[]>(['boss'])
   const [autoScore, setAutoScore] = useState(false)
@@ -113,6 +115,11 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
   const [zhilianCities, setZhilianCities] = useState<PlatformCityOption[]>([])
   const [job51Cities, setJob51Cities] = useState<PlatformCityOption[]>([])
   const [liepinCities, setLiepinCities] = useState<PlatformCityOption[]>([])
+  const [scoreThreshold, setScoreThreshold] = useState('60')
+  const [maxDeliveriesPerPlatform, setMaxDeliveriesPerPlatform] = useState('3')
+  const [bossGreeting, setBossGreeting] = useState('')
+  const [intervalMin, setIntervalMin] = useState('60')
+  const [intervalMax, setIntervalMax] = useState('180')
 
   useEffect(() => {
     if (!open) return
@@ -143,8 +150,8 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
         const nextZhilian = draftFromConfig(config, 'zhilian')
         const nextJob51 = draftFromConfig(config, '51job')
         const nextLiepin = draftFromConfig(config, 'liepin')
-        if (mode === 'full') {
-          nextZhilian.enabled = false
+        if (isAutoFull) {
+          nextZhilian.enabled = true
           nextJob51.enabled = false
           nextLiepin.enabled = false
         }
@@ -154,8 +161,13 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
           (item === 'boss' || item === 'zhilian' || item === '51job' || item === 'liepin') && values.indexOf(item) === index,
         )
         setDrafts({ boss: nextBoss, zhilian: nextZhilian, '51job': nextJob51, liepin: nextLiepin })
-        setOrder(mode === 'full' ? ['boss'] : (nextOrder.length ? nextOrder : ['boss']))
-        setAutoScore(mode === 'full' || config?.collection?.auto_score_default === true)
+        setOrder(isAutoFull ? ['boss', 'zhilian'] : (nextOrder.length ? nextOrder : ['boss']))
+        setAutoScore(isFullFlow || config?.collection?.auto_score_default === true)
+        setScoreThreshold(String(config?.scoring?.threshold ?? 60))
+        setMaxDeliveriesPerPlatform(String(config?.automation?.max_deliveries_per_platform ?? 3))
+        setBossGreeting(String(config?.automation?.boss_greeting || config?.profile?.greeting_preference || ''))
+        setIntervalMin(String(config?.throttle?.interval_min ?? 60))
+        setIntervalMax(String(config?.throttle?.interval_max ?? 180))
       })
       .catch(() => {
         if (!cancelled) setError('读取采集默认配置失败，可直接填写后启动。')
@@ -272,7 +284,42 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
         sort: draft.sort,
       }
     }
-    void submit({ platform_order: enabledOrder, auto_score: mode === 'full' ? true : autoScore, platforms })
+    if (isAutoFull) {
+      const threshold = Number(scoreThreshold)
+      const maxDeliveries = Number(maxDeliveriesPerPlatform)
+      const minimum = Number(intervalMin)
+      const maximum = Number(intervalMax)
+      if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) {
+        setError('自动流程评分阈值必须是 0 到 100 之间的数字。')
+        return
+      }
+      if (!Number.isInteger(maxDeliveries) || maxDeliveries < 1 || maxDeliveries > 3) {
+        setError('每个平台本轮最多投递数量必须是 1 到 3 之间的整数。')
+        return
+      }
+      if (!Number.isFinite(minimum) || minimum < 0 || !Number.isFinite(maximum) || maximum < minimum || maximum > 180) {
+        setError('自动流程随机等待必须满足：最小值不小于 0，最大值不小于最小值，且最大值不超过 180 秒。')
+        return
+      }
+      if (enabledOrder.includes('boss') && !bossGreeting.trim()) {
+        setError('自动投递 BOSS 岗位前，请先填写统一招呼语。')
+        return
+      }
+      void submit({
+        platform_order: enabledOrder,
+        auto_score: true,
+        platforms,
+        auto_settings: {
+          score_threshold: threshold,
+          max_deliveries_per_platform: maxDeliveries,
+          boss_greeting: bossGreeting.trim(),
+          interval_min: minimum,
+          interval_max: maximum,
+        },
+      })
+      return
+    }
+    void submit({ platform_order: enabledOrder, auto_score: autoScore, platforms })
   }
 
   const submit = async (options: Record<string, unknown>) => {
@@ -299,8 +346,8 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
         <div className="flex items-start justify-between gap-4">
           <div>
             <div className="text-xs font-black tracking-[0.18em] text-primary">COLLECT JOBS</div>
-            <h2 className="mt-1 text-2xl font-black">{mode === 'full' ? '全流程采集设置' : '岗位采集'}</h2>
-            <p className="mt-1 text-sm leading-6 text-muted">平台会按队列严格串行执行；每个平台只设置最大页数和排序。</p>
+            <h2 className="mt-1 text-2xl font-black">{isAutoFull ? '自动全流程设置' : '岗位采集'}</h2>
+            <p className="mt-1 text-sm leading-6 text-muted">{isAutoFull ? 'BOSS 与智联并行采集，自动评分并投递达标岗位；同一平台内逐条发送并随机等待，最长等待 180 秒。' : '平台会按队列严格串行执行；每个平台只设置最大页数和排序。'}</p>
           </div>
           <Button variant="ghost" size="sm" onClick={onClose} disabled={starting} aria-label="关闭"><X className="h-5 w-5" /></Button>
         </div>
@@ -347,7 +394,7 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
             return (
               <section key={platform} className={`rounded-2xl border p-4 ${draft.enabled ? 'border-primary/30 bg-[#FFFCFA]' : 'border-card-border bg-white opacity-70'}`}>
                 <div className="flex items-center justify-between gap-3">
-                  <label className="flex items-center gap-2 text-lg font-black"><input type="checkbox" checked={draft.enabled} disabled={mode === 'full' && platform !== 'boss'} onChange={event => togglePlatform(platform, event.target.checked)} className="h-4 w-4 accent-primary" />{label}</label>
+                  <label className="flex items-center gap-2 text-lg font-black"><input type="checkbox" checked={draft.enabled} disabled={isFullFlow && !['boss', 'zhilian'].includes(platform)} onChange={event => togglePlatform(platform, event.target.checked)} className="h-4 w-4 accent-primary" />{label}</label>
                   {draft.enabled && <div className="text-xs font-bold text-primary">队列 {enabledOrder.indexOf(platform) + 1}</div>}
                 </div>
                 {draft.enabled && <div className="mt-4 space-y-3">
@@ -373,19 +420,27 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
                     <label className="text-xs font-bold text-muted">排序<Select value={draft.sort} onChange={event => updateDraft(platform, 'sort', event.target.value)}><option value="default">默认</option>{platform !== '51job' && <option value="newest">最新</option>}</Select></label>
                   </div>
                 </div>}
-                {!draft.enabled && mode === 'full' && platform !== 'boss' && <p className="mt-3 text-xs text-muted">当前只支持“岗位采集”，不进入发送全流程。</p>}
+                {!draft.enabled && isFullFlow && !['boss', 'zhilian'].includes(platform) && <p className="mt-3 text-xs text-muted">自动投递目前只支持 BOSS 直聘和智联招聘。</p>}
               </section>
             )
           })}
         </div>
 
         <div className="mt-4 rounded-2xl border border-card-border bg-[#FFFCFA] p-4">
-                  <div className="flex items-center justify-between gap-3"><div><div className="text-sm font-black">执行顺序</div><p className="mt-1 text-xs text-muted">平台串行采集；BOSS、智联和猎聘使用各自的专属沟通链路，前程无忧暂不支持自动发送 HR 消息。</p></div><div className="flex gap-2">{enabledOrder.map((platform, index) => <div key={platform} className="flex items-center gap-1 rounded-full bg-white px-3 py-1 text-xs font-black text-primary"><span>{index + 1}. {PLATFORM_SHORT_LABELS[platform]}</span><button type="button" onClick={() => move(platform, -1)} disabled={index === 0} aria-label="上移"><ArrowUp className="h-3 w-3" /></button><button type="button" onClick={() => move(platform, 1)} disabled={index === enabledOrder.length - 1} aria-label="下移"><ArrowDown className="h-3 w-3" /></button></div>)}</div></div>
+                  <div className="flex items-center justify-between gap-3"><div><div className="text-sm font-black">执行顺序</div><p className="mt-1 text-xs text-muted">{isAutoFull ? 'BOSS 与智联并行采集；每个平台内部按消息队列逐条发送。遇到风控、验证码、登录失效或无法安全验证时，会停止对应平台，不会自动重试。' : '平台串行采集；BOSS、智联和猎聘使用各自的专属沟通链路，前程无忧暂不支持自动发送 HR 消息。'}</p></div><div className="flex gap-2">{enabledOrder.map((platform, index) => <div key={platform} className="flex items-center gap-1 rounded-full bg-white px-3 py-1 text-xs font-black text-primary"><span>{index + 1}. {PLATFORM_SHORT_LABELS[platform]}</span><button type="button" onClick={() => move(platform, -1)} disabled={isAutoFull || index === 0} aria-label="上移"><ArrowUp className="h-3 w-3" /></button><button type="button" onClick={() => move(platform, 1)} disabled={isAutoFull || index === enabledOrder.length - 1} aria-label="下移"><ArrowDown className="h-3 w-3" /></button></div>)}</div></div>
         </div>
 
-        <label className="mt-4 flex items-center justify-between rounded-2xl border border-card-border bg-white p-4"><div><div className="text-sm font-black">{mode === 'full' ? '全流程自动评分' : '采集后自动评分'}</div><p className="mt-1 text-xs leading-5 text-muted">{mode === 'full' ? '全流程必须先评分；评分后进入人工确认，再按平台适配器执行招呼和监测。' : '默认关闭；开启后只评分本轮新增岗位，评分结束即停止，不发送消息、不投递、不监测。'}</p></div><Switch checked={mode === 'full' || autoScore} onChange={mode === 'full' ? () => undefined : setAutoScore} disabled={mode === 'full'} /></label>
+        {isAutoFull && <div className="mt-4 grid gap-3 rounded-2xl border border-primary/20 bg-[#FFF8F2] p-4 md:grid-cols-4">
+          <label className="text-xs font-bold text-muted">自动投递最低评分<Input type="number" min={0} max={100} value={scoreThreshold} onChange={event => setScoreThreshold(event.target.value)} /></label>
+          <label className="text-xs font-bold text-muted">每个平台最多投递岗位数<Input type="number" min={1} max={3} step={1} value={maxDeliveriesPerPlatform} onChange={event => setMaxDeliveriesPerPlatform(event.target.value)} /></label>
+          <label className="text-xs font-bold text-muted">最小随机等待（秒）<Input type="number" min={0} max={180} value={intervalMin} onChange={event => setIntervalMin(event.target.value)} /></label>
+          <label className="text-xs font-bold text-muted">最大随机等待（秒）<Input type="number" min={0} max={180} value={intervalMax} onChange={event => setIntervalMax(event.target.value)} /></label>
+          <label className="text-xs font-bold text-muted md:col-span-3">BOSS 统一招呼语<textarea value={bossGreeting} onChange={event => setBossGreeting(event.target.value)} className="mt-1 min-h-20 w-full rounded-xl border border-card-border bg-white p-3 text-sm leading-6 text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-primary/20" placeholder="例如：您好，我对这个岗位很感兴趣，方便沟通一下吗？" /></label>
+          <p className="text-xs leading-5 text-muted md:col-span-3">智联招聘使用平台默认招呼语；BOSS 直聘使用上面的统一招呼语。达到评分阈值的岗位会自动进入投递队列，不需要再次人工点击投递。</p>
+        </div>}
+          <label className="mt-4 flex items-center justify-between rounded-2xl border border-card-border bg-white p-4"><div><div className="text-sm font-black">{isAutoFull ? '自动评分与投递' : '采集后自动评分'}</div><p className="mt-1 text-xs leading-5 text-muted">{isAutoFull ? '采集完成后自动评分，达到阈值的岗位会直接进入低频投递队列；成功投递后自动补齐会话并持续监控。' : '默认关闭；开启后只评分本轮新增岗位，评分结束即停止，不发送消息、不投递、不监测。'}</p></div><Switch checked={isFullFlow || autoScore} onChange={isFullFlow ? () => undefined : setAutoScore} disabled={isFullFlow} /></label>
         {error && <div className="mt-3 rounded-xl bg-red-50 px-3 py-2 text-sm text-danger">{error}</div>}
-        <div className="mt-5 flex justify-end gap-2"><Button variant="secondary" onClick={onClose} disabled={starting}>取消</Button><Button onClick={() => void start()} disabled={Boolean(activeTask) || starting}>{starting ? <span className="inline-flex items-center gap-2"><RefreshCw className="h-4 w-4 animate-spin" />启动中…</span> : mode === 'full' ? '开始全流程' : '重新采集'}</Button></div>
+        <div className="mt-5 flex justify-end gap-2"><Button variant="secondary" onClick={onClose} disabled={starting}>取消</Button><Button onClick={() => void start()} disabled={Boolean(activeTask) || starting}>{starting ? <span className="inline-flex items-center gap-2"><RefreshCw className="h-4 w-4 animate-spin" />启动中…</span> : isAutoFull ? '开始自动全流程' : '重新采集'}</Button></div>
       </div>
     </div>
   )

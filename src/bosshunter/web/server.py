@@ -128,6 +128,18 @@ from bosshunter.web.runtime_logging import configure_runtime_logging, runtime_lo
 from bosshunter.conversations import ConversationRepository, IncomingMessage, normalize_platform_external_url, utc_now
 from bosshunter.conversation_analytics import build_conversation_analytics
 from bosshunter.conversation_bridge import reconcile_verified_deliveries, sync_extracted_messages
+from bosshunter.automation.runner import AutoFullRunner
+from bosshunter.automation.monitor import (
+	automatic_full_run_config,
+	automatic_reply_allowed,
+	run_monitor_cycle,
+)
+from bosshunter.automation.scope import (
+    DeliveryScopeError,
+    build_verified_delivery_scope,
+    filter_conversations,
+    normalize_delivery_scope,
+)
 from bosshunter.conversation_scheduler import SerialConversationScheduler, init_scheduler_tables
 from bosshunter.platform_delivery import DeliveryContext, get_delivery_adapter
 from bosshunter.platform_delivery.reply import send_boss_reply, send_zhilian_reply
@@ -153,6 +165,7 @@ from bosshunter.platform_delivery.zhilian import (
 )
 from bosshunter.platform_delivery.liepin import _liepin_im_targets, _liepin_conversation_list_snapshot, _liepin_chat_snapshot
 from bosshunter.browser import click_at, evaluate, get_page_targets
+from bosshunter.browser.platform_targets import filter_platform_targets, target_id, target_url
 from bosshunter.platform_delivery.browser_helpers import parse_result
 from bosshunter.executor.monitor import JS_EXTRACT_CHAT_LIST, JS_EXTRACT_CONVERSATION, _send_message_in_chat
 from bosshunter.assistant_lab import list_messages as lab_list_messages, open_sandbox, reset as reset_lab, send_message as lab_send_message, session_payload as lab_session_payload
@@ -479,7 +492,10 @@ def _sanitize_config_for_write(data):
 def _preflight_messages(mode: str, config: dict, options: dict | None = None) -> list[str]:
 	"""Return user-actionable blockers before starting a dashboard task."""
 	messages: list[str] = []
-	if mode not in {"full", "collect", "rescore", "monitor"}:
+	if mode == "full":
+		messages.append("旧 full 工作流已停用新建入口，请使用 auto_full")
+		return messages
+	if mode not in {"auto_full", "collect", "rescore", "monitor"}:
 		messages.append(f"不支持的任务模式：{mode}")
 	if mode == "collect":
 		try:
@@ -497,10 +513,10 @@ def _preflight_messages(mode: str, config: dict, options: dict | None = None) ->
 
 	profile = config.get("profile", {})
 	resume_path = profile.get("resume_path", "")
-	if mode in {"full", "rescore"} and (not resume_path or not Path(str(resume_path)).exists()):
+	if mode in {"auto_full", "rescore"} and (not resume_path or not Path(str(resume_path)).exists()):
 		messages.append("请先在配置页上传 .md、.docx 或 .pdf 简历。")
 
-	if mode == "full":
+	if mode == "auto_full":
 		try:
 			full_options = normalize_collection_options(config, options)
 		except ValueError as exc:
@@ -509,7 +525,21 @@ def _preflight_messages(mode: str, config: dict, options: dict | None = None) ->
 			if not full_options.get("platform_order"):
 				messages.append("运行全流程至少需要选择一个采集平台。")
 
-	if mode in {"full", "rescore"} and not get_ai_api_key(config):
+	if mode == "auto_full":
+		try:
+			auto_options = normalize_collection_options(config, options)
+			unsupported = [platform for platform in auto_options.get("platform_order", []) if platform not in {"boss", "zhilian"}]
+			if unsupported:
+				messages.append("auto_full 只支持 BOSS 直聘和智联招聘")
+			if "boss" in auto_options.get("platform_order", []):
+				automation = config.get("automation") if isinstance(config.get("automation"), dict) else {}
+				profile = config.get("profile") if isinstance(config.get("profile"), dict) else {}
+				if not str(automation.get("boss_greeting") or profile.get("greeting_preference") or "").strip():
+					messages.append("auto_full 需要配置 BOSS 统一招呼语")
+		except ValueError:
+			pass
+
+	if mode in {"auto_full", "rescore"} and not get_ai_api_key(config):
 		messages.append("请先在配置页填写当前 AI 服务的 API Key，或设置对应的标准环境变量。")
 
 	return messages
@@ -607,7 +637,7 @@ def _execute_collect(task: WorkbenchTask, config: dict) -> None:
 		score_config["_workbench_stop_event"] = task.stop_requested
 		score_config["_workbench_log"] = lambda message: _log(task, message)
 		score_config["_workbench_score_progress"] = lambda state: _record_score_progress(task, state)
-		score_jobs(score_config)
+		score_jobs(score_config, db_path=DATA_DIR / "bosshunter.db")
 		return
 
 	result = CollectionOrchestrator(
@@ -629,6 +659,404 @@ def _execute_collect(task: WorkbenchTask, config: dict) -> None:
 	_log(task, f"本轮采集完成：新增 {len(result.get('collected_job_ids', []))}，状态 {result.get('status', 'completed')}")
 	if task.stop_requested.is_set():
 		return
+
+
+def _execute_auto_full(task: WorkbenchTask, config: dict) -> None:
+	"""Run collection, scoring, approved delivery, reconciliation, then monitor."""
+	options = config.get("_collection_options")
+	if not isinstance(options, dict):
+		raise ValueError("auto_full 缺少已归一化的采集配置")
+
+	def write_log(message: str) -> None:
+		_log(task, str(message))
+
+	def update_progress(state: dict[str, Any]) -> None:
+		if not isinstance(state, dict):
+			return
+		progress = dict(task.progress)
+		platforms = dict(progress.get("platforms") or {})
+		platform = str(state.get("platform") or "")
+		if platform and isinstance(state.get("result"), dict):
+			payload = state["result"]
+			platforms.update(payload.get("platforms") or {})
+		elif platform:
+			platforms[platform] = {**(platforms.get(platform) or {}), **state}
+		task.progress = {
+			**progress,
+			"stage": str(state.get("stage") or progress.get("stage") or "running"),
+			"platforms": platforms,
+		}
+
+	run_config = automatic_full_run_config(config)
+	run_config["_workbench_stop_event"] = task.stop_requested
+	run_config["_workbench_log"] = write_log
+	run_config["_automatic_full_run"] = True
+
+	runner = AutoFullRunner(
+		run_config,
+		options=options,
+		db_path=DATA_DIR / "bosshunter.db",
+		task_id=task.id,
+		stop_event=task.stop_requested,
+		auto_approve_delivery=True,
+		log=write_log,
+		progress=update_progress,
+	)
+	result = runner.run()
+	phase = getattr(result.phase, "value", str(result.phase))
+	task.metrics.update({
+		"auto_collected": len(result.collected_job_ids),
+		"auto_eligible": len(result.eligible_job_ids),
+		"auto_approved": len(result.approved_job_ids),
+		"auto_attempted": len(result.attempts),
+		"auto_succeeded": len(result.succeeded_job_ids),
+		"auto_failed": len(result.failed_job_ids),
+		"auto_reconciled": len(result.reconciliation.get("successful_job_ids", []))
+		if isinstance(result.reconciliation, dict)
+		else 0,
+	})
+	task.progress = {
+		**task.progress,
+		"outcome": phase,
+		"stage": phase,
+		"collected_job_ids": list(result.collected_job_ids),
+		"eligible_job_ids": list(result.eligible_job_ids),
+		"approved_job_ids": list(result.approved_job_ids),
+		"succeeded_job_ids": list(result.succeeded_job_ids),
+		"failed_job_ids": list(result.failed_job_ids),
+		"reconciliation": result.reconciliation,
+		"platform_states": result.platform_states,
+		"errors": result.errors,
+	}
+	for platform, message in result.errors.items():
+		write_log(f"{platform}: {message}")
+	# ``partial_completed`` is a successful handoff for the verified subset:
+	# the failed platform must stop, but the verified platform conversations
+	# still need to enter the low-frequency monitor.  Never turn an
+	# unverified delivery into a monitored conversation.
+	if phase not in {"completed", "partial_completed"}:
+		reason = result.stop_reason or phase
+		if phase == "stopped" or task.stop_requested.is_set():
+			return
+		raise RuntimeError(f"auto_full 未完成：{reason}")
+	write_log(
+		("automatic workflow delivery partially completed: " if phase == "partial_completed" else "automatic workflow delivery completed: ")
+		+ f"collected={len(result.collected_job_ids)}, "
+		+ f"eligible={len(result.eligible_job_ids)}, "
+		+ f"approved={len(result.approved_job_ids)}, sent={len(result.succeeded_job_ids)}"
+	)
+
+	# Keep the same task alive for the existing throttled monitor loop only after
+	# at least one delivery was safely verified and reconciled. The monitor still
+	# obeys the configured manual/AI-reply policy and stops on platform risk.
+	task.context["automatic_delivery_scope"] = []
+	task.context["automatic_reply_enabled"] = False
+	if result.succeeded_job_ids and isinstance(result.reconciliation, dict) and result.reconciliation.get("ok"):
+		try:
+			delivery_scope = build_verified_delivery_scope(result.attempts, result.reconciliation)
+		except DeliveryScopeError as exc:
+			task.progress = {
+				**task.progress,
+				"stage": "failed",
+				"outcome": "failed",
+				"automatic_delivery_scope_error": str(exc),
+			}
+			write_log(f"自动监测未启动：本轮安全投递范围校验失败：{exc}")
+			raise RuntimeError(f"automatic delivery scope validation failed: {exc}") from exc
+		auto_reply_enabled = automatic_reply_allowed(run_config)
+		task.context["automatic_delivery_scope"] = delivery_scope
+		task.context["automatic_reply_enabled"] = auto_reply_enabled
+		run_config["_automatic_delivery_scope"] = delivery_scope
+		run_config["_automatic_auto_reply_enabled"] = auto_reply_enabled
+		task.progress = {
+			**task.progress,
+			"automatic_delivery_scope": delivery_scope,
+			"automatic_reply_enabled": auto_reply_enabled,
+			"stage": "monitoring",
+			"outcome": "monitoring",
+			"delivery_outcome": phase,
+		}
+		task.context["automatic_monitoring"] = True
+		write_log(
+			"投递已完成，进入本轮已验证岗位的低频持续监测；"
+			f"自动回复={'开启' if auto_reply_enabled else '关闭'}；风险或停止请求会立即终止任务"
+		)
+		_execute_auto_conversation_monitor(task, run_config)
+	else:
+		task.context["automatic_monitoring"] = False
+		write_log("本轮没有可进入持续监测的已验证投递，会话监测未启动")
+def _execute_auto_conversation_monitor(task: WorkbenchTask, config: dict) -> None:
+    """Run the opt-in, low-frequency monitor owned by ``auto_full``."""
+    from bosshunter.executor.monitor import get_effective_monitor_interval_minutes
+
+    monitor_config = dict(config)
+    monitor_config["_workbench_stop_event"] = task.stop_requested
+    monitor_config["_automatic_workflow_monitor"] = True
+    interval_minutes = get_effective_monitor_interval_minutes(config)
+    interval_seconds = max(interval_minutes * 60, 1.0)
+    task.context["automatic_monitoring"] = True
+    task.context["monitoring"] = True
+    task.context["monitor_state"] = "monitoring"
+
+    while not task.stop_requested.is_set():
+        task.context["monitor_cycle_started_at"] = utc_now()
+        cycle = _run_auto_conversation_monitor_cycle(task, monitor_config)
+        cycle_completed_at = utc_now()
+        task.context["monitor_last_cycle_at"] = cycle_completed_at
+        task.progress = {
+            **task.progress,
+            "stage": "monitoring",
+            "outcome": "monitoring",
+            "monitor_cycle": cycle,
+            "monitor_last_cycle_at": cycle_completed_at,
+        }
+        stop_reason = str(cycle.get("stop_reason") or "").strip()
+        if stop_reason:
+            task.context["monitor_state"] = "stopped"
+            task.context["monitoring"] = False
+            task.stop_reason = f"automatic conversation monitor stopped: {stop_reason}"
+            task.stop_requested.set()
+            _log(task, task.stop_reason)
+            return
+        if monitor_config.get("_automatic_monitor_once"):
+            task.context["monitor_state"] = "completed_once"
+            task.context["monitoring"] = False
+            _log(task, "automatic conversation monitor completed one test cycle")
+            return
+        task.context["monitor_next_cycle_at"] = (
+            datetime.now(timezone.utc) + timedelta(seconds=interval_seconds)
+        ).isoformat()
+        task.context["monitor_state"] = "waiting_next_cycle"
+        _log(task, f"automatic conversation monitor completed; next cycle in {interval_minutes:g} minutes")
+        if task.stop_requested.wait(interval_seconds):
+            task.context["monitor_state"] = "stopped"
+            task.context["monitoring"] = False
+            return
+
+
+def _run_auto_conversation_monitor_cycle(task: WorkbenchTask, config: dict) -> dict[str, Any]:
+    """Sync and optionally answer only locally delivered BOSS/Zhilian cards."""
+    conn = _get_web_db()
+    try:
+        repo = ConversationRepository(conn)
+        try:
+            delivery_scope = normalize_delivery_scope(
+                config.get("_automatic_delivery_scope")
+            )
+        except DeliveryScopeError as exc:
+            error = str(exc)
+            _log(task, f"automatic conversation monitor not started: {error}")
+            return {
+                "processed": 0,
+                "skipped": 0,
+                "new_hr_messages": 0,
+                "replied": 0,
+                "failed": 0,
+                "stop_reason": "delivery_scope_invalid",
+                "scope_valid": False,
+                "scope_error": error,
+                "delivery_scope": [],
+                "details": [{
+                    "conversation_id": "",
+                    "platform": "",
+                    "status": "scope_invalid",
+                    "error": error,
+                }],
+            }
+
+        cards = repo.list_conversations(sort="recent")
+        eligible = filter_conversations(cards, delivery_scope)
+        rows_by_platform: dict[str, tuple[list[dict], list[dict]]] = {}
+        for platform in ("boss", "zhilian"):
+            if any(str(card.get("platform") or "").lower() == platform for card in eligible):
+                try:
+                    rows_by_platform[platform] = _opened_platform_rows(platform)
+                except Exception as exc:
+                    rows_by_platform[platform] = ([], [])
+                    _log(task, f"automatic conversation monitor {platform} list read failed: {exc}")
+
+        candidates: dict[str, tuple[dict, dict, str] | None] = {}
+        for card in eligible:
+            card_id = str(card.get("id") or "")
+            platform = str(card.get("platform") or "").lower()
+            _, rows = rows_by_platform.get(platform, ([], []))
+            scored: list[tuple[int, dict, str]] = []
+            for row in rows:
+                score = (
+                    _zhilian_identity_score(card, row)
+                    if platform == "zhilian"
+                    else _conversation_identity_score(card, row)
+                )
+                if platform == "boss" and score == 30 and not bool(row.get("active")):
+                    continue
+                if score:
+                    scored.append((score, row, _conversation_row_identity(row, platform=platform)))
+            scored.sort(key=lambda item: item[0], reverse=True)
+            if scored:
+                best_score = scored[0][0]
+                unique: dict[str, tuple[int, dict, str]] = {}
+                for item in scored:
+                    if item[0] == best_score:
+                        unique.setdefault(item[2], item)
+                best = list(unique.values())
+                candidates[card_id] = best[0] if len(best) == 1 else None
+            else:
+                candidates[card_id] = None
+
+        claimed: dict[str, list[str]] = {}
+        for card_id, item in candidates.items():
+            if item is not None:
+                claimed.setdefault(item[2], []).append(card_id)
+        contested = {
+            card_id
+            for card_ids in claimed.values()
+            if len(card_ids) > 1
+            for card_id in card_ids
+        }
+
+        def sync_one(card: dict) -> dict[str, Any]:
+            card_id = str(card.get("id") or "")
+            item = candidates.get(card_id)
+            if card_id in contested:
+                return {"status": "ambiguous", "error": "same platform chat claimed by multiple local cards"}
+            if item is None:
+                return {"status": "not_loaded", "error": "delivered HR chat is not safely loaded in an open platform panel"}
+            _, row, _ = item
+            platform = str(card.get("platform") or "").lower()
+            targets = rows_by_platform[platform][0]
+            target = next((candidate for candidate in targets if candidate["target_id"] == row.get("target_id")), None)
+            if target is None:
+                return {"status": "not_loaded", "error": "matching platform tab is no longer open"}
+            result = _sync_platform_target(
+                conn,
+                platform=platform,
+                target=target,
+                row={
+                    **row,
+                    "job_id": card.get("job_id") or "",
+                    "job_url": card.get("job_url") or "",
+                    "local_conversation_id": card_id,
+                },
+                base_dir=BASE_DIR,
+                config=config,
+            )
+            nested = result.get("synced") if isinstance(result.get("synced"), dict) else {}
+            persisted = nested.get("conversation") if isinstance(nested.get("conversation"), dict) else {}
+            local_id = str(persisted.get("id") or card_id)
+            return {
+                "status": str(result.get("status") or nested.get("status") or "error"),
+                "inserted": list(nested.get("inserted") or []),
+                "messages": repo.list_messages(local_id),
+                "target_id": target["target_id"],
+                "conversation_id": local_id,
+                "conversation_url": str(persisted.get("conversation_url") or card.get("conversation_url") or ""),
+            }
+
+        def handle_new_hr_message(card: dict, message: dict[str, Any]) -> dict[str, Any]:
+            conversation_id = str(card.get("id") or "")
+            content = str(message.get("content") or "").strip()
+            if not conversation_id or not content:
+                raise ValueError("new HR message is missing its local conversation or content")
+            result = process_hr_message(
+                conn,
+                conversation_id=conversation_id,
+                message=content,
+                base_dir=BASE_DIR,
+                config=config,
+                source="automatic_conversation_monitor",
+                message_id=message.get("platform_message_id") or message.get("id"),
+                allow_send=True,
+            )
+            classification = result.get("classification")
+            if not isinstance(classification, dict):
+                raise ValueError("HR message classifier returned an invalid result")
+            if classification.get("matched") is True:
+                category = str(classification.get("category") or "custom")
+                _log(
+                    task,
+                    f"automatic conversation monitor: human handoff required for {card.get('platform')}:{conversation_id} ({category})",
+                )
+            return classification
+
+        def generate_reply(card: dict, messages: list[dict]) -> str | None:
+            from bosshunter.executor.monitor import _generate_auto_reply
+
+            context = [
+                {
+                    "sender": "me" if str(message.get("sender_type") or "").lower() in {"user", "ai"} else "hr",
+                    "text": str(message.get("content") or ""),
+                }
+                for message in messages
+                if str(message.get("content") or "").strip()
+            ]
+            job = {
+                "title": card.get("job_title") or "",
+                "company": card.get("job_company") or "",
+                "hr_name": card.get("hr_name") or card.get("job_hr_name") or "",
+            }
+            return _generate_auto_reply(context, job, config)
+
+        def send_reply(card: dict, reply: str, synced: dict) -> dict[str, Any]:
+            platform = str(card.get("platform") or "").lower()
+            target_id = str(synced.get("target_id") or "")
+            verified = False
+            if platform == "boss":
+                action_started = bool(_send_message_in_chat(target_id, reply))
+                observed: list = []
+                if action_started:
+                    try:
+                        parsed = _parse_browser_json(evaluate(target_id, JS_EXTRACT_CONVERSATION, timeout=10))
+                        observed = parsed if isinstance(parsed, list) else []
+                    except Exception:
+                        observed = []
+                    expected = " ".join(reply.split())
+                    verified = any(
+                        str(item.get("sender") or "").lower() in {"me", "user"}
+                        and " ".join(str(item.get("text") or item.get("content") or "").split()) == expected
+                        for item in observed if isinstance(item, dict)
+                    )
+                result = {
+                    "success": verified,
+                    "verified": verified,
+                    "status": "sent" if verified else "send_not_verified",
+                    "error": "BOSS DOM did not confirm the automatic reply" if not verified else "",
+                }
+            elif platform == "zhilian":
+                raw = _fill_and_send_zhilian_message(target_id, reply)
+                result = raw if isinstance(raw, dict) else {"success": bool(raw), "verified": bool(raw)}
+                verified = bool(result.get("success") and result.get("verified"))
+                result.setdefault("status", "sent" if verified else "send_not_verified")
+            else:
+                return {"success": False, "verified": False, "status": "unsupported_platform"}
+            if verified:
+                conversation_id = str(synced.get("conversation_id") or card.get("id") or "")
+                repo.append_messages(conversation_id, [IncomingMessage(
+                    sender_type="ai",
+                    content=reply,
+                    message_time=None,
+                    platform_message_id=f"auto-reply:{uuid4().hex}",
+                    source_url=str(synced.get("conversation_url") or card.get("conversation_url") or ""),
+                    raw_payload={"source": "automatic_conversation_monitor", "platform": platform},
+                    is_ai_generated=True,
+                    is_sent=True,
+                )])
+            return result
+
+        return run_monitor_cycle(
+            eligible,
+            sync_one=sync_one,
+            handle_new_hr_message=handle_new_hr_message,
+            generate_reply=generate_reply,
+            send_reply=send_reply,
+            auto_reply_enabled=bool(
+                config.get("_automatic_auto_reply_enabled", automatic_reply_allowed(config))
+            ),
+            delivery_scope=delivery_scope,
+            stop_event=task.stop_requested,
+            log=lambda message: _log(task, message),
+        )
+    finally:
+        conn.close()
 
 
 def _stop_or_log_boss_collection_reason(task: WorkbenchTask, stop_reason: str) -> None:
@@ -662,7 +1090,7 @@ def _execute_rescore(task: WorkbenchTask, config: dict) -> None:
 	score_config["_workbench_log"] = lambda message: _log(task, message)
 	score_config["_workbench_score_progress"] = lambda state: _record_score_progress(task, state)
 	_log(task, "开始重新评分")
-	score_jobs(score_config, rescore_filtered=True)
+	score_jobs(score_config, rescore_filtered=True, db_path=DATA_DIR / "bosshunter.db")
 
 
 def _execute_score(task: WorkbenchTask, config: dict) -> None:
@@ -706,6 +1134,7 @@ def _execute_score(task: WorkbenchTask, config: dict) -> None:
 			limit=None,
 			job_ids=list(options.get("job_ids", [])),
 			force_rescore=bool(options.get("force_rescore")),
+			db_path=db_path,
 		)
 	except Exception as exc:
 		update_scoring_run(db_path, run_id, status="failed", error=str(exc)[:1000])
@@ -1180,7 +1609,7 @@ def _execute_greet(task: WorkbenchTask, config: dict) -> None:
 
 
 task_runner._executors.update({
-	"full": _execute_full,
+	"auto_full": _execute_auto_full,
 	"collect": _execute_collect,
 	"rescore": _execute_rescore,
 	"score": _execute_score,
@@ -1641,6 +2070,12 @@ def api_workbench_preflight():
 	try:
 		config = load_config(CONFIG_PATH)
 		options = _resolve_collection_resume(mode, options)
+		# ``auto_full`` always enables scoring when the task starts.  Mirror that
+		# contract during preflight so the AI connectivity check cannot be
+		# accidentally skipped when the dialog omits the derived ``auto_score``
+		# flag.
+		if mode == "auto_full":
+			options = {**(options if isinstance(options, dict) else {}), "auto_score": True}
 		checks = collect_preflight_checks(mode, config, options)
 		messages = error_messages(checks)
 		return _json_response({"ok": not messages, "messages": messages, "checks": checks})
@@ -1859,6 +2294,12 @@ def api_workbench_task_start():
 		if not isinstance(body, dict):
 			return _json_response({"error": "请求体必须是对象"}, 400)
 		mode = str(body.get("mode", ""))
+		if mode == "full":
+			return _json_response({
+				"error": "旧 full 工作流已停用新建入口，请使用 auto_full",
+				"code": "legacy_full_mode_disabled",
+				"replacement_mode": "auto_full",
+			}, 410)
 		if mode == "greet":
 			# greet 必须走 /api/workbench/greetings 携带岗位选择，通用入口无 job_ids
 			# 只会产生"零岗位成功任务"。
@@ -1875,29 +2316,58 @@ def api_workbench_task_start():
 				collection_options = normalize_collection_options(base_config, options)
 			except ValueError as exc:
 				return _json_response({"error": str(exc)}, 400)
-		elif mode == "full":
+		elif mode == "auto_full":
 			try:
 				collection_options = normalize_collection_options(base_config, options)
 			except ValueError as exc:
 				return _json_response({"error": str(exc)}, 400)
-			collection_only = [
-				platform for platform in collection_options["platform_order"]
-				if not platform_supports(platform, "deliver")
-			]
-			if collection_only:
-				return _json_response({
-					"error": "当前所选平台中仍有未开放发送全流程的平台",
-					"collection_only_platforms": collection_only,
-				}, 400)
+			unsupported = [platform for platform in collection_options["platform_order"] if platform not in {"boss", "zhilian"}]
+			if unsupported:
+				return _json_response({"error": "自动全流程目前只允许 BOSS 直聘和智联招聘", "unsupported_platforms": unsupported}, 400)
+			if not collection_options["platform_order"]:
+				return _json_response({"error": "自动全流程至少选择一个平台"}, 400)
 			collection_options["auto_score"] = True
+			auto_settings = options.get("auto_settings") if isinstance(options, dict) and isinstance(options.get("auto_settings"), dict) else {}
+			try:
+				threshold = max(0.0, min(float(auto_settings.get("score_threshold", base_config.get("scoring", {}).get("threshold", 60))), 100.0))
+				interval_min = max(0.0, float(auto_settings.get("interval_min", base_config.get("throttle", {}).get("interval_min", 60))))
+				interval_max = max(interval_min, float(auto_settings.get("interval_max", base_config.get("throttle", {}).get("interval_max", 180))))
+			except (TypeError, ValueError):
+				return _json_response({"error": "自动流程评分阈值和等待时间必须是有效数字"}, 400)
+			max_deliveries_value = auto_settings.get("max_deliveries_per_platform", 3)
+			try:
+				max_deliveries_per_platform = int(max_deliveries_value)
+			except (TypeError, ValueError):
+				return _json_response({"error": "自动流程每个平台的投递上限必须是 1 到 3 的整数"}, 400)
+			if (
+				isinstance(max_deliveries_value, bool)
+				or str(max_deliveries_value).strip() != str(max_deliveries_per_platform)
+				or not 1 <= max_deliveries_per_platform <= 3
+			):
+				return _json_response({"error": "自动流程每个平台的投递上限必须是 1 到 3 的整数"}, 400)
+			if interval_max > 180:
+				return _json_response({"error": "自动流程单次等待最长不能超过 180 秒"}, 400)
+			collection_options["max_deliveries_per_platform"] = max_deliveries_per_platform
+			base_config["scoring"] = {**(base_config.get("scoring") if isinstance(base_config.get("scoring"), dict) else {}), "threshold": threshold}
+			base_config["throttle"] = {
+				**(base_config.get("throttle") if isinstance(base_config.get("throttle"), dict) else {}),
+				"interval_min": interval_min,
+				"interval_max": interval_max,
+			}
+			if "boss" in collection_options["platform_order"]:
+				greeting = str(auto_settings.get("boss_greeting") or "").strip()
+				if greeting:
+					base_config["automation"] = {**(base_config.get("automation") if isinstance(base_config.get("automation"), dict) else {}), "boss_greeting": greeting}
 		messages = _preflight_messages(mode, base_config, collection_options)
 		if messages:
 			return _json_response({"error": "请先处理启动前检查", "messages": messages}, 400)
 		extra = {"_collection_options": collection_options} if collection_options is not None else {}
 		before_start = None
-		if collection_options is not None and not collection_options.get("resume_run_id"):
+		if mode != "auto_full" and collection_options is not None and not collection_options.get("resume_run_id"):
 			# Persist only non-secret collection preferences so the next dialog can
-			# restore each platform's independent fields and queue order.
+			# restore each platform's independent fields and queue order. The opt-in
+			# automatic flow is deliberately request-scoped so it cannot alter the
+			# legacy manual workflow's saved platform defaults.
 			base_config["collection"] = {
 				**(base_config.get("collection") if isinstance(base_config.get("collection"), dict) else {}),
 				"default_order": collection_options["platform_order"],
@@ -2175,7 +2645,7 @@ def api_workbench_deliver():
 			if (
 				not direct_send
 				and active_runtime_task
-				and active_runtime_task.mode == "full"
+				and active_runtime_task.mode == "auto_full"
 				and active_runtime_task.status == "running"
 				and not monitoring_task
 				and not delivery_task
@@ -2336,7 +2806,7 @@ def api_workbench_generate_greetings():
 def _greeting_edit_blocked_response():
 	"""Called under job_mutation_lock, also held by every web task start."""
 	active = task_runner.status().get("active")
-	if active and active.get("mode") in {"greet", "deliver", "full", "monitor"}:
+	if active and active.get("mode") in {"greet", "deliver", "auto_full", "monitor"}:
 		return _json_response({
 			"error": f"「{active.get('label') or active.get('mode')}」任务运行中，请等待结束后再编辑招呼语",
 			"code": "greeting_edit_busy",
@@ -3361,11 +3831,11 @@ def api_knowledge_search():
 def _boss_im_targets() -> list[dict[str, str]]:
     """Return already-open BOSS pages that can be inspected without navigation."""
     targets: list[dict[str, str]] = []
-    for target in get_page_targets() or []:
-        url = str(target.get("url") or "")
-        target_id = str(target.get("targetId") or target.get("id") or "").strip()
-        if target_id and "zhipin.com" in url and "/web/" in url:
-            targets.append({"target_id": target_id, "url": url})
+    for target in filter_platform_targets(get_page_targets(), "boss"):
+        url = target_url(target)
+        current_target_id = target_id(target)
+        if current_target_id and "/web/" in url.lower():
+            targets.append({"target_id": current_target_id, "url": url})
     return targets
 
 
@@ -4836,8 +5306,9 @@ def api_agent_state():
 				"collect_without_ai": True,
 				"evaluate_with_local_agent_without_ai": True,
 				"monitor_without_ai": True,
-				"start_full_flow": True,
-				"human_confirmation_before_delivery": True,
+				"start_auto_full_flow": True,
+				"legacy_full_mode": False,
+				"human_confirmation_before_delivery": False,
 			},
 			"task": status["active"],
 			"last_task": status["last_task"],
@@ -4882,7 +5353,7 @@ def api_agent_tools():
 				"name": "bosshunter_start_workflow",
 				"method": "POST",
 				"path": "/api/agent/tasks",
-				"description": "启动 collect、monitor 或 full 工作流。full 仍会在投递前暂停等待人工确认。",
+				"description": "启动 collect、monitor 或 auto_full 自动全流程。auto_full 按安全队列投递并持续监控；平台验证失败、风控或验证码会停止对应链路。",
 				"confirmation": "confirm: true",
 			},
 			{
@@ -5134,14 +5605,14 @@ def api_agent_task_start():
 		if body.get("confirm") is not True:
 			return _json_response({"error": "启动任务前必须传 confirm: true", "requires_confirmation": True}, 400)
 		mode = str(body.get("mode") or "")
-		if mode not in {"collect", "monitor", "full"}:
+		if mode not in {"collect", "monitor", "auto_full"}:
 			return _json_response({
-				"error": "Agent 只能启动 collect、monitor 或 full；不能单独跳过确认发送"
+				"error": "Agent 只能启动 collect、monitor 或 auto_full；不能使用已停用的 full 入口"
 			}, 403)
 
 		config = load_config(CONFIG_PATH)
 		options = None
-		if mode in {"collect", "full"}:
+		if mode in {"collect", "auto_full"}:
 			options = normalize_collection_options(config, None)
 			if mode == "collect":
 				# Pure collection remains available without a configured model service.
@@ -5169,8 +5640,8 @@ def api_agent_task_start():
 			"task": task,
 			"checks": checks,
 			"policy": {
-				"auto_score": False if mode == "collect" else True if mode == "full" else None,
-				"delivery": "full 工作流会在发送前暂停，必须经现有人工确认流程继续",
+				"auto_score": False if mode == "collect" else True if mode == "auto_full" else None,
+				"delivery": "auto_full 按安全队列自动投递；页面验证失败、风控或验证码会停止对应链路",
 			},
 		})
 	except (AgentRequestError, ValueError) as exc:

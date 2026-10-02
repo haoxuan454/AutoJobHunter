@@ -86,7 +86,7 @@ class ScraperBackgroundTests(unittest.TestCase):
             collected_job_ids.extend(["new-1", "new-2", "new-3"])
             return 3
 
-        def score_with_progress(score_config):
+        def score_with_progress(score_config, **_kwargs):
             score_config["_workbench_score_progress"]({
                 "completed": 3,
                 "total": 3,
@@ -137,9 +137,10 @@ class ScraperBackgroundTests(unittest.TestCase):
              patch("bosshunter.scraper.jobs.new_tab", return_value="worker-target"), \
              patch("bosshunter.scraper.jobs.navigate", return_value=True), \
              patch("bosshunter.scraper.jobs.evaluate", side_effect=[
-                 json.dumps({"risk": None}), False, json.dumps(jobs),
+                 json.dumps({"risk": None}), False, False,
                  json.dumps({"risk": None}), json.dumps(detail),
              ]), \
+             patch("bosshunter.collection.platforms.boss._wait_for_rendered_list", return_value=jobs), \
              patch("bosshunter.scraper.jobs.wait_for_load"), \
              patch("bosshunter.scraper.jobs.scroll"), \
              patch("bosshunter.scraper.jobs.close_tab"), \
@@ -151,7 +152,7 @@ class ScraperBackgroundTests(unittest.TestCase):
             guard_cls.return_value.ensure_unlocked.return_value = None
             count = scrape_jobs(config, ["AI"], collected_job_ids=collected_job_ids)
 
-        self.assertEqual(count, 1)
+        self.assertEqual(count, 1, config.get("_workbench_collect_report"))
         self.assertEqual(len(collected_job_ids), 1)
         self.assertEqual(updates[-1], {
             "seen": 2, "new": 1, "duplicate": 1, "filtered": 0,
@@ -198,10 +199,11 @@ class ScraperBackgroundTests(unittest.TestCase):
              patch(
                  "bosshunter.scraper.jobs.evaluate",
                  side_effect=[
-                     json.dumps({"risk": None}), False, json.dumps(jobs),
+                     json.dumps({"risk": None}), False, False,
                      json.dumps({"risk": None}), json.dumps(detail),
                  ],
              ), \
+             patch("bosshunter.collection.platforms.boss._wait_for_rendered_list", return_value=jobs), \
              patch("bosshunter.scraper.jobs.wait_for_load"), \
              patch("bosshunter.scraper.jobs.scroll"), \
              patch("bosshunter.scraper.jobs.close_tab"), \

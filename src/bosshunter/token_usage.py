@@ -7,12 +7,23 @@ responses, API keys, or other model payload content.
 from __future__ import annotations
 
 import sqlite3
+import logging
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 
-def _db_path() -> Path:
+logger = logging.getLogger("bosshunter.token_usage")
+_TOKEN_DB_TIMEOUT_SECONDS = 30.0
+_TOKEN_DB_BUSY_TIMEOUT_MS = 30_000
+_TOKEN_DB_WRITE_ATTEMPTS = 3
+
+
+def _db_path(config: dict[str, Any] | None = None) -> Path:
+    configured = config.get("_db_path") if isinstance(config, dict) else None
+    if configured:
+        return Path(str(configured))
     return Path.cwd() / "data" / "bosshunter.db"
 
 
@@ -36,7 +47,6 @@ def init_token_usage_tables(conn: sqlite3.Connection) -> None:
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_token_usage_created ON ai_token_usage(created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_token_usage_purpose ON ai_token_usage(purpose)")
-    conn.commit()
 
 
 def _number(value: Any) -> int:
@@ -85,16 +95,32 @@ def record_token_usage(
         input_rate = output_rate = 0.0
     input_cost = input_tokens / 1_000_000 * input_rate
     output_cost = output_tokens / 1_000_000 * output_rate
-    conn = sqlite3.connect(str(_db_path()))
-    try:
-        init_token_usage_tables(conn)
-        conn.execute(
-            "INSERT INTO ai_token_usage (provider, model, purpose, input_tokens, output_tokens, total_tokens, estimated, input_cost, output_cost, total_cost) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (str(provider or ""), str(model or ""), str(purpose or "unspecified"), input_tokens, output_tokens, total_tokens, estimated, input_cost, output_cost, input_cost + output_cost),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    path = _db_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in range(1, _TOKEN_DB_WRITE_ATTEMPTS + 1):
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(str(path), timeout=_TOKEN_DB_TIMEOUT_SECONDS)
+            conn.execute(f"PRAGMA busy_timeout = {_TOKEN_DB_BUSY_TIMEOUT_MS}")
+            init_token_usage_tables(conn)
+            conn.execute(
+                "INSERT INTO ai_token_usage (provider, model, purpose, input_tokens, output_tokens, total_tokens, estimated, input_cost, output_cost, total_cost) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(provider or ""), str(model or ""), str(purpose or "unspecified"), input_tokens, output_tokens, total_tokens, estimated, input_cost, output_cost, input_cost + output_cost),
+            )
+            conn.commit()
+            return
+        except sqlite3.OperationalError as exc:
+            locked = "locked" in str(exc).lower() or "busy" in str(exc).lower()
+            if not locked or attempt >= _TOKEN_DB_WRITE_ATTEMPTS:
+                logger.warning("token usage ledger write skipped: %s: %s", type(exc).__name__, str(exc)[:180])
+                return
+            time.sleep(0.2 * attempt)
+        except sqlite3.Error as exc:
+            logger.warning("token usage ledger write skipped: %s: %s", type(exc).__name__, str(exc)[:180])
+            return
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 def _bounds(start: str | None, end: str | None) -> tuple[str, str]:

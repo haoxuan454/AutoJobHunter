@@ -14,9 +14,11 @@ from bosshunter.collection.platforms.boss import (
     JS_DETECT_COLLECTION_RISK,
     JS_EXTRACT_DETAIL,
     JS_EXTRACT_LIST,
+    JS_IS_SCROLL_LIST,
     SEARCH_URL,
     BossBrowser,
     BossCollector,
+    _wait_for_rendered_list,
     build_boss_filter_query,
     generate_boss_job_id,
     normalize_boss_search_filters,
@@ -28,6 +30,32 @@ from bosshunter.collection_run_store import (
 
 
 class BossCollectorUnitTests(TestCase):
+    def test_wait_for_rendered_list_polls_same_page_until_jobs_mount(self):
+        reads = iter([[], [{"url": "/job_detail/rendered.html"}]])
+        sleeps = []
+
+        result = _wait_for_rendered_list(
+            lambda: next(reads),
+            sleep=sleeps.append,
+            timeout=1,
+            poll_interval=0.01,
+        )
+
+        self.assertEqual(result, [{"url": "/job_detail/rendered.html"}])
+        self.assertEqual(sleeps, [0.05])
+
+    def test_wait_for_rendered_list_returns_empty_at_bounded_deadline(self):
+        reads = []
+
+        result = _wait_for_rendered_list(
+            lambda: reads.append(1) or [],
+            sleep=lambda _seconds: None,
+            timeout=0,
+        )
+
+        self.assertEqual(result, [])
+        self.assertEqual(reads, [1])
+
     def test_generate_boss_job_id_from_detail_url(self):
         url = "https://www.zhipin.com/job_detail/abc123.html"
         self.assertEqual(generate_boss_job_id(url), "abc123")
@@ -95,6 +123,8 @@ class BossCollectorUnitTests(TestCase):
     def test_detail_script_targets_jd(self):
         self.assertIn(".job-sec-text", JS_EXTRACT_DETAIL)
         self.assertIn(".info-primary", JS_EXTRACT_DETAIL)
+        self.assertIn(".job-boss-info .name", JS_EXTRACT_DETAIL)
+        self.assertIn(".job-boss-info .boss-info-attr", JS_EXTRACT_DETAIL)
 
     def test_risk_detection_covers_captcha_and_block(self):
         self.assertIn("captcha", JS_DETECT_COLLECTION_RISK)
@@ -156,6 +186,87 @@ class BossCollectorCollectionTests(TestCase):
         )
         self.assertEqual(result.status, "completed_with_shortage")
         self.assertEqual(result.reason_code, "no_valid_city")
+
+    def test_search_page_load_requires_boss_host(self):
+        wait_calls = []
+
+        def evaluate(_target, script):
+            if script == JS_DETECT_COLLECTION_RISK:
+                return '{"risk": null}'
+            if script == JS_IS_SCROLL_LIST:
+                return False
+            if script == JS_EXTRACT_LIST:
+                return "[]"
+            return "{}"
+
+        browser = BossBrowser(
+            new_tab=lambda _url, **_kwargs: "tab-1",
+            close_tab=lambda _target: True,
+            evaluate=evaluate,
+            navigate=lambda _target, _url: True,
+            scroll=lambda *_args, **_kwargs: True,
+            wait_for_load=lambda *args, **kwargs: wait_calls.append((args, kwargs)) or True,
+        )
+        hooks, _ = self._make_hooks()
+        result = BossCollector(
+            browser=browser,
+            sleep=lambda _seconds: None,
+            throttle_factory=lambda **_kwargs: self._make_throttle(),
+        ).collect(
+            PlatformCollectionRequest("boss", ["AI"], ["北京"], {"北京": "101010100"}, max_pages=1),
+            hooks,
+        )
+
+        self.assertEqual(result.reason_code, "no_jobs_extracted")
+        self.assertEqual(wait_calls[0][1]["expected_host"], "www.zhipin.com")
+
+    def test_delayed_spa_mount_is_polled_even_when_marker_is_initially_missing(self):
+        list_jobs = [{
+            "title": "延迟挂载岗位",
+            "salary": "10-20K",
+            "company": "异步科技",
+            "url": "/job_detail/delayed123.html",
+        }]
+        detail = {
+            "title": "延迟挂载岗位",
+            "company": "异步科技",
+            "jd": "等待 SPA 首批 DOM 挂载后再读取。",
+        }
+        list_reads = iter([[], list_jobs])
+        marker_reads = iter([False, True])
+
+        def evaluate(_target, script):
+            if script == JS_DETECT_COLLECTION_RISK:
+                return '{"risk": null}'
+            if script == JS_IS_SCROLL_LIST:
+                return next(marker_reads, True)
+            if script == JS_EXTRACT_LIST:
+                return json.dumps(next(list_reads, list_jobs))
+            if script == JS_EXTRACT_DETAIL:
+                return json.dumps(detail)
+            return "{}"
+
+        browser = BossBrowser(
+            new_tab=lambda _url, **_kwargs: "tab-1",
+            close_tab=lambda _target: True,
+            evaluate=evaluate,
+            navigate=lambda _target, _url: True,
+            scroll=lambda *_args, **_kwargs: True,
+            wait_for_load=lambda *_args, **_kwargs: True,
+        )
+        hooks, collected = self._make_hooks()
+        result = BossCollector(
+            browser=browser,
+            sleep=lambda _seconds: None,
+            throttle_factory=lambda **_kwargs: self._make_throttle(),
+        ).collect(
+            PlatformCollectionRequest("boss", ["AI"], ["北京"], {"北京": "101010100"}, max_pages=1),
+            hooks,
+        )
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.reason_code, "search_exhausted")
+        self.assertEqual([candidate.title for candidate in collected], ["延迟挂载岗位"])
 
     def test_captcha_risk_stops_collection(self):
         browser = self._make_browser(risk="captcha")

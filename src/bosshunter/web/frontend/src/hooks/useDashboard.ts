@@ -55,7 +55,10 @@ interface TopCompany {
 
 export interface WorkbenchTask {
   id: string
-  mode: 'full' | 'collect' | 'rescore' | 'greet' | 'monitor' | 'deliver'
+  // `full` is kept here only so a task created by an older backend can still
+  // be rendered while it finishes.  The dashboard no longer exposes that
+  // legacy entry point; new automatic runs always use `auto_full`.
+  mode: 'full' | 'auto_full' | 'collect' | 'rescore' | 'greet' | 'monitor' | 'deliver'
   label: string
   status: string
   logs: string[]
@@ -68,6 +71,7 @@ export interface WorkbenchTask {
   confirmation?: {
     waiting_confirmation: boolean
     confirmation_complete: boolean
+    eligible_job_ids: string[]
     confirmed_job_ids: string[]
   }
 }
@@ -214,7 +218,7 @@ export function useDashboard(scope: DashboardDataScope = 'all') {
     }
   }, [scope])
 
-  const startTask = async (mode: 'full' | 'collect' | 'rescore' | 'greet' | 'monitor' | 'deliver', options?: Record<string, unknown>) => {
+  const startTask = async (mode: 'auto_full' | 'collect' | 'rescore' | 'greet' | 'monitor' | 'deliver', options?: Record<string, unknown>) => {
     const res = await fetch('/api/workbench/task', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

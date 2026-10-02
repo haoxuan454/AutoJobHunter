@@ -16,6 +16,7 @@ from bosshunter.browser import (
     type_text,
     wait_for_load,
 )
+from bosshunter.browser.platform_targets import filter_platform_targets, target_id, target_url
 from .base import DeliveryContext, DeliveryResult, dry_run_result
 from .browser_helpers import inspect_page, parse_result
 
@@ -62,18 +63,242 @@ def _entry_state(target_id: str) -> dict[str, Any]:
       const visible = el => {
         const r = el.getBoundingClientRect(), s = getComputedStyle(el);
         return !!(r.width && r.height && s.display !== 'none' && s.visibility !== 'hidden' &&
-          s.pointerEvents !== 'none');
+          s.pointerEvents !== 'none' && !el.disabled && !el.getAttribute('aria-disabled'));
       };
-      const items = [...document.querySelectorAll('button.summary-planes__prechat,.job-detail-summary__prechat')]
-        .filter(visible);
-      const item = items.find(el => (el.innerText || el.textContent || '').trim());
-      const text = item ? (item.innerText || item.textContent || '').replace(/\s+/g, '') : '';
-      const mode = /\u5148\u804a\u804a|\u7acb\u5373\u6c9f\u901a/.test(text) ? 'first_contact' :
-        (/\u7ee7\u7eed\u6c9f\u901a/.test(text) ? 'existing_conversation' : 'unknown');
-      return JSON.stringify({success:true, mode, text, selector:item ?
-        (item.matches('button.summary-planes__prechat') ? 'button.summary-planes__prechat' : '.job-detail-summary__prechat') : null});
+      const normalize = value => String(value || '').replace(/\s+/g, '');
+      const textOf = el => normalize(el.innerText || el.textContent);
+      const isShortActionText = text => text && text.length <= 40;
+      const modeOf = text => /\u5148\u804a\u804a|\u7acb\u5373\u6c9f\u901a/.test(text) ? 'first_contact' :
+        (/\u7ee7\u7eed\u6c9f\u901a/.test(text) ? 'existing_conversation' :
+          (/\u7acb\u5373\u6295\u9012|\u7533\u8bf7\u804c\u4f4d|\u9a6c\u4e0a\u6295\u9012/.test(text) ? 'application_required' : 'unknown'));
+      // Zhilian renders the recruiter action asynchronously and has used
+      // several wrappers across builds. Keep the known selectors first, then
+      // inspect only short, visible interactive/action nodes so page-wide text
+      // cannot be mistaken for a chat entry.
+      const knownSelectors = [
+        'button.summary-planes__prechat',
+        '.job-detail-summary__prechat',
+        '[class*="prechat"]',
+        '[data-testid*="chat"]',
+        '[data-test*="chat"]',
+      ];
+      const known = knownSelectors.flatMap(selector => [...document.querySelectorAll(selector)])
+        .filter(visible).filter(el => isShortActionText(textOf(el)));
+      const interactive = [...document.querySelectorAll('button,a,[role="button"],input[type="button"],input[type="submit"]')]
+        .filter(visible).filter(el => isShortActionText(textOf(el)));
+      const actionNodes = [...known, ...interactive];
+      const item = actionNodes.find(el => modeOf(textOf(el)) !== 'unknown');
+      const text = item ? textOf(item) : '';
+      const mode = modeOf(text);
+      const knownSelector = item && knownSelectors.find(selector => item.matches(selector));
+      return JSON.stringify({success:true, mode, text, action_text:text, selector:item ?
+        (knownSelector || ('text:' + mode)) : null});
     })()
     """, timeout=10))
+
+
+def _wait_for_entry_state(target_id: str, timeout: float = 6.0) -> dict[str, Any]:
+    """Wait for Zhilian's asynchronously rendered recruiter action."""
+    deadline = time.time() + timeout
+    state: dict[str, Any] = {}
+    while time.time() < deadline:
+        state = _entry_state(target_id)
+        if state.get("mode") in {"first_contact", "existing_conversation", "application_required"}:
+            return state
+        time.sleep(0.35)
+    return state
+
+
+def _zhilian_entry_selectors(entry_state: dict[str, Any]) -> list[str]:
+    """Return a strict selector cascade for the detected entry mode."""
+    mode = str(entry_state.get("mode") or "")
+    selectors: list[str] = []
+    detected = str(entry_state.get("selector") or "")
+    if detected:
+        selectors.append(detected)
+    selectors.extend([
+        "button.summary-planes__prechat",
+        ".job-detail-summary__prechat",
+        '[class*="prechat"]',
+        '[data-testid*="chat"]',
+        '[data-test*="chat"]',
+    ])
+    if mode in {"first_contact", "existing_conversation"}:
+        selectors.append(f"text:{mode}")
+    return list(dict.fromkeys(selectors))
+
+
+_ZHILIAN_APPLICATION_LABELS = ("立即投递", "申请职位", "马上投递", "继续职位")
+
+
+def _zhilian_resume_selection_state(target_id: str) -> dict[str, Any]:
+    """Inspect the visible resume-selection dialog opened by job delivery.
+
+    On the current Zhilian job-detail page, clicking ``立即投递`` does not
+    immediately show the platform greeting confirmation.  It first opens a
+    resume picker.  The picker has a stable, exact action label (``投递简历``)
+    but is also rendered from a hidden template, so visibility must be checked
+    against the actual dialog geometry before it is considered actionable.
+    """
+    return parse_result(evaluate(target_id, r"""
+    (() => {
+      const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
+      const visible = el => {
+        if (!el) return false;
+        for (let node = el; node && node !== document; node = node.parentElement) {
+          const rect = node.getBoundingClientRect();
+          const style = getComputedStyle(node);
+          if (!rect.width || !rect.height || style.display === 'none' ||
+              style.visibility === 'hidden' || style.opacity === '0' ||
+              style.pointerEvents === 'none' || node.hidden ||
+              node.getAttribute('aria-hidden') === 'true') return false;
+        }
+        return true;
+      };
+      const dialogs = [...document.querySelectorAll(
+        '.a-dialog,[role="dialog"],dialog'
+      )].filter(visible);
+      const dialog = dialogs.find(el =>
+        normalize(el.innerText || el.textContent).includes('请选择要投递的简历')
+      );
+      if (!dialog) return JSON.stringify({success:true, visible:false});
+      const action = [...dialog.querySelectorAll(
+        'a,button,[role="button"],input[type="button"],input[type="submit"]'
+      )].find(el => visible(el) && normalize(el.innerText || el.textContent || el.value) === '投递简历');
+      if (!action) return JSON.stringify({success:true, visible:true, action_missing:true});
+      const rect = action.getBoundingClientRect();
+      return JSON.stringify({success:true, visible:true, action_missing:false,
+        text:normalize(action.innerText || action.textContent || action.value),
+        x:rect.left + rect.width / 2, y:rect.top + rect.height / 2,
+        selector:'.a-attachment-select__action-btn__delivery'});
+    })()
+    """, timeout=10))
+
+
+def _click_zhilian_resume_delivery(target_id: str) -> dict[str, Any]:
+    """Confirm the selected resume through a real mouse event.
+
+    This is deliberately limited to the exact visible resume-picker action;
+    it must not fall back to page-wide fuzzy text clicking.
+    """
+    state = _zhilian_resume_selection_state(target_id)
+    if not state.get("visible"):
+        return {"success": False, "error": "resume_selection_not_visible"}
+    if state.get("action_missing"):
+        return {"success": False, "error": "resume_delivery_action_missing"}
+    x = state.get("x")
+    y = state.get("y")
+    if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+        return {"success": False, "error": "resume_delivery_coordinates_missing"}
+    if not click_at(target_id, f"{x},{y}"):
+        return {"success": False, "error": "resume_delivery_click_failed"}
+    def picker_is_gone() -> bool:
+        return not _zhilian_resume_selection_state(target_id).get("visible")
+
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        if picker_is_gone():
+            return {"success": True, "action": "resume_delivery_clicked", "text": state.get("text")}
+        time.sleep(0.25)
+
+    # A coordinate event can be delivered to a stale overlay in some builds.
+    # Retry only the exact allowlisted action once; never use page-wide fuzzy
+    # text matching or a second arbitrary coordinate click.
+    retry = _click_zhilian_selector(target_id, [".a-attachment-select__action-btn__delivery"])
+    if not retry.get("success"):
+        return {
+            "success": False,
+            "error": "resume_delivery_not_confirmed",
+            "reason": retry.get("error", "resume_delivery_selector_retry_failed"),
+        }
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        if picker_is_gone():
+            return {
+                "success": True,
+                "action": "resume_delivery_selector_retry_confirmed",
+                "text": state.get("text"),
+            }
+        time.sleep(0.25)
+    return {
+        "success": False,
+        "error": "resume_delivery_not_confirmed",
+        "reason": "resume_picker_remained_visible_after_coordinate_and_selector_click",
+    }
+
+
+def _click_zhilian_application_entry(target_id: str, entry_state: dict[str, Any]) -> dict[str, Any]:
+    """Click only a known Zhilian application entry.
+
+    Zhilian sometimes exposes an application button before it exposes the
+    recruiter conversation entry.  This is intentionally separate from the
+    generic conversation clicker: a page-wide fuzzy click here could submit a
+    resume, accept an unknown dialog, or trigger a risk-control action.
+    """
+    action_text = "".join(str(entry_state.get("action_text") or "").split())
+    if action_text not in _ZHILIAN_APPLICATION_LABELS:
+        return {
+            "success": False,
+            "error": "application_button_not_safe",
+            "reason": "application_action_text_not_allowlisted",
+            "action_text": action_text,
+        }
+    return parse_result(evaluate(target_id, f"""
+    (() => {{
+      const visible = el => {{
+        const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+        return !!(r.width && r.height && s.display !== 'none' &&
+          s.visibility !== 'hidden' && s.opacity !== '0' &&
+          s.pointerEvents !== 'none' && !el.disabled &&
+          el.getAttribute('aria-disabled') !== 'true');
+      }};
+      const expected = {json.dumps(action_text, ensure_ascii=False)};
+      const allowed = {json.dumps(list(_ZHILIAN_APPLICATION_LABELS), ensure_ascii=False)};
+      const nodes = [...document.querySelectorAll(
+        'button,a,[role="button"],input[type="button"],input[type="submit"]'
+      )].filter(visible);
+      const item = nodes.find(el => {{
+        const text = String(el.innerText || el.textContent || el.value || '')
+          .replace(/\\s+/g, '').trim();
+        return allowed.includes(text) && text === expected;
+      }});
+      if (!item) return JSON.stringify({{success:false,error:'application_button_missing'}});
+      const clickable = item.closest('button,a,[role="button"]') || item;
+      if (!visible(clickable) || typeof clickable.click !== 'function')
+        return JSON.stringify({{success:false,error:'application_button_not_clickable'}});
+      clickable.scrollIntoView({{block:'center'}});
+      clickable.click();
+      return JSON.stringify({{success:true, text:expected, action:'application_entry_clicked'}});
+    }})()
+    """, timeout=10))
+
+
+def _application_transition_state(target_id: str, timeout: float = 10.0) -> dict[str, Any]:
+    """Wait for a safe post-application conversation/default-greeting state."""
+    deadline = time.time() + timeout
+    last: dict[str, Any] = {"status": "application_transition_pending"}
+    while time.time() < deadline:
+        resume = _zhilian_resume_selection_state(target_id)
+        if resume.get("visible"):
+            return {"status": "resume_selection", "resume": resume}
+        modal = _modal_state(target_id)
+        if modal.get("visible") and modal.get("confirmation"):
+            return {"status": "default_greeting_modal", "modal": modal}
+        entry = _entry_state(target_id)
+        if entry.get("mode") in {"first_contact", "existing_conversation"}:
+            return {
+                "status": "conversation_entry",
+                "mode": entry.get("mode"),
+                "entry_state": entry,
+            }
+        page = inspect_page(target_id, "zhilian")
+        text = "".join(str(page.get("text") or "").split())
+        if any(token in text for token in ("验证码", "短信验证", "风险提示", "操作频繁", "安全验证")):
+            return {"status": "risk_control", "page": page}
+        if any(token in text for token in ("申请成功", "投递成功", "职位申请成功", "已申请", "已投递")):
+            last = {"status": "application_confirmed", "page": page}
+        time.sleep(0.4)
+    return last
 
 
 def _post_start_state(target_id: str) -> dict[str, Any]:
@@ -157,13 +382,13 @@ def _zhilian_im_targets() -> list[dict[str, Any]]:
         raw_targets = get_page_targets()
     except Exception:
         raw_targets = []
-    for target in raw_targets or []:
-        url = str(target.get("url") or "")
-        if "i.zhaopin.com" not in url or "/im" not in url:
+    for target in filter_platform_targets(raw_targets, "zhilian"):
+        url = target_url(target)
+        if "i.zhaopin.com" not in url.lower() or "/im" not in url.lower():
             continue
-        target_id = str(target.get("targetId") or target.get("id") or "").strip()
-        if target_id:
-            targets.append({"target_id": target_id, "url": url})
+        current_target_id = target_id(target)
+        if current_target_id:
+            targets.append({"target_id": current_target_id, "url": url})
     return targets
 
 
@@ -397,20 +622,33 @@ def _zhilian_text_equal(left: str, right: str) -> bool:
 
 
 def _zhilian_company_equal(left: str, right: str) -> bool:
-    suffixes = ("有限公司", "有限责任公司", "股份有限公司", "集团有限公司")
-    suffixes = ("\u6709\u9650\u516c\u53f8", "\u6709\u9650\u8d23\u4efb\u516c\u53f8", "\u80a1\u4efd\u6709\u9650\u516c\u53f8", "\u96c6\u56e2\u6709\u9650\u516c\u53f8")
+    suffixes = ("有限责任公司", "股份有限公司", "集团有限公司", "有限公司")
     normalize = lambda value: "".join(str(value or "").split()).casefold()
+
+    def base(value: str) -> str:
+        normalized = normalize(value)
+        for suffix in suffixes:
+            compact_suffix = normalize(suffix)
+            if normalized.endswith(compact_suffix):
+                return normalized[: -len(compact_suffix)]
+        return normalized
+
     left_value = normalize(left)
     right_value = normalize(right)
+    if not left_value or not right_value:
+        return False
     if left_value == right_value:
         return True
-    for suffix in suffixes:
-        compact_suffix = normalize(suffix)
-        left_base = left_value.removesuffix(compact_suffix)
-        right_base = right_value.removesuffix(compact_suffix)
-        if left_base and left_base == right_base:
-            return True
-    return False
+    left_base = base(left_value)
+    right_base = base(right_value)
+    if left_base and left_base == right_base:
+        return True
+    # Zhilian often renders a legal company name as a short display name,
+    # e.g. "external short name" vs "external short name technology ltd". Allow only a
+    # meaningful prefix/containment (four compact characters minimum); the
+    # caller still requires the same job title and recruiter name.
+    shorter, longer = sorted((left_base, right_base), key=len)
+    return len(shorter) >= 4 and shorter in longer
 
 
 def _match_zhilian_conversation_row(row: dict[str, Any], job: dict[str, Any]) -> tuple[bool, str]:
@@ -916,7 +1154,12 @@ def _open_zhilian_job(job: dict[str, Any]) -> tuple[str | None, dict[str, Any] |
         if not url or not navigate(target_id, url):
             close_tab(target_id)
             return None, {"success": False, "error": "open_page_failed", "history_detail": "智联岗位新标签未完成导航"}
-    if not wait_for_load(target_id, timeout=15):
+    if not wait_for_load(
+        target_id,
+        timeout=15,
+        expected_url=url,
+        expected_host="www.zhaopin.com",
+    ):
         close_tab(target_id)
         return None, {"success": False, "error": "page_load_timeout", "history_detail": "智联岗位页面加载超时"}
     return target_id, None
@@ -924,12 +1167,48 @@ def _open_zhilian_job(job: dict[str, Any]) -> tuple[str | None, dict[str, Any] |
 
 def _click_zhilian_selector(target_id: str, selectors: list[str]) -> dict[str, Any]:
     for selector in selectors:
+        if selector.startswith("text:"):
+            mode = selector[5:]
+            accepted = {
+                "first_contact": ["先聊聊", "立即沟通"],
+                "existing_conversation": ["继续沟通"],
+            }.get(mode, [])
+            result = parse_result(evaluate(target_id, f"""
+            (() => {{
+              const visible = el => {{
+                const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+                return !!(r.width && r.height && s.display !== 'none' && s.visibility !== 'hidden' &&
+                  s.pointerEvents !== 'none' && !el.disabled && !el.getAttribute('aria-disabled'));
+              }};
+              const accepted = {json.dumps(accepted, ensure_ascii=False)};
+              const nodes = [...document.querySelectorAll(
+                'button,a,[role="button"],input[type="button"],input[type="submit"],[class*="prechat"],[data-testid*="chat"],[data-test*="chat"]'
+              )].filter(visible);
+              const item = nodes.find(el => {{
+                const text = String(el.innerText || el.textContent || '').replace(/\\s+/g, '');
+                return text.length <= 40 && accepted.some(label => text.includes(label));
+              }});
+              if (!item) return JSON.stringify({{success:false,error:'action_button_missing'}});
+              const clickable = item.closest('button,a,[role="button"]') || item;
+              if (!visible(clickable) || typeof clickable.click !== 'function')
+                return JSON.stringify({{success:false,error:'action_button_not_clickable'}});
+              clickable.click();
+              return JSON.stringify({{success:true,selector:'text:' + {json.dumps(mode)}}});
+            }})()
+            """, timeout=10))
+            if result.get("success"):
+                return result
+            continue
         if click_at(target_id, selector):
             return {"success": True, "selector": selector}
         fallback = parse_result(evaluate(target_id, f"""
         (() => {{
           const el = document.querySelector({json.dumps(selector)});
           if (!el) return JSON.stringify({{success:false,error:'action_button_missing'}});
+          const rect = el.getBoundingClientRect(), style = getComputedStyle(el);
+          if (!rect.width || !rect.height || style.display === 'none' || style.visibility === 'hidden' ||
+              style.pointerEvents === 'none' || el.disabled || el.getAttribute('aria-disabled') === 'true')
+            return JSON.stringify({{success:false,error:'action_button_not_visible'}});
           el.click();
           return JSON.stringify({{success:true,selector:{json.dumps(selector)}}});
         }})()
@@ -948,6 +1227,157 @@ def _wait_for_conversation(target_id: str, timeout: float = 8.0) -> dict[str, An
             return state
         time.sleep(0.4)
     return state
+
+
+def _zhilian_conversation_state_is_verified(state: dict[str, Any]) -> bool:
+    """Return whether a target visibly contains a usable IM composer."""
+    return bool(
+        state.get("imRoute")
+        and state.get("hasChatInput")
+        and not state.get("modalVisible")
+    )
+
+
+def _select_zhilian_conversation_target(
+    job: dict[str, Any],
+    preferred_target_id: str,
+    initial_state: dict[str, Any],
+    stable_state: dict[str, Any],
+    *,
+    timeout: float = 8.0,
+) -> dict[str, Any] | None:
+    """Select exactly one IM target whose rendered identity matches this job.
+
+    Clicking a Zhilian job-page entry can leave the job tab in place while the
+    actual IM conversation appears in another existing or newly-created tab.
+    Every candidate is therefore checked against company + title and, when the
+    local job has it, recruiter name.  Multiple exact candidates are treated as
+    ambiguous so a message can never be sent to a merely similar conversation.
+    """
+    expected = {
+        "company": str(job.get("company") or "").strip(),
+        "title": str(job.get("title") or "").strip(),
+        "hr_name": str(job.get("hr_name") or "").strip(),
+    }
+    if not expected["company"] or not expected["title"]:
+        return None
+
+    preferred_target_id = str(preferred_target_id or "").strip()
+    deadline = time.time() + max(0.5, float(timeout))
+    while time.time() < deadline:
+        candidate_ids: list[str] = [preferred_target_id]
+        candidate_ids.extend(
+            str(item.get("target_id") or "").strip()
+            for item in _zhilian_im_targets()
+        )
+        seen: set[str] = set()
+        matches: list[dict[str, Any]] = []
+        sidebar_matches: list[dict[str, Any]] = []
+        for target_id in candidate_ids:
+            if not target_id or target_id in seen:
+                continue
+            seen.add(target_id)
+            try:
+                state = (
+                    stable_state or initial_state
+                    if target_id == preferred_target_id
+                    else _post_start_state(target_id)
+                )
+                if not _zhilian_conversation_state_is_verified(state):
+                    continue
+                active = _active_zhilian_conversation_snapshot(target_id)
+            except Exception:
+                continue
+            if active.get("success"):
+                actual = {
+                    "company": active.get("company") or "",
+                    "title": active.get("title") or "",
+                    "hr_name": active.get("hr_name") or "",
+                }
+                matched, quality = _match_zhilian_sync_identity(actual, expected)
+                if matched:
+                    matches.append({
+                        "target_id": target_id,
+                        "state": state,
+                        "active": active,
+                        "match_quality": quality,
+                    })
+                    continue
+
+            # The job-page action can open an IM tab while leaving another
+            # recruiter active. Search existing sidebar rows, then delegate
+            # the actual click and post-click verification to the fail-closed
+            # row opener.
+            try:
+                sidebar = _scan_zhilian_conversation_list(
+                    target_id, max_scrolls=8, settle_seconds=0.2
+                )
+            except Exception:
+                continue
+            exact_rows: list[tuple[dict[str, Any], str]] = []
+            for row in sidebar.get("rows") or []:
+                if not isinstance(row, dict):
+                    continue
+                matched, quality = _match_zhilian_sync_identity(row, expected)
+                if matched:
+                    exact_rows.append((row, quality))
+            if len(exact_rows) == 1:
+                row, quality = exact_rows[0]
+                sidebar_matches.append({
+                    "target_id": target_id,
+                    "state": state,
+                    "row": {
+                        **row,
+                        "expected_hr_name": expected["hr_name"],
+                        "expected_company": expected["company"],
+                        "expected_title": expected["title"],
+                    },
+                    "match_quality": quality,
+                })
+
+        all_matches = [*matches, *sidebar_matches]
+        preferred_matches = [
+            item for item in all_matches
+            if item.get("target_id") == preferred_target_id
+        ]
+        if len(preferred_matches) == 1:
+            selected = preferred_matches[0]
+            if selected in sidebar_matches:
+                opened = _open_zhilian_conversation_row(
+                    preferred_target_id,
+                    selected["row"],
+                    timeout=min(8.0, max(0.5, deadline - time.time())),
+                )
+                if opened.get("status") == "matched_chat_loaded":
+                    return {
+                        "target_id": preferred_target_id,
+                        "state": selected["state"],
+                        "active": opened,
+                        "match_quality": opened.get("match_quality") or selected["match_quality"],
+                    }
+            else:
+                return selected
+        if len(all_matches) == 1:
+            selected = all_matches[0]
+            if selected in sidebar_matches:
+                opened = _open_zhilian_conversation_row(
+                    selected["target_id"],
+                    selected["row"],
+                    timeout=min(8.0, max(0.5, deadline - time.time())),
+                )
+                if opened.get("status") == "matched_chat_loaded":
+                    return {
+                        "target_id": selected["target_id"],
+                        "state": selected["state"],
+                        "active": opened,
+                        "match_quality": opened.get("match_quality") or selected["match_quality"],
+                    }
+            else:
+                return selected
+        if len(all_matches) > 1:
+            return None
+        time.sleep(0.35)
+    return None
 
 
 def _fill_and_send_zhilian_message(target_id: str, message: str) -> dict[str, Any]:
@@ -1020,17 +1450,18 @@ class ZhilianDeliveryAdapter:
         existing = _find_existing_zhilian_conversation(job)
         if existing.get("matched"):
             row = existing.get("row") or {}
-            detail = "智联已有 HR 会话，已复用现有会话；本次未重复发送平台招呼语。"
+            detail = "Existing Zhilian HR conversation found; this run sent nothing."
             return DeliveryResult(
-                True,
-                True,
+                False,
+                False,
                 self.platform,
-                None,
+                "existing_conversation_reused",
                 detail,
                 delivery_kind="existing_conversation_reused",
                 metadata={
                     "platform_confirmed": False,
                     "conversation_reconciled": True,
+                    "message_sent": False,
                     "existing_conversation": True,
                     "conversation_url": existing.get("conversation_url"),
                     "match_quality": existing.get("match_quality"),
@@ -1057,30 +1488,94 @@ class ZhilianDeliveryAdapter:
                 close_tab(target_id)
                 return DeliveryResult(False, platform=self.platform, error="login_required", history_detail="智联招聘当前页面未确认登录")
 
-            entry_state = _entry_state(target_id)
+            entry_state = _wait_for_entry_state(target_id)
             mode = entry_state.get("mode")
+            application_modal_ready = False
+            if mode == "application_required":
+                application = _click_zhilian_application_entry(target_id, entry_state)
+                if not application.get("success"):
+                    close_tab(target_id)
+                    return DeliveryResult(
+                        False,
+                        platform=self.platform,
+                        error=application.get("error", "application_button_not_safe"),
+                        history_detail="智联岗位页需要申请职位，但当前按钮文本或 DOM 未通过严格白名单校验；未自动点击未知按钮。",
+                        target_id=target_id,
+                    )
+                transition = _application_transition_state(target_id)
+                transition_status = str(transition.get("status") or "")
+                if transition_status == "resume_selection":
+                    resume = _click_zhilian_resume_delivery(target_id)
+                    if not resume.get("success"):
+                        close_tab(target_id)
+                        return DeliveryResult(
+                            False,
+                            platform=self.platform,
+                            error=resume.get("error", "resume_delivery_not_verified"),
+                            history_detail="智联已打开简历选择弹框，但未能安全确认“投递简历”；未继续操作。",
+                            target_id=target_id,
+                        )
+                    # The platform may render the default-greeting modal only
+                    # after the resume-confirm action. Re-enter the same
+                    # bounded state machine instead of treating the picker as
+                    # a successful delivery.
+                    transition = _application_transition_state(target_id)
+                    transition_status = str(transition.get("status") or "")
+                if transition_status == "risk_control":
+                    close_tab(target_id)
+                    return DeliveryResult(
+                        False,
+                        platform=self.platform,
+                        error="platform_risk_control",
+                        history_detail="智联申请职位后出现验证码、短信验证或风控提示，已停止自动操作。",
+                        target_id=target_id,
+                    )
+                if transition_status == "default_greeting_modal":
+                    application_modal_ready = True
+                    mode = "first_contact"
+                elif transition_status == "conversation_entry":
+                    entry_state = transition.get("entry_state") or entry_state
+                    mode = entry_state.get("mode")
+                else:
+                    close_tab(target_id)
+                    return DeliveryResult(
+                        False,
+                        platform=self.platform,
+                        error="application_contact_not_ready",
+                        history_detail="智联申请职位已触发，但未出现可验证的默认招呼确认弹窗或 HR 会话入口；未继续猜测操作。",
+                        target_id=target_id,
+                    )
             if mode == "unknown":
                 close_tab(target_id)
                 return DeliveryResult(False, platform=self.platform, error="conversation_entry_missing", history_detail="智联岗位页未找到可见的先聊聊或继续沟通入口", target_id=target_id)
-            entry = _click_zhilian_selector(target_id, [
-                "button.summary-planes__prechat",
-                ".job-detail-summary__prechat",
-            ])
-            if not entry.get("success"):
-                close_tab(target_id)
-                return DeliveryResult(False, platform=self.platform, error="conversation_entry_missing", history_detail="智联岗位页入口不可点击", target_id=target_id)
+            entry = {"success": True, "selector": "application_default_greeting_modal"}
+            if not application_modal_ready:
+                entry = _click_zhilian_selector(target_id, _zhilian_entry_selectors(entry_state))
+                if not entry.get("success"):
+                    close_tab(target_id)
+                    return DeliveryResult(False, platform=self.platform, error="conversation_entry_missing", history_detail="智联岗位页入口不可点击", target_id=target_id)
 
             time.sleep(0.5)
             if mode == "existing_conversation":
                 verification = _wait_for_conversation(target_id)
                 time.sleep(0.8)
                 stable_verification = _post_start_state(target_id)
-                if verification.get("modalVisible") or not (
-                    (verification.get("imRoute") and stable_verification.get("imRoute")) and
-                    (verification.get("hasChatInput") and stable_verification.get("hasChatInput"))
-                ):
+                selected = _select_zhilian_conversation_target(
+                    job,
+                    target_id,
+                    verification,
+                    stable_verification,
+                )
+                if selected is None:
                     close_tab(target_id)
                     return DeliveryResult(False, platform=self.platform, error="existing_conversation_not_verified", history_detail="智联继续沟通入口已点击，但未确认进入对应 HR 会话", target_id=target_id)
+                selected_target_id = str(selected.get("target_id") or "").strip()
+                if not selected_target_id:
+                    close_tab(target_id)
+                    return DeliveryResult(False, platform=self.platform, error="existing_conversation_not_verified", history_detail="智联继续沟通入口已点击，但未确认进入对应 HR 会话", target_id=target_id)
+                if selected_target_id != target_id:
+                    close_tab(target_id)
+                    target_id = selected_target_id
                 greeting = str(context.metadata.get("greeting") or "").strip()
                 if not greeting:
                     close_tab(target_id)
@@ -1146,17 +1641,41 @@ class ZhilianDeliveryAdapter:
             if inspect_page(target_id, self.platform).get("login_required"):
                 close_tab(target_id)
                 return DeliveryResult(False, platform=self.platform, error="login_required", history_detail="智联招聘当前页面未确认登录")
-            state = _entry_state(target_id)
+            state = _wait_for_entry_state(target_id)
+            if state.get("mode") == "application_required":
+                close_tab(target_id)
+                return DeliveryResult(
+                    False,
+                    platform=self.platform,
+                    error="application_required",
+                    history_detail="智联岗位页当前只有“立即投递/申请职位”入口，尚未出现可安全确认的 HR 会话入口；未自动点击未知投递按钮。",
+                    target_id=target_id,
+                )
             if state.get("mode") != "existing_conversation":
                 close_tab(target_id)
                 return DeliveryResult(False, platform=self.platform, error="first_contact_required", history_detail="该智联岗位尚未确认已有会话，发送消息前必须先走平台默认招呼流程", target_id=target_id)
-            if not _click_zhilian_selector(target_id, ["button.summary-planes__prechat", ".job-detail-summary__prechat"]).get("success"):
+            if not _click_zhilian_selector(target_id, _zhilian_entry_selectors(state)).get("success"):
                 close_tab(target_id)
                 return DeliveryResult(False, platform=self.platform, error="conversation_entry_missing", history_detail="智联岗位页未找到继续沟通入口", target_id=target_id)
-            state = _wait_for_conversation(target_id)
-            if not state.get("imRoute") or not state.get("hasChatInput"):
+            initial_state = _wait_for_conversation(target_id)
+            time.sleep(0.8)
+            stable_state = _post_start_state(target_id)
+            selected = _select_zhilian_conversation_target(
+                job,
+                target_id,
+                initial_state,
+                stable_state,
+            )
+            if selected is None:
                 close_tab(target_id)
                 return DeliveryResult(False, platform=self.platform, error="existing_conversation_not_verified", history_detail="未确认进入智联 HR 会话输入框，未发送消息", target_id=target_id)
+            selected_target_id = str(selected.get("target_id") or "").strip()
+            if not selected_target_id:
+                close_tab(target_id)
+                return DeliveryResult(False, platform=self.platform, error="existing_conversation_not_verified", history_detail="未确认进入智联 HR 会话输入框，未发送消息", target_id=target_id)
+            if selected_target_id != target_id:
+                close_tab(target_id)
+                target_id = selected_target_id
             sent = _fill_and_send_zhilian_message(target_id, message)
             if not sent.get("success"):
                 close_tab(target_id)

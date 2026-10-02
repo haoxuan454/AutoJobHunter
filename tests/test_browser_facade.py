@@ -13,6 +13,19 @@ class BrowserFacadeTests(unittest.TestCase):
         self.assertEqual(RuntimeClient({}).new_tab("https://example.com"), "target-1")
         self.assertEqual(get.call_args.kwargs["timeout"], 30)
 
+    @patch("bosshunter.browser.client.httpx.post")
+    def test_runtime_client_type_text_preserves_utf8_bytes(self, post):
+        from bosshunter.browser.client import RuntimeClient
+
+        post.return_value.status_code = 200
+
+        self.assertTrue(RuntimeClient({}).type_text("target-1", "??", human=True))
+
+        request = post.call_args
+        self.assertEqual(request.kwargs["content"], "??".encode("utf-8"))
+        self.assertEqual(request.kwargs["headers"], {"Content-Type": "text/plain; charset=utf-8"})
+        self.assertEqual(request.kwargs["params"], {"target": "target-1", "human": "1"})
+
     @patch("bosshunter.browser.RuntimeClient")
     @patch("bosshunter.browser.ensure_runtime")
     def test_new_tab_returns_target_id_from_runtime_client(self, ensure_runtime, client_cls):
@@ -116,12 +129,45 @@ class BrowserFacadeTests(unittest.TestCase):
 
         ensure_runtime.return_value = True
         client_cls.return_value.info.side_effect = [
-            {"ready": "loading"},
-            {"ready": "complete"},
+            {"ready": "complete", "url": "about:blank"},
+            {"ready": "loading", "url": "https://www.zhaopin.com/jobs/1"},
+            {"ready": "complete", "url": "https://www.zhaopin.com/jobs/1"},
         ]
 
         with patch("bosshunter.browser.time.sleep"):
-            self.assertTrue(browser.wait_for_load("target-1", timeout=2))
+            self.assertTrue(browser.wait_for_load(
+                "target-1", timeout=2, expected_host="www.zhaopin.com"
+            ))
+
+    @patch("bosshunter.browser.RuntimeClient")
+    @patch("bosshunter.browser.ensure_runtime")
+    def test_wait_for_load_rejects_wrong_host(self, ensure_runtime, client_cls):
+        import bosshunter.browser as browser
+
+        ensure_runtime.return_value = True
+        client_cls.return_value.info.return_value = {
+            "ready": "complete",
+            "url": "https://www.zhipin.com/web/geek/job/1",
+        }
+
+        with patch("bosshunter.browser.time.sleep"):
+            self.assertFalse(browser.wait_for_load(
+                "target-1", timeout=0.01, expected_host="www.zhaopin.com"
+            ))
+
+    def test_page_url_matches_requires_http_page_and_expected_path(self):
+        import bosshunter.browser as browser
+
+        self.assertFalse(browser._page_url_matches("about:blank"))
+        self.assertTrue(browser._page_url_matches(
+            "https://www.zhaopin.com/jobs/abc?x=1",
+            expected_url="https://www.zhaopin.com/jobs/abc",
+            expected_host="www.zhaopin.com",
+        ))
+        self.assertFalse(browser._page_url_matches(
+            "https://www.zhaopin.com/jobs/other",
+            expected_url="https://www.zhaopin.com/jobs/abc",
+        ))
 
     @patch("bosshunter.browser.RuntimeClient")
     @patch("bosshunter.browser.ensure_runtime")
@@ -149,6 +195,95 @@ class BrowserFacadeTests(unittest.TestCase):
         result = browser.find_boss_tab()
 
         self.assertEqual(result["targetId"], "2")
+
+    @patch("bosshunter.browser.RuntimeClient")
+    @patch("bosshunter.browser.ensure_runtime")
+    def test_find_boss_tab_prefers_search_page_over_chat_page(self, ensure_runtime, client_cls):
+        import bosshunter.browser as browser
+
+        ensure_runtime.return_value = True
+        client_cls.return_value.targets.return_value = [
+            {"targetId": "chat", "url": "https://www.zhipin.com/web/geek/chat"},
+            {"targetId": "jobs", "url": "https://www.zhipin.com/web/geek/jobs?query=python&city=101281600"},
+        ]
+
+        result = browser.find_boss_tab()
+
+        self.assertEqual(result["targetId"], "jobs")
+
+    @patch("bosshunter.browser.RuntimeClient")
+    @patch("bosshunter.browser.ensure_runtime")
+    def test_find_zhilian_tab_skips_stale_target_and_selects_live_target(self, ensure_runtime, client_cls):
+        import bosshunter.browser as browser
+
+        ensure_runtime.return_value = True
+        client_cls.return_value.targets.return_value = [
+            {"targetId": "stale", "url": "https://www.zhaopin.com/jobs/?pageMode=search&jl=779"},
+            {"targetId": "live", "url": "https://www.zhaopin.com/jobs/?pageMode=search&jl=779"},
+        ]
+        client_cls.return_value.evaluate.side_effect = [
+            None,
+            '{"ok":true,"ready":"complete","url":"https://www.zhaopin.com/jobs/?pageMode=search&jl=779"}',
+        ]
+
+        result = browser.find_zhilian_tab()
+
+        self.assertEqual(result["targetId"], "live")
+        self.assertEqual(client_cls.return_value.evaluate.call_count, 2)
+
+    @patch("bosshunter.browser.RuntimeClient")
+    @patch("bosshunter.browser.ensure_runtime")
+    def test_find_zhilian_tab_returns_none_when_all_public_targets_are_stale(self, ensure_runtime, client_cls):
+        import bosshunter.browser as browser
+
+        ensure_runtime.return_value = True
+        client_cls.return_value.targets.return_value = [
+            {"targetId": "stale-a", "url": "https://www.zhaopin.com/jobs/?jl=779"},
+            {"targetId": "stale-b", "url": "https://www.zhaopin.com/jobs/?jl=779"},
+        ]
+        client_cls.return_value.evaluate.return_value = None
+
+        self.assertIsNone(browser.find_zhilian_tab())
+
+    @patch("bosshunter.browser.RuntimeClient")
+    @patch("bosshunter.browser.ensure_runtime")
+    def test_find_boss_tab_does_not_treat_chat_only_as_search_page(self, ensure_runtime, client_cls):
+        import bosshunter.browser as browser
+
+        ensure_runtime.return_value = True
+        client_cls.return_value.targets.return_value = [
+            {"targetId": "chat", "url": "https://www.zhipin.com/web/geek/chat"},
+        ]
+
+        self.assertIsNone(browser.find_boss_tab())
+
+    @patch("bosshunter.browser.RuntimeClient")
+    @patch("bosshunter.browser.ensure_runtime")
+    def test_find_zhilian_tab_prefers_public_job_page_over_im_page(self, ensure_runtime, client_cls):
+        import bosshunter.browser as browser
+
+        ensure_runtime.return_value = True
+        client_cls.return_value.targets.return_value = [
+            {"targetId": "im", "url": "https://i.zhaopin.com/im?sessionId=abc"},
+            {"targetId": "jobs", "url": "https://www.zhaopin.com/jobs/?pageMode=recommend"},
+        ]
+        client_cls.return_value.evaluate.return_value = '{"ok":true,"ready":"complete"}'
+
+        result = browser.find_zhilian_tab()
+
+        self.assertEqual(result["targetId"], "jobs")
+
+    @patch("bosshunter.browser.RuntimeClient")
+    @patch("bosshunter.browser.ensure_runtime")
+    def test_find_zhilian_tab_does_not_treat_im_only_as_search_page(self, ensure_runtime, client_cls):
+        import bosshunter.browser as browser
+
+        ensure_runtime.return_value = True
+        client_cls.return_value.targets.return_value = [
+            {"targetId": "im", "url": "https://i.zhaopin.com/im?sessionId=abc"},
+        ]
+
+        self.assertIsNone(browser.find_zhilian_tab())
 
     @patch("bosshunter.browser.RuntimeClient")
     @patch("bosshunter.browser.ensure_runtime")

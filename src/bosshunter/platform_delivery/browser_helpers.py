@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from bosshunter.browser import close_tab, evaluate, new_tab, press_key, type_text, wait_for_load
 
@@ -22,10 +23,17 @@ def parse_result(value: Any) -> dict[str, Any]:
 
 
 def open_job(job: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
-    target_id = new_tab(str(job.get("url") or ""), background=True)
+    job_url = str(job.get("url") or "").strip()
+    expected_host = urlsplit(job_url).hostname
+    target_id = new_tab(job_url, background=True)
     if not target_id:
         return None, {"success": False, "error": "open_page_failed", "history_detail": "无法打开岗位页面"}
-    if not wait_for_load(target_id, timeout=15):
+    if not wait_for_load(
+        target_id,
+        timeout=15,
+        expected_url=job_url,
+        expected_host=expected_host,
+    ):
         close_tab(target_id)
         return None, {"success": False, "error": "page_load_timeout", "history_detail": "岗位页面加载超时"}
     return target_id, None
@@ -36,10 +44,30 @@ def inspect_page(target_id: str, platform: str) -> dict[str, Any]:
     (() => {{
       const text = document.body ? (document.body.innerText || '') : '';
       const title = document.title || '';
+      const pageUrl = String(location.href || '');
+      const pagePath = String(location.pathname || '');
+      const visible = el => {{
+        const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+        return !!(r.width && r.height && s.display !== 'none' && s.visibility !== 'hidden' &&
+          s.opacity !== '0' && s.pointerEvents !== 'none');
+      }};
+      const actionText = Array.from(document.querySelectorAll(
+        'button,a,[role="button"],[class*="prechat"],[data-testid*="chat"],[data-test*="chat"]'
+      )).filter(visible).map(el => (el.innerText || el.textContent || '').replace(/\s+/g, '')).join(' ');
+      const hasConversationEntry = /\u5148\u804a\u804a|\u7acb\u5373\u6c9f\u901a|\u7ee7\u7eed\u6c9f\u901a/.test(actionText);
+      const loginRoute = /(^|\.)(passport|login)\./i.test(location.hostname) ||
+        /(^|\/)(login|passport|signin)(\/|$)/i.test(pagePath);
+      const loginText = /\u767b\u5f55\u5931\u6548|\u8bf7\u5148\u767b\u5f55|\u626b\u7801\u767b\u5f55|\u5bc6\u7801\u767b\u5f55|\u767b\u5f55\u540e\u7ee7\u7eed/.test(text);
+      const dialogText = Array.from(document.querySelectorAll('[role="dialog"],dialog,[class*="login"],[id*="login"]'))
+        .filter(visible).map(el => (el.innerText || el.textContent || '')).join(' ');
+      const loginDialog = /\u767b\u5f55\u5931\u6548|\u8bf7\u5148\u767b\u5f55|\u626b\u7801\u767b\u5f55|\u5bc6\u7801\u767b\u5f55|\u767b\u5f55\u540e\u7ee7\u7eed/.test(dialogText);
+      const strictLoginRequired = !hasConversationEntry && (loginRoute || loginText || loginDialog);
       const login = /登录|注册|扫码登录|登录失效|请先登录/.test(text);
       const platform = {json.dumps(platform, ensure_ascii=False)};
       return JSON.stringify({{success:true, platform, title, url:location.href,
         login_required: login && !/退出|我的简历|个人中心|消息/.test(text),
+        login_required: strictLoginRequired,
+        url: pageUrl,
         text: text.slice(0, 1600)}});
     }})()
     """, timeout=10))

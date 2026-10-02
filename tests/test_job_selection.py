@@ -71,6 +71,28 @@ class JobSelectionTests(unittest.TestCase):
         self.assertTrue(result["verified"])
         self.assertEqual(target_id, "zhilian-target")
 
+    def test_zhilian_existing_conversation_is_not_a_verified_send_even_if_adapter_claims_success(self):
+        job = _job("zhilian-existing")
+        job["source_platform"] = "zhilian"
+        adapter = unittest.mock.Mock()
+        adapter.start_conversation.return_value = DeliveryResult(
+            success=True,
+            verified=True,
+            platform="zhilian",
+            delivery_kind="existing_conversation_reused",
+            history_detail="Existing chat found; nothing sent",
+            metadata={"existing_conversation": True, "message_sent": False},
+            target_id="zhilian-existing-tab",
+        )
+        with patch("bosshunter.executor.sender.get_delivery_adapter", return_value=adapter):
+            result, target_id = _send_greeting_once(job, "hello", {})
+
+        self.assertFalse(result["success"])
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["error"], "existing_conversation_reused_without_send")
+        self.assertEqual(result["delivery_kind"], "existing_conversation_reused")
+        self.assertEqual(target_id, "zhilian-existing-tab")
+
     def test_chat_button_script_prefers_real_anchor_over_visible_wrapper(self):
         script = CHAT_BUTTON_SCRIPT_FOR_TESTS
 
@@ -88,11 +110,44 @@ class JobSelectionTests(unittest.TestCase):
             "bosshunter.executor.sender.evaluate",
             return_value='{"success": true, "action": "preset_confirmed"}',
         ) as evaluate_mock, patch("bosshunter.executor.sender.click_at") as click_at:
-            result = _confirm_preset_greeting("target-1")
+            result = _confirm_preset_greeting("target-1", "您好")
 
         self.assertEqual(result["action"], "preset_confirmed")
         self.assertIn("button.click()", evaluate_mock.call_args.args[1])
         click_at.assert_not_called()
+
+    def test_preset_confirmation_rejects_platform_default_greeting_mismatch(self):
+        with patch(
+            "bosshunter.executor.sender.evaluate",
+            return_value=(
+                '{"success": false, "error": "platform_default_greeting_mismatch", '
+                '"observed_greeting": "您好，欢迎了解这个岗位，方便沟通一下吗？", '
+                '"expected_greeting": "您好"}'
+            ),
+        ) as evaluate_mock, patch("bosshunter.executor.sender.click_at") as click_at:
+            result = _confirm_preset_greeting("target-1", "您好")
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "platform_default_greeting_mismatch")
+        self.assertIn("observed_greeting", result)
+        self.assertTrue(result["skip_backoff"])
+        self.assertIn("不一致", result["history_detail"])
+        self.assertIn("expected_greeting", evaluate_mock.call_args.args[1])
+        click_at.assert_not_called()
+
+    def test_preset_confirmation_accepts_only_exact_platform_greeting(self):
+        with patch(
+            "bosshunter.executor.sender.evaluate",
+            return_value=(
+                '{"success": true, "action": "preset_confirmed", '
+                '"observed_greeting": "您好"}'
+            ),
+        ) as evaluate_mock:
+            result = _confirm_preset_greeting("target-1", " 您好 ")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["observed_greeting"], "您好")
+        self.assertIn("expected_greeting", evaluate_mock.call_args.args[1])
 
     def test_startchat_submission_uses_trusted_typing_and_real_send_message_click(self):
         greeting = "您好，我的经历和岗位需求比较匹配。"
@@ -151,7 +206,8 @@ class JobSelectionTests(unittest.TestCase):
         self.assertEqual(state, "delivered")
         script = evaluate_mock.call_args.args[1]
         self.assertIn(".message-content", script)
-        self.assertIn("text.includes(expectedText)", script)
+        self.assertNotIn("text.includes(expectedText)", script)
+        self.assertIn("removeDeliveryLabels(value) === expectedText", script)
         self.assertIn("发送中|已读|未读|送达|发送成功|重试|重新发送", script)
 
     def test_chat_list_verification_requires_company_and_complete_greeting(self):
@@ -168,7 +224,7 @@ class JobSelectionTests(unittest.TestCase):
 
         self.assertTrue(verified)
         expression = evaluate.call_args.args[1]
-        self.assertIn("companyMatches && actualMessage.includes(expectedGreeting)", expression)
+        self.assertIn("companyMatches && actualMessage === expectedGreeting", expression)
         close_tab.assert_called_once_with("chat-target")
 
     def test_startchat_popup_reuses_chat_redirect_without_foreground_input(self):
@@ -369,7 +425,7 @@ class JobSelectionTests(unittest.TestCase):
         self.assertIsNone(target_id)
         self.assertTrue(result["success"])
         self.assertTrue(result["verified"])
-        confirm_preset.assert_called_once_with("target-1")
+        confirm_preset.assert_called_once_with("target-1", "您好，我对这个岗位很感兴趣。")
         background_submit.assert_called_once()
         fill_input.assert_not_called()
 

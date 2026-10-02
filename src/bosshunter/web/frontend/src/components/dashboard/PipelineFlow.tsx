@@ -4,7 +4,7 @@ const steps = [
   { icon: Search, label: '采集', desc: '搜索岗位' },
   { icon: Bot, label: 'AI评分', desc: '匹配打分' },
   { icon: MessageSquare, label: '招呼语', desc: '个性生成' },
-  { icon: CheckCircle, label: '人工确认', desc: '审核通过' },
+  { icon: CheckCircle, label: '安全校验', desc: '验证后投递' },
   { icon: Send, label: '发送', desc: '自动投递' },
   { icon: Eye, label: '监控', desc: '跟进回复' },
 ]
@@ -30,7 +30,7 @@ export function PipelineFlow() {
         ))}
       </div>
       <p className="text-xs text-muted mt-4">
-        可从上方选择运行全流程、单独采集或单独监测；投递前需要人工确认。
+        自动全流程会按配置采集、评分，并将达到阈值的岗位直接进入安全投递队列；平台验证失败、登录失效、验证码或风控时会停止对应平台，已验证成功的会话继续进入低频监控。
       </p>
     </div>
   )

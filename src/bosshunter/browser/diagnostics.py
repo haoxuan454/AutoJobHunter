@@ -15,7 +15,9 @@ from bosshunter.browser.runtime import check_node_available, ensure_runtime, get
 ZHILIAN_PAGE_STATE_SCRIPT = """
 (() => {
   const text = document.body ? document.body.innerText : '';
-  const searchInput = document.querySelector('input[placeholder="输入职位、公司等搜索"], input[placeholder*="职位、公司"]');
+  const searchInput = document.querySelector(
+    'input.query-sug__input, input.search-wrapper__input, input[placeholder="输入职位、公司等搜索"], input[placeholder*="职位、公司"]'
+  );
   if (/验证码|滑块|访问频繁|频率限制|账号异常|拒绝访问/.test(text)) {
     return JSON.stringify({status: 'blocked', message: '智联页面受到验证码、频率限制或账号异常拦截'});
   }

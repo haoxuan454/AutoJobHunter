@@ -19,9 +19,10 @@ from bosshunter.browser import (
     type_text,
     wait_for_load,
 )
+from bosshunter.browser.platform_targets import target_belongs_to_platform
 from bosshunter.db import (
     get_db, get_jobs_ready_to_send, update_job_status, update_job_last_error,
-    add_history, add_risk_event, set_platform_safety_lock,
+    add_history, add_risk_event, count_daily_delivery_usage, set_platform_safety_lock,
 )
 from bosshunter.config import effective_send_windows
 from bosshunter.collection.capabilities import platform_supports
@@ -237,9 +238,19 @@ def _is_preset_greeting_popup(state: dict) -> bool:
     return state.get("kind") in {None, "preset_greeting"}
 
 
-def _confirm_preset_greeting(target_id: str) -> dict:
+def _normalize_greeting_text(value: str) -> str:
+    return " ".join(str(value or "").replace("\u200b", "").replace("\ufeff", "").split())
+
+
+def _confirm_preset_greeting(target_id: str, expected_greeting: str) -> dict:
+    expected = _normalize_greeting_text(expected_greeting)
+    expected_json = json.dumps(expected, ensure_ascii=False)
     result = _parse_js_result(evaluate(target_id, """
     (() => {
+        const normalize = (value) => String(value || '')
+            .replace(/[\u200b-\u200f\ufeff]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
         const visible = (element) => {
             if (!element) return false;
             const rect = element.getBoundingClientRect();
@@ -256,6 +267,34 @@ def _confirm_preset_greeting(target_id: str) -> dict:
             )
         );
         if (!popup) return JSON.stringify({success: false, error: 'preset_popup_missing'});
+        const expected = normalize(__EXPECTED_GREETING__);
+        const candidates = [];
+        const addCandidate = (value) => {
+            const text = normalize(value);
+            if (text && !candidates.includes(text)) candidates.push(text);
+        };
+        popup.querySelectorAll(
+            '[data-greeting], [data-message], .greet-content, .greet-text, '
+            + '.greet-message, textarea, input[type="text"], [contenteditable="true"], '
+            + '.message-content, .message-text, p'
+        ).forEach((element) => {
+            if (element.matches('textarea, input')) addCandidate(element.value);
+            else addCandidate(element.innerText || element.textContent);
+        });
+        const observedGreeting = candidates.find((text) => text === expected)
+            || candidates.find((text) => text.length <= 300 && !/确定|确认|继续|开始沟通|立即沟通/.test(text))
+            || '';
+        if (!observedGreeting) {
+            return JSON.stringify({success: false, error: 'platform_default_greeting_unreadable'});
+        }
+        if (observedGreeting !== expected) {
+            return JSON.stringify({
+                success: false,
+                error: 'platform_default_greeting_mismatch',
+                observed_greeting: observedGreeting,
+                expected_greeting: expected
+            });
+        }
         const buttons = Array.from(popup.querySelectorAll(
             '[ka="dialog_confirm"], .btn-sure, button, [role="button"]'
         )).filter((element) => {
@@ -268,16 +307,32 @@ def _confirm_preset_greeting(target_id: str) -> dict:
         if (!button) return JSON.stringify({success: false, error: 'preset_confirm_missing'});
         button.scrollIntoView({block: 'center', inline: 'center'});
         button.click();
-        return JSON.stringify({success: true, action: 'preset_confirmed'});
+        return JSON.stringify({success: true, action: 'preset_confirmed', observed_greeting: observedGreeting});
     })()
-    """))
+    """.replace('__EXPECTED_GREETING__', expected_json)))
     if not result.get("success"):
+        if result.get("error") == "platform_default_greeting_mismatch":
+            return {
+                **result,
+                "history_detail": "平台默认招呼语与配置招呼语不一致，已停止发送，请人工确认",
+                "skip_backoff": True,
+            }
+        if result.get("error") == "platform_default_greeting_unreadable":
+            return {
+                **result,
+                "history_detail": "无法读取平台默认招呼语，已停止发送，请人工确认",
+                "skip_backoff": True,
+            }
         return {
             **result,
             "history_detail": "检测到平台招呼语，但无法确认招呼语弹窗",
             "skip_backoff": True,
         }
-    return {"success": True, "action": "preset_confirmed"}
+    return {
+        "success": True,
+        "action": "preset_confirmed",
+        "observed_greeting": result.get("observed_greeting", expected),
+    }
 
 
 def _submit_startchat_greeting(target_id: str, greeting: str) -> dict:
@@ -390,7 +445,7 @@ def _handle_greet_popup(target_id: str, greeting: str, click_result: dict | None
             "skip_backoff": True,
         }
     if _is_preset_greeting_popup(state):
-        return _confirm_preset_greeting(target_id)
+        return _confirm_preset_greeting(target_id, greeting)
     if state.get("kind") == "startchat_dialog":
         if click_result and _navigate_to_chat_redirect(target_id, click_result):
             return {"success": True, "action": "startchat_redirected"}
@@ -557,6 +612,7 @@ def _wait_for_chat_page(
                     candidate_id
                     and candidate_id != target_id
                     and "/web/geek/chat" in candidate_url
+                    and target_belongs_to_platform({"url": candidate_url, "targetId": candidate_id}, "boss")
                     and _chat_target_matches_job(candidate_id, job)
                 ):
                     return {"success": True, "target_id": candidate_id, "opened_new_tab": True}
@@ -598,10 +654,8 @@ def _message_delivery_state(target_id: str, greeting: str) -> str:
         const removeDeliveryLabels = (value) => normalize(value)
             .replace(/(发送中|已读|未读|送达|发送成功|重试|重新发送)$/g, '')
             .trim();
-        const textMatchesExpected = (value, expectedText) => {{
-            const text = removeDeliveryLabels(value);
-            return text === expectedText || text.includes(expectedText);
-        }};
+        const textMatchesExpected = (value, expectedText) =>
+            removeDeliveryLabels(value) === expectedText;
         const messageText = (node) => {{
             const contentNode = node.querySelector(
                 '.message-content, .text, .content, .message-text, '
@@ -693,7 +747,7 @@ def _verify_greeting_in_chat_list(
                     || actualCompany.includes(expectedCompany)
                     || expectedCompany.includes(actualCompany)
                 );
-                return companyMatches && actualMessage.includes(expectedGreeting);
+                return companyMatches && actualMessage === expectedGreeting;
             }});
             return JSON.stringify({{success: true, matched}});
         }})()
@@ -870,11 +924,20 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
             job,
             DeliveryContext(metadata={"workbench": True, "greeting": greeting}),
         )
+        # Reusing an existing conversation is reconciliation information, not
+        # proof that this run sent a message. Keep the automatic flow fail-closed
+        # even if a platform adapter accidentally reports success for this kind.
+        existing_conversation_reused = result.delivery_kind == "existing_conversation_reused"
+        verified_send = result.success and result.verified and not existing_conversation_reused
         return {
-            "success": result.success and result.verified,
-            "verified": result.verified,
+            "success": verified_send,
+            "verified": result.verified and not existing_conversation_reused,
             "first_contact": True,
-            "error": result.error or ("delivery_not_verified" if result.success and not result.verified else None),
+            "error": result.error or (
+                "existing_conversation_reused_without_send"
+                if existing_conversation_reused
+                else "delivery_not_verified" if result.success and not result.verified else None
+            ),
             "history_detail": result.history_detail or (
                 "智联适配器未提供可验证的发送证据，未写入已发送状态"
                 if result.success and not result.verified else ""
@@ -1268,11 +1331,13 @@ def send_greetings(config: dict, force: bool = False, db_path=None) -> int:
     interval_min = throttle_config.get("interval_min", 60)
     interval_max = throttle_config.get("interval_max", 180)
 
-    # Count today's sent
-    today_sent = db.execute(
-        "SELECT COUNT(*) as cnt FROM history WHERE action='sent' AND date(created_at)=date('now')"
-    ).fetchone()
-    already_sent = today_sent["cnt"] if today_sent else 0
+    # Count today's successful sends plus active automatic claims. The current
+    # automatic claim is excluded because this sender owns that slot already.
+    automatic_claim_id = str(config.get("_automatic_delivery_claim_id") or "").strip()
+    already_sent = count_daily_delivery_usage(
+        db,
+        exclude_claim_id=automatic_claim_id or None,
+    )
 
     remaining_quota = daily_limit - already_sent
     send_report["already_sent"] = already_sent

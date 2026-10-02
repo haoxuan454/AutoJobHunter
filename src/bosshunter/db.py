@@ -2,12 +2,15 @@
 
 import json
 import sqlite3
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 
 DB_PATH = Path("./data/bosshunter.db")
+SQLITE_TIMEOUT_SECONDS = 30.0
+SQLITE_BUSY_TIMEOUT_MS = 30_000
 MAX_JOB_IDS = 1000
 DELETION_PROTECTED_STATUSES = {"sent", "replied", "resume_sent", "needs_resume", "follow_up_sent"}
 GREETING_ALLOWED_STATUSES = {"ready", "approved", "error"}
@@ -44,8 +47,9 @@ def get_db(db_path: Path | None = None) -> sqlite3.Connection:
     """Get a database connection, creating tables if needed."""
     path = db_path or DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=SQLITE_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA journal_mode=WAL")
     _init_tables(conn)
     return conn
@@ -109,12 +113,27 @@ def _init_tables(conn: sqlite3.Connection) -> None:
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS automatic_delivery_claims (
+            claim_id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            claim_date TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('claimed', 'consumed', 'released')),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (job_id) REFERENCES jobs(id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
         CREATE INDEX IF NOT EXISTS idx_jobs_score ON jobs(score);
         CREATE INDEX IF NOT EXISTS idx_history_job_id ON history(job_id);
         CREATE INDEX IF NOT EXISTS idx_risk_events_type ON risk_events(event_type);
         CREATE INDEX IF NOT EXISTS idx_platform_access_stage_action
             ON platform_access_events(stage, action, created_at);
+        CREATE INDEX IF NOT EXISTS idx_auto_delivery_claims_date_status
+            ON automatic_delivery_claims(claim_date, status);
+        CREATE INDEX IF NOT EXISTS idx_auto_delivery_claims_job_date
+            ON automatic_delivery_claims(job_id, claim_date, status);
     """)
     conn.commit()
     _migrate_v1_1(conn)
@@ -465,6 +484,53 @@ def insert_job_if_new(
     if commit:
         conn.commit()
     return cursor.rowcount == 1
+
+
+def enrich_existing_job_metadata(
+    conn: sqlite3.Connection,
+    job: dict[str, Any],
+    *,
+    commit: bool = True,
+) -> bool:
+    """Fill missing job metadata from a later detail-page snapshot.
+
+    Collection is intentionally idempotent, but a duplicate search result can
+    still carry richer detail data than the first snapshot (notably BOSS HR
+    name/title).  Only non-empty values are allowed to replace existing
+    fields; workflow state, score and greeting are never touched here.
+    """
+    job_id = str(job.get("id") or "").strip()
+    if not job_id:
+        return False
+    row = conn.execute("SELECT * FROM jobs WHERE id = ? AND deleted_at IS NULL", (job_id,)).fetchone()
+    if not row:
+        return False
+    allowed = (
+        "title", "company", "salary", "city", "experience", "education",
+        "recruitment_type", "jd", "hr_name", "hr_title", "hr_active",
+        "company_size", "company_industry", "url", "source_keyword", "source_city_code",
+    )
+    updates: dict[str, Any] = {}
+    for field in allowed:
+        value = job.get(field)
+        if value is None:
+            continue
+        value = str(value).strip() if isinstance(value, str) else value
+        if value in ("", "unknown"):
+            continue
+        if str(row[field] or "").strip() != str(value).strip():
+            updates[field] = value
+    if not updates:
+        return False
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+    assignments = ", ".join(f"{field} = ?" for field in updates)
+    conn.execute(
+        f"UPDATE jobs SET {assignments} WHERE id = ? AND deleted_at IS NULL",
+        (*updates.values(), job_id),
+    )
+    if commit:
+        conn.commit()
+    return True
 
 
 def insert_job(conn: sqlite3.Connection, job: dict[str, Any]) -> bool:
@@ -1263,6 +1329,84 @@ def count_platform_access_today(
         params,
     ).fetchone()
     return int(row["cnt"] if row else 0)
+
+
+def count_daily_delivery_usage(conn: sqlite3.Connection, *, exclude_claim_id: str | None = None) -> int:
+    history_row = conn.execute(
+        "SELECT COUNT(*) AS cnt FROM history WHERE action = 'sent' "
+        "AND date(created_at, 'localtime') = date('now', 'localtime')"
+    ).fetchone()
+    sql = (
+        "SELECT COUNT(*) AS cnt FROM automatic_delivery_claims "
+        "WHERE claim_date = date('now', 'localtime') AND status = 'claimed'"
+    )
+    params: tuple[str, ...] = ()
+    if exclude_claim_id:
+        sql += " AND claim_id != ?"
+        params = (str(exclude_claim_id),)
+    claim_row = conn.execute(sql, params).fetchone()
+    return int((history_row["cnt"] if history_row else 0) or 0) + int((claim_row["cnt"] if claim_row else 0) or 0)
+
+
+def claim_automatic_delivery_slot(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    platform: str,
+    daily_limit: int,
+) -> dict[str, Any]:
+    """Atomically reserve one global daily slot for the automatic workflow."""
+    limit = int(daily_limit)
+    if limit < 0:
+        raise ValueError("daily delivery limit cannot be negative")
+    claim_id = uuid.uuid4().hex
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        today = str(conn.execute("SELECT date('now', 'localtime')").fetchone()[0])
+        in_flight = conn.execute(
+            "SELECT claim_id FROM automatic_delivery_claims "
+            "WHERE job_id = ? AND claim_date = ? AND status = 'claimed' LIMIT 1",
+            (str(job_id), today),
+        ).fetchone()
+        if in_flight:
+            conn.rollback()
+            return {"status": "in_flight", "claim_id": str(in_flight["claim_id"])}
+        used = count_daily_delivery_usage(conn)
+        if used >= limit:
+            conn.rollback()
+            return {"status": "exhausted", "claim_id": "", "used": used, "limit": limit}
+        conn.execute(
+            "INSERT INTO automatic_delivery_claims "
+            "(claim_id, job_id, platform, claim_date, status) VALUES (?, ?, ?, ?, 'claimed')",
+            (claim_id, str(job_id), str(platform), today),
+        )
+        conn.commit()
+        return {"status": "claimed", "claim_id": claim_id, "used": used + 1, "limit": limit}
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def consume_automatic_delivery_slot(conn: sqlite3.Connection, claim_id: str) -> bool:
+    """Mark an active automatic claim consumed exactly once."""
+    cursor = conn.execute(
+        "UPDATE automatic_delivery_claims SET status = 'consumed', updated_at = CURRENT_TIMESTAMP "
+        "WHERE claim_id = ? AND status = 'claimed'",
+        (str(claim_id),),
+    )
+    conn.commit()
+    return cursor.rowcount == 1
+
+
+def release_automatic_delivery_slot(conn: sqlite3.Connection, claim_id: str) -> bool:
+    """Release an unconsumed automatic claim after a failed attempt."""
+    cursor = conn.execute(
+        "UPDATE automatic_delivery_claims SET status = 'released', updated_at = CURRENT_TIMESTAMP "
+        "WHERE claim_id = ? AND status = 'claimed'",
+        (str(claim_id),),
+    )
+    conn.commit()
+    return cursor.rowcount == 1
 
 
 def add_platform_access(

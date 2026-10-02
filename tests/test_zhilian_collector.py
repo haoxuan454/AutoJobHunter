@@ -13,6 +13,7 @@ from bosshunter.collection.platforms.zhilian import (
     ZhilianBrowser,
     ZhilianCollector,
     _analyze_api_response,
+    _wait_for_rendered_list,
 
     _ApiRateLimiter,
     _reason_code_for,
@@ -108,10 +109,42 @@ class ZhilianFixtureTests(TestCase):
 
     def test_current_dom_selectors_cover_anchor_company_and_detail_jd(self):
         self.assertIn(".companyinfo__name", JS_EXTRACT_LIST)
+        self.assertIn(".job-card__title-clamp", JS_EXTRACT_LIST)
+        self.assertIn(".job-card__title-main", JS_EXTRACT_LIST)
+        self.assertIn(".job-card__company-name", JS_EXTRACT_LIST)
+        self.assertIn(".job-card__location", JS_EXTRACT_LIST)
         self.assertIn("div.job-card", JS_EXTRACT_LIST)
         self.assertIn(".describtion-card__detail-content", JS_EXTRACT_DETAIL)
         self.assertIn("descriptionCard", JS_EXTRACT_DETAIL)
         self.assertIn("describtion-card__detail-content", JD_CLASSES)
+
+    def test_current_spa_job_card_classes_parse_without_detail_anchor(self):
+        items = parse_zhilian_list_html(
+            """
+            <div class="job-list-panel">
+              <article class="job-card" data-positionid="CC-SPA-001">
+                <div class="job-card__title-main">
+                  <div class="job-card__title-clamp"><span class="vue-clamp__text">新媒体运营（兼职）</span></div>
+                </div>
+                <div class="job-card__salary">4000-8000元</div>
+                <div class="job-card__company-row"><span class="job-card__company-name">厦门搜益教育科技有限公司</span></div>
+                <div class="job-card__location">东莞</div>
+              </article>
+            </div>
+            """,
+            city="东莞",
+            source_keyword="运营",
+        )
+
+        self.assertEqual(items, [{
+            "source_job_id": "CC-SPA-001",
+            "title": "新媒体运营（兼职）",
+            "company": "厦门搜益教育科技有限公司",
+            "salary": "4000-8000元",
+            "city": "东莞",
+            "url": "https://www.zhaopin.com/jobdetail/CC-SPA-001.htm",
+            "source_keyword": "运营",
+        }])
 
     def test_current_detail_markup_parses_without_list_fallback(self):
         detail = parse_zhilian_detail_html(
@@ -172,6 +205,41 @@ class ZhilianFixtureTests(TestCase):
             "CC123J40800000001",
         )
 
+    def test_live_list_script_reads_vue_job_fields_when_dom_text_is_empty(self):
+        self.assertIn('item.__vue__', JS_EXTRACT_LIST)
+        self.assertIn('item.__vueParentComponent', JS_EXTRACT_LIST)
+        self.assertIn('vueJob.number', JS_EXTRACT_LIST)
+        self.assertIn('vueJob.positionURL', JS_EXTRACT_LIST)
+        self.assertIn('vueJob.companyName', JS_EXTRACT_LIST)
+        self.assertIn('vueJob.jobDescription', JS_EXTRACT_LIST)
+
+    def test_candidate_accepts_complete_vue_backed_list_payload(self):
+        candidate = ZhilianCollector._candidate_from_list(
+            {
+                'source_job_id': 'CC192921310J40894884209',
+                'title': '350+京东上门家政保洁师',
+                'company': '京东集团',
+                'salary': '7000-13000元',
+                'city': '东莞',
+                'url': 'http://www.zhaopin.com/jobdetail/CC192921310J40894884209.htm',
+                'jd': '负责上门家政服务',
+            },
+            '东莞',
+            '工程师',
+        )
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.source_job_id, 'CC192921310J40894884209')
+        self.assertEqual(candidate.title, '350+京东上门家政保洁师')
+        self.assertEqual(candidate.company, '京东集团')
+        self.assertEqual(candidate.url, 'http://www.zhaopin.com/jobdetail/CC192921310J40894884209.htm')
+
+    def test_list_candidate_still_fails_closed_without_id_title_or_url(self):
+        self.assertIsNone(
+            ZhilianCollector._candidate_from_list(
+                {'company': '京东集团'}, '东莞', '工程师'
+            )
+        )
+
     def test_list_candidate_can_defer_company_until_detail_page(self):
         candidate = ZhilianCollector._candidate_from_list(
             {
@@ -193,7 +261,7 @@ class ZhilianFixtureTests(TestCase):
             "人力",
             1,
         )
-        self.assertEqual(url, "https://www.zhaopin.com/sou/jl765/")
+        self.assertEqual(url, "https://www.zhaopin.com/jobs/?pageMode=search&jl=765")
 
     def test_missing_detail_jd_is_a_parse_failure(self):
         with self.assertRaises(CollectionError) as error:
@@ -302,14 +370,41 @@ class ZhilianFixtureTests(TestCase):
         self.assertEqual(actions, [
             (
                 "click",
-                'input[placeholder="输入职位、公司等搜索"], '
-                'input[placeholder="搜索职位、公司"], '
-                'input[placeholder*="职位、公司"]',
+                "input.query-sug__input",
             ),
             ("key", "SelectAll"),
             ("key", "Backspace"),
             ("type", "人力"),
         ])
+
+    def test_search_input_falls_back_to_legacy_selector(self):
+        attempted = []
+
+        def click(_target, selector, **_kwargs):
+            attempted.append(selector)
+            return len(attempted) == 2
+
+        browser = ZhilianBrowser(click_action=click)
+
+        self.assertTrue(ZhilianCollector(browser=browser)._click_search_input("tab-1"))
+        self.assertEqual(attempted[0], "input.query-sug__input")
+        self.assertIn("input.search-wrapper__input", attempted)
+        from bosshunter.collection.platforms.zhilian import ZHILIAN_SEARCH_INPUT_SELECTOR
+        self.assertIn("input[placeholder=", ZHILIAN_SEARCH_INPUT_SELECTOR)
+
+    def test_current_home_search_dom_is_supported_by_all_search_scripts(self):
+        from bosshunter.collection.platforms.zhilian import (
+            JS_CLICK_SEARCH_BUTTON,
+            JS_FOCUS_SEARCH_INPUT,
+            JS_PROBE_SEARCH_TAB,
+            JS_SUBMIT_SEARCH,
+        )
+
+        for script in (JS_PROBE_SEARCH_TAB, JS_FOCUS_SEARCH_INPUT, JS_SUBMIT_SEARCH):
+            self.assertIn("input.search-wrapper__input", script)
+        self.assertIn("input.search-wrapper__input", JS_CLICK_SEARCH_BUTTON)
+        self.assertIn("a.search-wrapper__button", JS_CLICK_SEARCH_BUTTON)
+        self.assertIn("input.search-wrapper__input", JS_EXTRACT_LIST)
 
     def test_collector_reads_current_split_page_by_clicking_job_card(self):
         search_state_calls = 0
@@ -365,9 +460,104 @@ class ZhilianFixtureTests(TestCase):
         )
 
         self.assertEqual(result.reason_code, "callback_stopped")
-        self.assertEqual(navigated, ["https://www.zhaopin.com/sou/jl530/"])
+        self.assertEqual(navigated, ["https://www.zhaopin.com/jobs/?pageMode=search&jl=530"])
         self.assertEqual(collected[0].storage_id, "zhilian:CC123J40800000001")
         self.assertIn("用户增长", collected[0].jd)
+
+    def test_complete_list_payload_skips_changed_split_detail_panel(self):
+        """A complete list item remains collectible when optional detail DOM changes."""
+        evaluated_scripts = []
+
+        def evaluate_current(_target, script):
+            evaluated_scripts.append(script)
+            if "item_count" in script:
+                return json.dumps({
+                    "url": "https://www.zhaopin.com/jobs?jl=779&pageMode=search&kw=Python",
+                    "input": "Python",
+                    "signature": "new",
+                })
+            if "submitted_by" in script:
+                return json.dumps({"ok": True, "value": "Python", "submitted_by": "button"})
+            if "descriptionCard" in script:
+                self.fail("complete list payload must not read the changed detail panel")
+            return json.dumps({
+                "status": "ready",
+                "items": [{
+                    "card_index": 0,
+                    "source_job_id": "CC821752090J40934301408",
+                    "title": "Python开发工程师",
+                    "company": "东莞佰和生物科技有限公司",
+                    "salary": "8-12K",
+                    "city": "东莞",
+                    "jd": "负责 Python 服务开发和接口维护",
+                    "url": "https://www.zhaopin.com/jobdetail/CC821752090J40934301408.htm",
+                    "hr_name": "刘先生",
+                }],
+            })
+
+        browser = ZhilianBrowser(
+            new_tab=lambda _url, **_kwargs: self.fail("complete list payload must not open a detail tab"),
+            close_tab=lambda _target: True,
+            evaluate=evaluate_current,
+            scroll=lambda *_args, **_kwargs: True,
+            wait_for_load=lambda *_args, **_kwargs: True,
+        )
+        collected = []
+        hooks = CollectorHooks(
+            stop_event=None,
+            on_list_candidate=lambda _candidate: True,
+            on_candidate=lambda candidate: collected.append(candidate) or False,
+            on_parse_failed=lambda reason: self.fail(reason),
+            on_event=lambda **_kwargs: None,
+        )
+
+        result = ZhilianCollector(browser=browser, sleep=lambda _seconds: None).collect(
+            PlatformCollectionRequest("zhilian", ["Python"], ["东莞"], {"东莞": "779"}, max_pages=1),
+            hooks,
+        )
+
+        self.assertEqual(result.reason_code, "callback_stopped")
+        self.assertEqual(len(collected), 1)
+        self.assertEqual(collected[0].company, "东莞佰和生物科技有限公司")
+        self.assertEqual(collected[0].hr_name, "刘先生")
+        self.assertEqual(collected[0].jd, "负责 Python 服务开发和接口维护")
+        self.assertFalse(any("descriptionCard" in script for script in evaluated_scripts))
+
+    def test_reused_search_tab_accepts_already_applied_keyword_route(self):
+        browser = ZhilianBrowser(
+            evaluate=lambda _target, _script: json.dumps({
+                "url": "https://www.zhaopin.com/jobs/?jl=779&pageMode=search&kw=%E5%B7%A5%E7%A8%8B%E5%B8%88",
+                "input": "工程师",
+                "signature": "same-result-signature",
+                "item_count": 8,
+            })
+        )
+
+        ZhilianCollector(browser=browser, sleep=lambda _seconds: None)._wait_for_search_results(
+            "tab-1",
+            "工程师",
+            {"signature": "same-result-signature"},
+            timeout=0.1,
+        )
+
+    def test_same_input_without_applied_route_is_not_accepted_as_search(self):
+        browser = ZhilianBrowser(
+            evaluate=lambda _target, _script: json.dumps({
+                "url": "https://www.zhaopin.com/jobs/?jl=779&pageMode=search",
+                "input": "工程师",
+                "signature": "same-result-signature",
+                "item_count": 8,
+            })
+        )
+
+        with self.assertRaises(CollectionError) as raised:
+            ZhilianCollector(browser=browser, sleep=lambda _seconds: None)._wait_for_search_results(
+                "tab-1",
+                "工程师",
+                {"signature": "same-result-signature"},
+                timeout=0.01,
+            )
+        self.assertEqual(raised.exception.code, "search_not_applied")
 
     def test_detail_reader_rechecks_a_transient_false_login_state(self):
         responses = iter([
@@ -503,6 +693,37 @@ class ZhilianResumeCheckpointTests(TestCase):
             press_key_action=lambda _t, _v, **_kw: True,
         )
         return browser
+
+    def test_waits_for_transient_empty_spa_list_without_reloading(self):
+        job = {"source_job_id": "zl-1", "title": "AI"}
+        payloads = iter([
+            {"items": [], "status": "empty"},
+            {"items": [job], "status": "ready"},
+        ])
+        reads = []
+        waits = []
+
+        result = _wait_for_rendered_list(
+            lambda: reads.append(True) or next(payloads),
+            sleep=waits.append,
+        )
+
+        self.assertEqual(result["items"], [job])
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(waits, [0.4])
+
+    def test_empty_spa_list_wait_is_bounded(self):
+        reads = []
+        waits = []
+
+        result = _wait_for_rendered_list(
+            lambda: reads.append(True) or {"items": [], "status": "empty"},
+            sleep=waits.append,
+        )
+
+        self.assertEqual(result, {"items": [], "status": "empty"})
+        self.assertEqual(len(reads), 6)
+        self.assertEqual(waits, [0.4] * 5)
 
     def _job(self, job_id="zl-1"):
         return {"source_job_id": job_id, "title": "AI", "company": "公司",
@@ -1009,6 +1230,147 @@ class ZhilianCollectApiTests(TestCase):
             on_candidate=lambda c: collected.append(c) or True,
             on_parse_failed=lambda msg: None,
         )
+
+    def test_api_host_ignores_im_tab_and_uses_public_search_tab(self):
+        browser = ZhilianBrowser(
+            get_page_targets=lambda: [
+                {"targetId": "im-tab", "url": "https://i.zhaopin.com/im?sessionId=abc"},
+                {"targetId": "jobs-tab", "url": "https://www.zhaopin.com/jobs/?jl=779"},
+            ],
+            evaluate=lambda target, _script, **_kwargs: (
+                json.dumps({"http_status": 200, "content_type": "application/json", "body": "{}"})
+                if target == "jobs-tab" else None
+            ),
+            new_tab=lambda *_args, **_kwargs: "new-tab",
+        )
+        request = PlatformCollectionRequest("zhilian", ["工程师"], ["东莞"], {"东莞": "779"}, max_pages=1)
+
+        target, owned = ZhilianCollector(browser=browser, sleep=lambda _s: None)._ensure_host_tab(request)
+
+        self.assertEqual(target, "jobs-tab")
+        self.assertFalse(owned)
+
+    def test_city_search_tab_requires_exact_jl_code(self):
+        browser = ZhilianBrowser(
+            get_page_targets=lambda: [
+                {"targetId": "guangzhou", "url": "https://www.zhaopin.com/jobs/?pageMode=search&jl=763"},
+                {"targetId": "dongguan", "url": "https://www.zhaopin.com/jobs/?pageMode=search&jl=779&kw=工程师"},
+                {"targetId": "im-tab", "url": "https://i.zhaopin.com/im"},
+            ],
+        )
+        collector = ZhilianCollector(browser=browser, sleep=lambda _s: None)
+
+        self.assertEqual(collector._find_city_search_tab("779"), "dongguan")
+        self.assertIsNone(collector._find_city_search_tab("530"))
+
+    def test_city_search_tab_accepts_normalized_runtime_target_id_shapes(self):
+        browser = ZhilianBrowser(
+            get_page_targets=lambda: [
+                {"target_id": "dongguan", "url": "https://www.zhaopin.com/jobs/?jl=779"},
+                {"id": "other", "url": "https://www.zhaopin.com/jobs/?jl=763"},
+            ],
+        )
+        collector = ZhilianCollector(browser=browser, sleep=lambda _s: None)
+
+        self.assertEqual(collector._find_city_search_tab("779"), "dongguan")
+
+    def test_city_search_tab_skips_stale_target_and_selects_live_target(self):
+        browser = ZhilianBrowser(
+            get_page_targets=lambda: [
+                {"targetId": "stale", "url": "https://www.zhaopin.com/jobs/?jl=779"},
+                {"targetId": "live", "url": "https://www.zhaopin.com/jobs/?jl=779"},
+            ],
+            evaluate=lambda target, _script, **_kwargs: (
+                None if target == "stale" else '{"ok":true,"url":"https://www.zhaopin.com/jobs/?jl=779"}'
+            ),
+            navigate_action=lambda *_args: True,
+        )
+        collector = ZhilianCollector(browser=browser, sleep=lambda _s: None)
+
+        self.assertEqual(collector._find_city_search_tab("779"), "live")
+
+    def test_city_search_tab_returns_none_when_all_matching_targets_are_stale(self):
+        browser = ZhilianBrowser(
+            get_page_targets=lambda: [
+                {"targetId": "stale", "url": "https://www.zhaopin.com/jobs/?jl=779"},
+            ],
+            evaluate=lambda *_args, **_kwargs: None,
+            navigate_action=lambda *_args: True,
+        )
+        collector = ZhilianCollector(browser=browser, sleep=lambda _s: None)
+
+        self.assertIsNone(collector._find_city_search_tab("779"))
+
+    def test_wait_for_search_page_reports_live_runtime_load_failure(self):
+        browser = ZhilianBrowser(
+            navigate_action=lambda _target, _url: True,
+            wait_for_load=lambda *_args, **_kwargs: False,
+        )
+        collector = ZhilianCollector(browser=browser, sleep=lambda _s: None)
+
+        self.assertFalse(collector._wait_for_search_page("stalled"))
+
+    def test_wait_for_search_page_keeps_legacy_offline_fake_compatible(self):
+        browser = ZhilianBrowser(
+            wait_for_load=lambda *_args, **_kwargs: False,
+        )
+        collector = ZhilianCollector(browser=browser, sleep=lambda _s: None)
+
+        self.assertTrue(collector._wait_for_search_page("offline"))
+
+    def test_dom_tab_reuses_exact_city_and_only_new_tab_is_owned(self):
+        created = []
+        browser = ZhilianBrowser(
+            get_page_targets=lambda: [
+                {"targetId": "dongguan", "url": "https://www.zhaopin.com/jobs/?jl=779"},
+            ],
+            new_tab=lambda url, **_kwargs: created.append(url) or "new-tab",
+        )
+        collector = ZhilianCollector(browser=browser, sleep=lambda _s: None)
+        request = PlatformCollectionRequest("zhilian", ["AI"], ["东莞"], {"东莞": "779"}, max_pages=1)
+
+        reused, reused_owned = collector._ensure_dom_tab(request, "东莞", collector.build_search_url(request, "东莞", "AI", 1))
+        self.assertEqual((reused, reused_owned), ("dongguan", False))
+        self.assertEqual(created, [])
+
+        browser.get_page_targets = lambda: []
+        opened, opened_owned = collector._ensure_dom_tab(request, "东莞", collector.build_search_url(request, "东莞", "AI", 1))
+        self.assertEqual((opened, opened_owned), ("new-tab", True))
+        self.assertEqual(created, ["https://www.zhaopin.com/jobs/?pageMode=search&jl=779"])
+
+    def test_dom_tab_skips_target_with_dead_runtime_context(self):
+        created = []
+        browser = ZhilianBrowser(
+            get_page_targets=lambda: [
+                {"targetId": "stale", "url": "https://www.zhaopin.com/jobs/?jl=779"},
+            ],
+            evaluate=lambda *_args, **_kwargs: None,
+            navigate_action=lambda _target, _url: True,
+            new_tab=lambda url, **_kwargs: created.append(url) or "fresh",
+        )
+        collector = ZhilianCollector(browser=browser, sleep=lambda _s: None)
+        request = PlatformCollectionRequest("zhilian", ["AI"], ["city"], {"city": "779"}, max_pages=1)
+
+        target, owned = collector._ensure_dom_tab(request, "city", collector.build_search_url(request, "city", "AI", 1))
+
+        self.assertEqual((target, owned), ("fresh", True))
+        self.assertEqual(created, ["about:blank"])
+
+    def test_dom_tab_reuses_target_with_live_runtime_context(self):
+        browser = ZhilianBrowser(
+            get_page_targets=lambda: [
+                {"targetId": "live", "url": "https://www.zhaopin.com/jobs/?jl=779"},
+            ],
+            evaluate=lambda *_args, **_kwargs: json.dumps({"ok": True, "url": "https://www.zhaopin.com/jobs/?jl=779"}),
+            navigate_action=lambda _target, _url: True,
+            new_tab=lambda *_args, **_kwargs: self.fail("a live search target should be reused"),
+        )
+        collector = ZhilianCollector(browser=browser, sleep=lambda _s: None)
+        request = PlatformCollectionRequest("zhilian", ["AI"], ["city"], {"city": "779"}, max_pages=1)
+
+        target, owned = collector._ensure_dom_tab(request, "city", collector.build_search_url(request, "city", "AI", 1))
+
+        self.assertEqual((target, owned), ("live", False))
 
     def test_no_host_tab_returns_none(self):
         browser = ZhilianBrowser(

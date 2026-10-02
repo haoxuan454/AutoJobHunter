@@ -44,7 +44,8 @@ class RuntimeClient:
             response = httpx.post(
                 f"{self.base_url}/eval",
                 params={"target": target_id},
-                content=expression,
+                content=expression.encode("utf-8"),
+                headers={"Content-Type": "text/plain; charset=utf-8"},
                 timeout=timeout,
                 trust_env=False,
             )
@@ -130,7 +131,9 @@ class RuntimeClient:
             response = httpx.post(
                 f"{self.base_url}{path}",
                 params=params,
-                content=content,
+                # Send raw UTF-8 bytes explicitly for browser text input.
+                content=content.encode("utf-8"),
+                headers={"Content-Type": "text/plain; charset=utf-8"},
                 timeout=timeout,
                 trust_env=False,
             )

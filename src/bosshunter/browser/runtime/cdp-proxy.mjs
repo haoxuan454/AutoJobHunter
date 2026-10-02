@@ -16,11 +16,14 @@ const COMMON_PORTS = String(process.env.BOSSHUNTER_CHROME_PORTS || '9222,9229,93
   .map((value) => parseInt(value.trim(), 10))
   .filter((value) => value > 0 && value < 65536);
 const RUNTIME_NAME = 'bosshunter';
+const SESSION_HEALTH_CHECK_TIMEOUT_MS = 1500;
+const SESSION_DETACH_TIMEOUT_MS = 1000;
 
 let ws = null;
 let cmdId = 0;
 const pending = new Map();
 const sessions = new Map();
+const sessionAttachPromises = new Map();
 const portGuardedSessions = new Set();
 let chromePort = null;
 let chromeWsPath = null;
@@ -188,7 +191,22 @@ async function connect() {
 
       if (msg.method === 'Target.attachedToTarget') {
         const { sessionId, targetInfo } = msg.params;
+        const previousSessionId = targetInfo?.targetId ? sessions.get(targetInfo.targetId) : null;
+        if (previousSessionId && previousSessionId !== sessionId) {
+          portGuardedSessions.delete(previousSessionId);
+        }
         sessions.set(targetInfo.targetId, sessionId);
+      }
+      if (msg.method === 'Target.detachedFromTarget') {
+        const { sessionId, targetId } = msg.params || {};
+        if (targetId && sessions.get(targetId) === sessionId) sessions.delete(targetId);
+        if (sessionId) portGuardedSessions.delete(sessionId);
+      }
+      if (msg.method === 'Target.targetDestroyed') {
+        const { targetId } = msg.params || {};
+        const sessionId = targetId ? sessions.get(targetId) : null;
+        if (targetId) sessions.delete(targetId);
+        if (sessionId) portGuardedSessions.delete(sessionId);
       }
       if (msg.method === 'Fetch.requestPaused') {
         const { requestId, sessionId } = msg.params;
@@ -223,7 +241,7 @@ async function connect() {
   return connectingPromise;
 }
 
-function sendCDP(method, params = {}, sessionId = null) {
+function sendCDP(method, params = {}, sessionId = null, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
     if (!ws || (ws.readyState !== WS.OPEN && ws.readyState !== 1)) {
       reject(new Error('WebSocket is not connected'));
@@ -235,7 +253,7 @@ function sendCDP(method, params = {}, sessionId = null) {
     const timer = setTimeout(() => {
       pending.delete(id);
       reject(new Error(`CDP command timeout: ${method}`));
-    }, 30000);
+    }, timeoutMs);
     pending.set(id, { resolve, timer });
     ws.send(JSON.stringify(msg));
   });
@@ -254,14 +272,63 @@ async function enablePortGuard(sessionId) {
   } catch {}
 }
 
+function forgetSession(targetId, sessionId = null) {
+  const currentSessionId = sessions.get(targetId);
+  if (sessionId && currentSessionId && currentSessionId !== sessionId) return false;
+  if (currentSessionId) portGuardedSessions.delete(currentSessionId);
+  sessions.delete(targetId);
+  return Boolean(currentSessionId);
+}
+
+async function detachSession(sessionId) {
+  if (!sessionId) return;
+  try {
+    await sendCDP('Target.detachFromTarget', { sessionId }, null, SESSION_DETACH_TIMEOUT_MS);
+  } catch {}
+}
+
+async function cachedSessionIsHealthy(sessionId) {
+  try {
+    const resp = await sendCDP('Runtime.evaluate', {
+      expression: 'document.readyState',
+      returnByValue: true,
+    }, sessionId, SESSION_HEALTH_CHECK_TIMEOUT_MS);
+    return !resp?.error && resp.result?.result?.value !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+async function attachSession(targetId) {
+  const existing = sessionAttachPromises.get(targetId);
+  if (existing) return existing;
+
+  const pendingAttach = (async () => {
+    const resp = await sendCDP('Target.attachToTarget', { targetId, flatten: true });
+    if (resp?.error) throw new Error(`attach failed: ${JSON.stringify(resp.error)}`);
+    const sessionId = resp.result?.sessionId;
+    if (!sessionId) throw new Error(`attach failed: ${JSON.stringify(resp.error)}`);
+    sessions.set(targetId, sessionId);
+    await enablePortGuard(sessionId);
+    return sessionId;
+  })();
+
+  sessionAttachPromises.set(targetId, pendingAttach);
+  try {
+    return await pendingAttach;
+  } finally {
+    if (sessionAttachPromises.get(targetId) === pendingAttach) sessionAttachPromises.delete(targetId);
+  }
+}
+
 async function ensureSession(targetId) {
-  if (sessions.has(targetId)) return sessions.get(targetId);
-  const resp = await sendCDP('Target.attachToTarget', { targetId, flatten: true });
-  const sessionId = resp.result?.sessionId;
-  if (!sessionId) throw new Error(`attach failed: ${JSON.stringify(resp.error)}`);
-  sessions.set(targetId, sessionId);
-  await enablePortGuard(sessionId);
-  return sessionId;
+  const cachedSessionId = sessions.get(targetId);
+  if (cachedSessionId && await cachedSessionIsHealthy(cachedSessionId)) return cachedSessionId;
+  if (cachedSessionId) {
+    forgetSession(targetId, cachedSessionId);
+    await detachSession(cachedSessionId);
+  }
+  return attachSession(targetId);
 }
 
 async function waitForLoad(sessionId, timeoutMs = 15000) {
@@ -289,9 +356,11 @@ async function waitForLoad(sessionId, timeoutMs = 15000) {
 }
 
 async function readBody(req) {
-  let body = '';
-  for await (const chunk of req) body += chunk;
-  return body;
+  const chunks = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString('utf8');
 }
 
 function sendJson(res, data, statusCode = 200) {

@@ -29,6 +29,7 @@ from bosshunter.browser import (
     type_text as browser_type_text,
     wait_for_load,
 )
+from bosshunter.browser.platform_targets import target_id as platform_target_id
 from bosshunter.collection.base import CollectionBlockedError, CollectionError, CollectorHooks
 from bosshunter.config import effective_send_windows
 from bosshunter.collection.models import JobCandidate, PlatformCollectionRequest, PlatformCollectionResult
@@ -45,15 +46,84 @@ from bosshunter.job_filters import matching_blocked_company, matching_deal_break
 from bosshunter.throttle import SendWindowChecker, should_take_day_off
 
 
-SEARCH_URL = "https://www.zhaopin.com/sou/jl{city_code}/"
+def _wait_for_rendered_list(
+    read_list: Callable[[], Any],
+    *,
+    stop_event: Any = None,
+    sleep: Callable[[float], None] = time.sleep,
+    max_reads: int = 6,
+    poll_interval: float = 0.4,
+) -> Any:
+    """Wait briefly for Zhilian's SPA list to mount on the current page.
+
+    A completed document can still expose an empty list while Vue is rendering.
+    Re-read only the existing page DOM for a bounded number of attempts; never
+    refresh, navigate, or issue another platform request here.
+    """
+    attempts = max(int(max_reads), 1)
+    last_payload: Any = None
+    for attempt in range(attempts):
+        if stop_event is not None and stop_event.is_set():
+            return None
+        last_payload = read_list()
+        if isinstance(last_payload, list):
+            if last_payload:
+                return last_payload
+        elif isinstance(last_payload, dict):
+            items = last_payload.get("items")
+            status = str(last_payload.get("status") or "").lower()
+            if not isinstance(items, list) or items or status not in {"", "empty", "ready"}:
+                return last_payload
+        else:
+            return last_payload
+        if attempt + 1 < attempts:
+            if stop_event is not None:
+                if stop_event.wait(max(float(poll_interval), 0.05)):
+                    return None
+            else:
+                sleep(max(float(poll_interval), 0.05))
+    return last_payload
+
+
+# The current public SPA entry is /jobs/?...; the former /sou/jl... route can
+# redirect to a generic landing page and therefore produces no searchable DOM.
+# Keyword submission still happens through the page's own search input below.
+SEARCH_URL = "https://www.zhaopin.com/jobs/?pageMode=search&jl={city_code}"
 DETAIL_BASE_URL = "https://www.zhaopin.com"
 CITY_SNAPSHOT_PATH = Path(__file__).resolve().parents[2] / "data" / "zhilian_cities.json"
 _INTERNSHIP_TITLE_TERMS = ("实习", "intern", "internship", "管培")
 LIST_ITEM_CLASSES = ("joblist-box__item", "joblist-item", "job-card")
-TITLE_CLASSES = ("summary-planes__title", "jobinfo__name", "job-name", "job-title")
-SALARY_CLASSES = ("summary-planes__salary", "jobinfo__salary", "job-salary", "salary")
-COMPANY_CLASSES = ("company-info__name", "companyinfo__name", "company-name", "company")
-CITY_CLASSES = ("jobinfo__city", "job-city", "city", "summary-planes__info", "address-info__content")
+TITLE_CLASSES = (
+    "summary-planes__title",
+    "jobinfo__name",
+    "job-card__title-clamp",
+    "job-card__title-main",
+    "vue-clamp__text",
+    "job-name",
+    "job-title",
+)
+SALARY_CLASSES = (
+    "summary-planes__salary",
+    "jobinfo__salary",
+    "job-card__salary",
+    "job-salary",
+    "salary",
+)
+COMPANY_CLASSES = (
+    "company-info__name",
+    "companyinfo__name",
+    "job-card__company-name",
+    "company-name",
+    "company",
+)
+CITY_CLASSES = (
+    "jobinfo__city",
+    "job-card__location",
+    "job-city",
+    "city",
+    "summary-planes__info",
+    "address-info__content",
+)
 JD_CLASSES = (
     "describtion-card__detail-content",
     "describtion__detail-content",
@@ -65,11 +135,18 @@ JD_CLASSES = (
 DETAIL_PATH_PATTERN = re.compile(r"/(?:jobdetail|job|position|detail)/[^/?]+", re.IGNORECASE)
 DETAIL_DELAY_MIN_SECONDS = 8.0
 DETAIL_DELAY_MAX_SECONDS = 15.0
-ZHILIAN_SEARCH_INPUT_SELECTOR = (
-    'input[placeholder="输入职位、公司等搜索"], '
-    'input[placeholder="搜索职位、公司"], '
-    'input[placeholder*="职位、公司"]'
+# The public Zhilian search page currently exposes a stable component class.
+# Keep the placeholder selectors as fallbacks because older deployments used
+# a different placeholder, but do not make the Browser Runtime click endpoint
+# parse a long comma selector as its primary action.
+ZHILIAN_SEARCH_INPUT_SELECTORS = (
+    "input.query-sug__input",
+    "input.search-wrapper__input",
+    'input[placeholder="输入职位、公司等搜索"]',
+    'input[placeholder="搜索职位、公司"]',
+    'input[placeholder*="职位、公司"]',
 )
+ZHILIAN_SEARCH_INPUT_SELECTOR = ", ".join(ZHILIAN_SEARCH_INPUT_SELECTORS)
 
 # ---------------------------------------------------------------------------
 # API-fetch 模式常量（参考 51job API-fetch，适配智联 fe-api.zhaopin.com）
@@ -77,6 +154,17 @@ ZHILIAN_SEARCH_INPUT_SELECTOR = (
 API_SEARCH_URL = "https://fe-api.zhaopin.com/c/i/sou"
 API_PAGE_SIZE = 20
 API_FETCH_TIMEOUT = 25.0
+
+JS_PROBE_SEARCH_TAB = """
+(() => {
+  const input = document.querySelector('input.query-sug__input, input.search-wrapper__input');
+  return JSON.stringify({
+    ok: Boolean(input),
+    url: window.location.href,
+    ready: document.readyState,
+  });
+})()
+"""
 
 API_RATE_MAX_PER_MIN = 30
 API_RATE_GAP_MIN = 2.0
@@ -141,7 +229,7 @@ def get_zhilian_city_code(city: str) -> str | None:
 
 JS_SUBMIT_SEARCH = """
 (() => {
-  const input = document.querySelector('input[placeholder="输入职位、公司等搜索"], input[placeholder*="职位、公司"]');
+  const input = document.querySelector('input.query-sug__input, input.search-wrapper__input, input[placeholder="输入职位、公司等搜索"], input[placeholder="搜索职位、公司"], input[placeholder*="职位、公司"]');
   if (!input) return JSON.stringify({ok: false, reason: 'search_input_missing'});
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
   if (setter) setter.call(input, __KEYWORD__);
@@ -149,7 +237,7 @@ JS_SUBMIT_SEARCH = """
   input.focus();
   input.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: __KEYWORD__}));
   input.dispatchEvent(new Event('change', {bubbles: true}));
-  const button = document.querySelector('.query-search__content-button, .query-sug__button, button[class*="query-search"]');
+  const button = document.querySelector('button.query-sug__button, .query-search__content-button, button[class*="query-search"], a.search-wrapper__button');
   if (button) {
     button.click();
     return JSON.stringify({ok: true, value: input.value, submitted_by: 'button'});
@@ -162,7 +250,7 @@ JS_SUBMIT_SEARCH = """
 
 JS_FOCUS_SEARCH_INPUT = """
 (() => {
-  const input = document.querySelector('input[placeholder="输入职位、公司等搜索"], input[placeholder*="职位、公司"]');
+  const input = document.querySelector('input.query-sug__input, input.search-wrapper__input, input[placeholder="输入职位、公司等搜索"], input[placeholder="搜索职位、公司"], input[placeholder*="职位、公司"]');
   if (!input) return JSON.stringify({ok: false, reason: 'search_input_missing'});
   input.focus();
   return JSON.stringify({ok: true, value: input.value || '', active: document.activeElement === input});
@@ -171,8 +259,8 @@ JS_FOCUS_SEARCH_INPUT = """
 
 JS_CLICK_SEARCH_BUTTON = """
 (() => {
-  const input = document.querySelector('input[placeholder="输入职位、公司等搜索"], input[placeholder*="职位、公司"]');
-  const button = document.querySelector('.query-search__content-button, .query-sug__button, button[class*="query-search"]');
+  const input = document.querySelector('input.query-sug__input, input.search-wrapper__input, input[placeholder="输入职位、公司等搜索"], input[placeholder="搜索职位、公司"], input[placeholder*="职位、公司"]');
+  const button = document.querySelector('button.query-sug__button, .query-search__content-button, button[class*="query-search"], a.search-wrapper__button');
   if (!button) return JSON.stringify({ok: false, reason: 'search_button_missing'});
   button.click();
   return JSON.stringify({ok: true, value: input ? input.value || '' : '', submitted_by: 'button'});
@@ -181,7 +269,7 @@ JS_CLICK_SEARCH_BUTTON = """
 
 JS_READ_SEARCH_STATE = """
 (() => {
-  const input = document.querySelector('input[placeholder="输入职位、公司等搜索"], input[placeholder*="职位、公司"]');
+  const input = document.querySelector('input.query-sug__input, input.search-wrapper__input, input[placeholder="输入职位、公司等搜索"], input[placeholder="搜索职位、公司"], input[placeholder*="职位、公司"]');
   const items = Array.from(document.querySelectorAll(
     'div.joblist-box__item, div.joblist-item, article.job-card, div.job-card'
   )).slice(0, 8);
@@ -216,13 +304,48 @@ JS_EXTRACT_LIST = """
 (() => {
   const text = document.body ? document.body.innerText : '';
   const expectedCity = "__EXPECTED_CITY__";
-  const searchInput = document.querySelector('input[placeholder="输入职位、公司等搜索"], input[placeholder*="职位、公司"]');
+  const searchInput = document.querySelector('input.query-sug__input, input.search-wrapper__input, input[placeholder="输入职位、公司等搜索"], input[placeholder="搜索职位、公司"], input[placeholder*="职位、公司"]');
   const blockedMatch = text.match(/验证码|滑块|访问频繁|频率限制|账号异常|拒绝访问/);
   const items = Array.from(document.querySelectorAll(
     'div.joblist-box__item, div.joblist-item, article.job-card, div.job-card'
   )).map((item, cardIndex) => {
     const first = (selectors) => selectors.map((s) => item.querySelector(s)).find(Boolean);
-    const title = first(['a.jobinfo__name', '.job-card__title-text', '.job-name', '.job-title']);
+    const clean = (value) => {
+      if (value === null || value === undefined) return '';
+      return String(value).replace(/\s+/g, ' ').trim();
+    };
+    const nested = (object, path) => {
+      try {
+        return path.reduce((current, key) => current == null ? undefined : current[key], object);
+      } catch (_) {
+        return undefined;
+      }
+    };
+    const firstValue = (...values) => values.map(clean).find(Boolean) || '';
+    // The current Zhilian SPA can leave visible card text empty while the
+    // Vue view-model still contains the authoritative job object.
+    let vueJob = {};
+    try {
+      const vm = item.__vue__ || item.__vueParentComponent || null;
+      const props = vm && (vm._props || vm.props || vm.$props || {});
+      vueJob = (props && (props.job || props.position || props.item)) || {};
+    } catch (_) {
+      vueJob = {};
+    }
+    const vueBase = nested(vueJob, ['jobDetailData', 'position', 'base'])
+      || nested(vueJob, ['position', 'base']) || {};
+    const vueDescription = nested(vueJob, ['jobDetailData', 'position', 'desc', 'description'])
+      || nested(vueJob, ['position', 'desc', 'description']) || '';
+    const vueStaff = vueJob.staffCard || nested(vueJob, ['staff', 'card']) || {};
+    const title = first([
+      'a.jobinfo__name',
+      '.job-card__title-clamp',
+      '.job-card__title-main',
+      '.job-card__title-text',
+      '.vue-clamp__text',
+      '.job-name',
+      '.job-title'
+    ]);
     const salary = first(['p.jobinfo__salary', '.job-card__salary', '.job-salary', '.salary']);
     const company = first(['.companyinfo__name', '.job-card__company-name', '.company-name', '.company']);
     const info = Array.from(item.querySelectorAll('.jobinfo__other-info-item')).map((node) => node.textContent.trim()).filter(Boolean);
@@ -238,19 +361,38 @@ JS_EXTRACT_LIST = """
       const detailPath = new URL(href, window.location.href).pathname;
       matchedId = detailPath.match(/\\/(?:jobdetail|job|position|detail)\\/([^/?]+?)(?:\\.html?)?$/i);
     } catch (_) {}
+    const sourceJobId = firstValue(
+      vueJob.number, vueJob.jobId, vueJob.positionId, vueBase.positionNumber,
+      item.getAttribute('data-positionid'), item.getAttribute('data-job-id'),
+      item.getAttribute('data-id'), title ? title.getAttribute('data-positionid') : '',
+      detailLink ? detailLink.getAttribute('data-positionid') : '', matchedId ? matchedId[1] : ''
+    );
+    const vueUrl = firstValue(
+      vueJob.positionURL, vueJob.positionUrl, vueBase.positionURL, vueBase.positionUrl
+    );
+    const resolvedTitle = firstValue(vueJob.name, vueJob.positionName, vueBase.positionName, title ? title.textContent : '');
+    const resolvedSalary = firstValue(vueJob.salary60, vueJob.salary, vueBase.salary, salary ? salary.textContent : '');
+    const resolvedCompany = firstValue(vueJob.companyName, vueJob.company, vueBase.companyName, company ? company.textContent : '');
+    const resolvedCity = firstValue(
+      info.find(value => expectedCity && value.includes(expectedCity)), vueJob.workCity,
+      vueJob.cityName, vueBase.workCity, vueBase.cityName,
+      cityNode ? cityNode.textContent : '', info[0], expectedCity
+    );
     return {
       card_index: item.matches('div.job-card') ? cardIndex : null,
-      source_job_id: item.getAttribute('data-positionid') || item.getAttribute('data-job-id') || item.getAttribute('data-id')
-        || (title ? title.getAttribute('data-positionid') : '') || (detailLink ? detailLink.getAttribute('data-positionid') : '')
-        || (matchedId ? matchedId[1] : ''),
-      title: title ? title.textContent.trim() : '',
-      salary: salary ? salary.textContent.trim() : '',
-      company: company ? company.textContent.trim() : '',
-      city,
-      url: href
+      source_job_id: sourceJobId,
+      title: resolvedTitle,
+      salary: resolvedSalary,
+      company: resolvedCompany,
+      city: resolvedCity,
+      url: vueUrl || href,
+      jd: firstValue(vueJob.jobDescription, vueJob.jobDesc, vueDescription),
+      hr_name: firstValue(vueStaff.staffName, vueStaff.name),
+      hr_title: firstValue(vueStaff.hrJob, vueStaff.title),
+      hr_id: firstValue(vueStaff.id)
     };
   });
-  const hasListRegion = Boolean(document.querySelector('.positionlist__list, [class*="positionlist"], .job-list-panel'));
+  const hasListRegion = Boolean(document.querySelector('.positionlist__list, [class*="positionlist"], .job-list-panel, .joblist-box, .job-list, [class*="job-list"]'));
   const strongLoginWallText = /登录查看更多|登录查看全部|立即登录/.test(text);
   const loginWallText = /请先登录|请登录|登录后(?:查看|继续|获取)|登录失效|账号登录|扫码登录/.test(text);
   const loginDialog = Boolean(document.querySelector('[role="dialog"], .login-dialog, [class*="login-modal"], [class*="login-dialog"]'));
@@ -845,7 +987,7 @@ class ZhilianCollector:
             focused = self._parse_payload(self.browser.evaluate(target_id, JS_FOCUS_SEARCH_INPUT))
             if focused.get("ok") is False:
                 raise CollectionError("selector_changed", "智联搜索框选择器未命中，可能是页面结构变化")
-            if not self.browser.click_action(target_id, ZHILIAN_SEARCH_INPUT_SELECTOR):
+            if not self._click_search_input(target_id):
                 raise CollectionError("selector_changed", "智联搜索框选择器未命中，可能是页面结构变化")
             # The city landing page normally starts with an empty search box.
             # Clear it first when the platform restores a previous query.
@@ -883,6 +1025,21 @@ class ZhilianCollector:
         if submit_payload.get("ok") and submit_payload.get("value") != keyword:
             raise CollectionError("search_not_applied", "智联搜索框未写入目标关键词")
         self._wait_for_search_results(target_id, keyword, before_state)
+
+    def _click_search_input(self, target_id: str) -> bool:
+        """Click the first selector supported by the current Zhilian DOM.
+
+        Browser Runtime's click endpoint accepts a single CSS selector. Trying
+        the stable class first avoids making the live path depend on parsing a
+        comma-separated selector string, while the legacy placeholders remain
+        available for older page versions and test fixtures.
+        """
+        if self.browser.click_action is None:
+            return False
+        for selector in ZHILIAN_SEARCH_INPUT_SELECTORS:
+            if self.browser.click_action(target_id, selector):
+                return True
+        return False
 
     @staticmethod
     def _parse_payload(value: Any) -> dict[str, Any]:
@@ -948,10 +1105,20 @@ class ZhilianCollector:
                 return
             url = str(last_state.get("url") or "")
             value = str(last_state.get("input") or "")
-            query_keyword = (parse_qs(urlparse(url).query).get("kw") or [""])[0]
-            keyword_route = bool(re.search(r"/kw[^/]+(?:/|$)", url, re.IGNORECASE)) or query_keyword == keyword
             refreshed = str(last_state.get("signature") or "") != old_signature
-            if value == keyword and keyword_route and refreshed:
+            query_keyword = (parse_qs(urlparse(url).query).get("kw") or [""])[0]
+            keyword_route = query_keyword == keyword or bool(
+                re.search(r"/kw[^/]+(?:/|$)", url, re.IGNORECASE)
+            )
+            # A reused tab may already be showing the requested search before
+            # the collector starts. In that case the platform can keep the
+            # same result signature after the button click, so the route's
+            # decoded ``kw`` parameter is the second valid proof that the
+            # keyword is applied. We still require the controlled input to
+            # contain the exact keyword, preventing stale unfiltered lists
+            # from being accepted merely because a URL happens to contain a
+            # similar token.
+            if value == keyword and (refreshed or keyword_route):
                 return
             time.sleep(0.5)
         if last_state and str(last_state.get("input") or "") != keyword:
@@ -967,6 +1134,91 @@ class ZhilianCollector:
         # 先打开城市搜索页，再通过搜索框提交关键词，避免猜测私有编码。
         return SEARCH_URL.format(city_code=quote(code))
 
+    @staticmethod
+    def _city_code_from_target_url(target_url: str) -> str:
+        """Return the public Zhilian search city code carried by a tab URL."""
+        try:
+            parsed = urlparse(str(target_url or ""))
+        except (TypeError, ValueError):
+            return ""
+        values = parse_qs(parsed.query).get("jl") or []
+        return str(values[0] or "").strip() if values else ""
+
+    def _find_city_search_tab(self, city_code: str) -> str | None:
+        """Find an already-open public search tab for exactly ``city_code``."""
+        wanted = str(city_code or "").strip()
+        if not wanted:
+            return None
+        candidates: list[str] = []
+        for target in self.browser.get_page_targets():
+            target_url = str(target.get("url") or "").strip()
+            parsed = urlparse(target_url)
+            if parsed.netloc.lower() != "www.zhaopin.com":
+                continue
+            target_key = platform_target_id(target)
+            if target_key and self._city_code_from_target_url(target_url) == wanted:
+                candidates.append(target_key)
+        # Do not trust URL presence alone: an old CDP target may still expose
+        # the matching URL while its execution context is already dead.
+        for target_key in candidates:
+            if self._has_live_search_dom(target_key):
+                return target_key
+        return None
+
+    def _has_live_search_dom(self, target_id: str) -> bool:
+        """Return whether a matching target still exposes a live search DOM."""
+        # Offline fakes intentionally exercise URL matching without a live
+        # Browser Runtime. Preserve that seam while validating real targets.
+        if self.browser.navigate_action is None:
+            return True
+        try:
+            raw = self._evaluate_with_timeout(target_id, JS_PROBE_SEARCH_TAB, 5)
+        except Exception:
+            return False
+        payload = self._parse_payload(raw)
+        return bool(payload.get("ok") and payload.get("url"))
+
+    def _ensure_dom_tab(
+        self,
+        request: PlatformCollectionRequest,
+        city: str,
+        search_url: str,
+    ) -> tuple[str, bool]:
+        """Reuse an exact-city search tab or create one when none is open."""
+        city_code = str(request.city_codes.get(city) or "").strip()
+        existing = self._find_city_search_tab(city_code)
+        if existing and self._has_live_search_dom(existing):
+            return existing, False
+
+        # Do not reuse a stale target whose URL remains visible in CDP but
+        # whose execution context no longer responds to DOM evaluation.
+
+        initial_url = "about:blank" if self.browser.navigate_action is not None else search_url
+        target_id = self.browser.new_tab(initial_url, background=True)
+        if not target_id:
+            raise CollectionError("browser_disconnected", "Unable to open Zhilian search page")
+        return str(target_id), True
+
+    def _has_complete_current_list(self, city: str, keyword: str) -> bool:
+        if self.browser.navigate_action is not None or self.safety_conn is not None:
+            return False
+        try:
+            raw = self.browser.evaluate(city, _build_list_script(city))
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(payload, list):
+                items = payload
+            elif isinstance(payload, dict):
+                items = next((value for value in payload.values() if isinstance(value, list)), [])
+            else:
+                return False
+            return any(
+                self._is_complete_list_candidate(self._candidate_from_list(item, city, keyword))
+                for item in items
+                if isinstance(item, dict)
+            )
+        except Exception:
+            return False
+
     # ------------------------------------------------------------------ API-fetch
     def _evaluate_with_timeout(self, target_id: str, js: str, timeout: float) -> Any:
         """evaluate 兼容包装：支持不接受 timeout 的旧 fake。"""
@@ -974,6 +1226,23 @@ class ZhilianCollector:
             return self.browser.evaluate(target_id, js, timeout=timeout)
         except TypeError:
             return self.browser.evaluate(target_id, js)
+
+    def _wait_for_search_page(self, target_id: str, timeout: float = 10.0) -> bool:
+        """Wait for a real Zhilian page and preserve a precise failure reason.
+
+        Offline browser fakes historically return ``None`` and do not accept
+        URL constraints.  The live runtime returns a boolean, so only the
+        live-browser path treats a false result as a disconnect/load failure.
+        """
+        try:
+            loaded = self.browser.wait_for_load(
+                target_id,
+                timeout=timeout,
+                expected_host="www.zhaopin.com",
+            )
+        except TypeError:
+            loaded = self.browser.wait_for_load(target_id, timeout=timeout)
+        return bool(loaded) if self.browser.navigate_action is not None else True
 
     def _ensure_host_tab(self, request: PlatformCollectionRequest) -> tuple[str, bool]:
         """找一个智联搜索页作为 fetch 宿主（与 fe-api.zhaopin.com 同域 cookie）。
@@ -985,23 +1254,20 @@ class ZhilianCollector:
         if request.cities:
             code = str(request.city_codes.get(request.cities[0]) or "").strip()
 
-        for t in self.browser.get_page_targets():
-            if "zhaopin.com" in str(t.get("url", "")):
-                candidate_target = t.get("targetId")
-                if not candidate_target:
-                    continue
-                try:
-                    alive_js = (
-                        JS_FETCH_API_PAGE
-                        .replace("__KW__", quote(keyword))
-                        .replace("__CITY_ID__", code or "530")
-                        .replace("__START__", "0")
-                    )
-                    alive = self._evaluate_with_timeout(candidate_target, alive_js, 8)
-                    if alive and "error" not in str(alive):
-                        return str(candidate_target), False
-                except Exception:
-                    continue
+        candidate_target = self._find_city_search_tab(code)
+        if candidate_target:
+            try:
+                alive_js = (
+                    JS_FETCH_API_PAGE
+                    .replace("__KW__", quote(keyword))
+                    .replace("__CITY_ID__", code or "530")
+                    .replace("__START__", "0")
+                )
+                alive = self._evaluate_with_timeout(candidate_target, alive_js, 8)
+                if alive and "error" not in str(alive):
+                    return str(candidate_target), False
+            except Exception:
+                pass
 
         tmp_url = SEARCH_URL.format(city_code=quote(code or "530"))
         host_target = self.browser.new_tab(tmp_url, background=False)
@@ -1287,38 +1553,85 @@ class ZhilianCollector:
                                    message=f"智联 {keyword} 页级断点已超最大页（{saved_page}/{request.max_pages}），视为已采完，跳过")
                     continue
                 target_id: str | None = None
+                owns_target = False
                 try:
                     try:
                         search_url = self.build_search_url(request, city, keyword, 1)
                     except CollectionError as exc:
                         return PlatformCollectionResult(self.platform, "failed", exc.code, exc.message)
-                    initial_url = "about:blank" if self.browser.navigate_action is not None else search_url
-                    target_id = self.browser.new_tab(initial_url, background=True)
+                    if self._has_complete_current_list(city, keyword):
+                        target_id, owns_target = city, False
+                    else:
+                        target_id, owns_target = self._ensure_dom_tab(request, city, search_url)
+                    hooks.on_event(
+                        phase="reuse_search_tab" if not owns_target else "open_search_tab",
+                        keyword=keyword,
+                        city=city,
+                        message=("reused existing same-city Zhilian search tab" if not owns_target else "opened a new Zhilian search tab"),
+                    )
                     if not target_id:
                         return PlatformCollectionResult(self.platform, "failed", "browser_disconnected", "无法打开智联搜索页")
-                    if self.browser.navigate_action is not None and not self.browser.navigate_action(target_id, search_url):
+                    if owns_target and self.browser.navigate_action is not None and not self.browser.navigate_action(target_id, search_url):
                         return PlatformCollectionResult(self.platform, "failed", "browser_disconnected", "智联搜索页导航失败")
                     for page in range(start_page, request.max_pages + 1):
                         if hooks.stop_event is not None and hooks.stop_event.is_set():
                             return PlatformCollectionResult(self.platform, "stopped", "user_stopped", "用户已停止")
                         hooks.on_event(phase="loading_list", keyword=keyword, city=city, page=page)
                         try:
-                            self.browser.wait_for_load(target_id, timeout=10)
+                            if not self._wait_for_search_page(target_id):
+                                return PlatformCollectionResult(
+                                    self.platform,
+                                    "failed",
+                                    "browser_disconnected",
+                                    "智联搜索页面未在限定时间内完成加载",
+                                )
                             if page == start_page:
                                 self._submit_keyword(target_id, keyword)
                                 if start_page > 1:
                                     self.browser.evaluate(target_id, _build_page_script(page))
                             else:
                                 self.browser.evaluate(target_id, _build_page_script(page))
-                            self.browser.wait_for_load(target_id, timeout=10)
+                            if not self._wait_for_search_page(target_id):
+                                return PlatformCollectionResult(
+                                    self.platform,
+                                    "failed",
+                                    "browser_disconnected",
+                                    "智联搜索结果页面未在限定时间内完成加载",
+                                )
                         except CollectionError as exc:
+                            hooks.on_event(
+                                phase="search_failed",
+                                keyword=keyword,
+                                city=city,
+                                page=page,
+                                message=f"智联搜索阶段失败：{exc.code}；{exc.message}",
+                            )
                             return PlatformCollectionResult(self.platform, "blocked", exc.code, exc.message)
-                        except Exception:
-                            return PlatformCollectionResult(self.platform, "blocked", "selector_changed", "智联搜索页未能正常加载")
+                        except Exception as exc:
+                            message = f"智联搜索页未能正常加载：{type(exc).__name__}"
+                            hooks.on_event(
+                                phase="search_failed",
+                                keyword=keyword,
+                                city=city,
+                                page=page,
+                                message=message,
+                            )
+                            return PlatformCollectionResult(self.platform, "blocked", "selector_changed", message)
                         try:
                             self.browser.scroll(target_id, y=2600)
-                            raw = self.browser.evaluate(target_id, _build_list_script(city))
-                            payload = json.loads(raw) if isinstance(raw, str) else raw
+                            def read_list_payload() -> Any:
+                                raw = self.browser.evaluate(target_id, _build_list_script(city))
+                                return json.loads(raw) if isinstance(raw, str) else raw
+
+                            payload = _wait_for_rendered_list(
+                                read_list_payload,
+                                stop_event=hooks.stop_event,
+                                sleep=self.sleep,
+                            )
+                            if payload is None and hooks.stop_event is not None and hooks.stop_event.is_set():
+                                return PlatformCollectionResult(
+                                    self.platform, "stopped", "user_stopped", "User stopped"
+                                )
                             if isinstance(payload, list):
                                 items = payload
                                 status = "ready" if items else "empty"
@@ -1347,6 +1660,22 @@ class ZhilianCollector:
                         for raw_item in items:
                             card_index = raw_item.get("card_index") if isinstance(raw_item, dict) else None
                             if card_index is not None:
+                                # The live list extractor can expose a complete job
+                                # payload (including JD) even when the split-panel
+                                # DOM has changed. Prefer that trusted payload so a
+                                # selector change in the optional detail panel does
+                                # not discard an otherwise usable job.
+                                list_candidate = self._candidate_from_list(raw_item, city, keyword)
+                                if self._is_complete_list_candidate(list_candidate):
+                                    if not self._passes_filters(list_candidate):
+                                        continue
+                                    if not hooks.on_list_candidate(list_candidate):
+                                        continue
+                                    if not hooks.on_candidate(list_candidate):
+                                        return PlatformCollectionResult(
+                                            self.platform, "completed", "callback_stopped", "收集回调已停止"
+                                        )
+                                    continue
                                 if detail_requests:
                                     delay = max(0.0, self.uniform(*self.delay_range))
                                     hooks.on_event(
@@ -1460,7 +1789,7 @@ class ZhilianCollector:
                         if self.safety_conn is not None:
                             upsert_page_progress(self.safety_conn, "zhilian", city, keyword, page)
                 finally:
-                    if target_id:
+                    if target_id and owns_target:
                         self.browser.close_tab(target_id)
                 # 词结束：标记词级断点 + 清页级断点
                 if self.safety_conn is not None:
@@ -1485,7 +1814,23 @@ class ZhilianCollector:
         return JobCandidate(
             platform="zhilian", source_job_id=source_id, title=title, company=company,
             salary=str(raw.get("salary") or "").strip(), city=str(raw.get("city") or city).strip(),
+            experience=str(raw.get("experience") or "").strip(),
+            education=str(raw.get("education") or "").strip(),
+            jd=str(raw.get("jd") or "").strip(),
+            hr_name=str(raw.get("hr_name") or "").strip(),
+            hr_title=str(raw.get("hr_title") or "").strip(),
             url=url, source_keyword=keyword,
+        )
+
+    @staticmethod
+    def _is_complete_list_candidate(candidate: JobCandidate | None) -> bool:
+        """Return whether list data is sufficient without opening a detail panel."""
+        return bool(
+            candidate
+            and candidate.title
+            and candidate.company
+            and candidate.url
+            and candidate.jd
         )
 
     @staticmethod

@@ -94,6 +94,7 @@ class CollectionOrchestratorTests(TestCase):
         for text in ("新增 0 条", "读取 2 条", "重复 1 条", "过滤 1 条"):
             self.assertIn(text, state["message"])
         self.assertEqual(result["collected_job_ids"], [])
+        self.assertEqual(result["matched_job_ids"], ["duplicate"])
 
     def test_boss_summary_preserves_empty_search_reason(self):
         collector = _BlockedCollector("boss", [], "no_jobs_extracted")
@@ -474,6 +475,25 @@ class SharedProcessorTests(TestCase):
             result = CollectionOrchestrator({}, db_path=db_path, registry=registry).run(_options())
             self.assertEqual(result["platforms"]["boss"]["duplicate"], 1)
             self.assertEqual(result["platforms"]["boss"]["new"], 0)
+
+    def test_duplicate_detail_enriches_missing_hr_metadata(self):
+        events = []
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "test.db"
+            db = get_db(db_path)
+            original = _candidate("boss", "dup").as_job_record()
+            insert_job(db, original)
+            db.close()
+            enriched = _candidate("boss", "dup")
+            enriched.hr_name = "张先生"
+            enriched.hr_title = "CEO"
+            registry = CollectorRegistry({"boss": lambda: _FakeCollector("boss", events, [enriched])})
+            result = CollectionOrchestrator({}, db_path=db_path, registry=registry).run(_options())
+            db = get_db(db_path)
+            row = db.execute("SELECT hr_name, hr_title FROM jobs WHERE id = ?", (enriched.storage_id,)).fetchone()
+            db.close()
+            self.assertEqual(result["platforms"]["boss"]["duplicate"], 1)
+            self.assertEqual(dict(row), {"hr_name": "张先生", "hr_title": "CEO"})
 
     def test_inspect_filters_deal_breaker_in_title(self):
         events = []

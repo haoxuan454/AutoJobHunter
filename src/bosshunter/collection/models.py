@@ -134,3 +134,6 @@ class PlatformCollectionResult:
     new_job_ids: list[str] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
     error: str = ""
+    # Search hits for this run, including jobs already stored in SQLite.
+    # Kept at the end so existing positional constructors remain compatible.
+    matched_job_ids: list[str] = field(default_factory=list)
