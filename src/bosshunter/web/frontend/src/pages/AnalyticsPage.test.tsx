@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import AnalyticsPage from './AnalyticsPage'
 
 const sampleAnalytics = {
@@ -14,6 +14,10 @@ const sampleAnalytics = {
   job_directions: [
     { label: 'Python 后端工程师', conversations: 2, replied_conversations: 1, hr_messages: 2, reply_rate: 50 },
     { label: 'Java 平台研发工程师', conversations: 1, replied_conversations: 0, hr_messages: 0, reply_rate: 0 },
+  ],
+  job_direction_activity: [
+    { label: 'Python 后端工程师', conversations: 2, replied_conversations: 1, hr_messages: 2, message_count: 5, reply_rate: 50 },
+    { label: 'Java 平台研发工程师', conversations: 1, replied_conversations: 0, hr_messages: 0, message_count: 1, reply_rate: 0 },
   ],
   platform_metrics: [{ platform: 'zhilian', conversations: 2, replied_conversations: 1, reply_rate: 50 }],
   hr_question_keywords: [
@@ -52,5 +56,41 @@ describe('AnalyticsPage', () => {
     expect(screen.getByText('等待 HR 回复')).toBeTruthy()
     expect(screen.getByText('我方消息')).toBeTruthy()
     expect(screen.getByText(/按相同原文出现次数从高到低排列/)).toBeTruthy()
+  })
+
+  it('refreshes a bounded top-50 scrollable legend without exposing unescaped names', async () => {
+    const rows = Array.from({ length: 70 }, (_, index) => ({
+      label: `岗位方向-${String(index).padStart(2, '0')}-这是很长的完整岗位名称`,
+      conversations: 1, replied_conversations: 1, hr_messages: index + 1, message_count: index + 1, reply_rate: 100,
+    }))
+    rows[69].label = '<img src=x onerror=alert(1)> 最高频岗位'
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(sampleAnalytics)))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...sampleAnalytics, job_direction_activity: rows }))))
+    render(<AnalyticsPage />)
+    expect(await screen.findByText('岗位方向会话分布')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '刷新真实数据' }))
+    expect(await screen.findByText(/当前 50 项/)).toBeTruthy()
+    const legend = screen.getByRole('list', { name: '岗位方向图例' })
+    const entries = within(legend).getAllByRole('listitem')
+    expect(entries).toHaveLength(50)
+    expect(entries[0].getAttribute('title')).toContain(rows[69].label)
+    expect(entries[49].getAttribute('title')).toContain(rows[20].label)
+    expect(legend.className).toContain('overflow-y-auto')
+    expect(legend.className).toContain('sm:h-80')
+    expect(legend.querySelector('img')).toBeNull()
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps the pie visible when paired with an older analytics API payload', async () => {
+    const legacyPayload = { ...sampleAnalytics }
+    delete (legacyPayload as Partial<typeof sampleAnalytics>).job_direction_activity
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(legacyPayload))))
+
+    render(<AnalyticsPage />)
+
+    expect(await screen.findByText(/兼容旧版接口：按 HR 消息数排序/)).toBeTruthy()
+    expect(screen.getByTestId('job-direction-pie')).toBeTruthy()
+    expect(screen.getByRole('list', { name: '岗位方向图例' })).toBeTruthy()
   })
 })

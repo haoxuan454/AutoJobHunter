@@ -12,6 +12,7 @@ from typing import Any, Callable
 from urllib.parse import quote, urlencode
 
 from bosshunter.ai.prefilter import quick_score
+from bosshunter.boss_urls import resolve_boss_job_url
 from bosshunter.browser import close_tab, evaluate, navigate, new_tab, scroll, wait_for_load
 from bosshunter.collection.base import CollectorHooks
 from bosshunter.collection.models import JobCandidate, PlatformCollectionRequest, PlatformCollectionResult
@@ -672,7 +673,7 @@ class BossCollector:
                             continue
                         if throttle.wait(hooks.stop_event):
                             return PlatformCollectionResult(self.platform, "stopped", "user_stopped", "用户已停止")
-                        detail_url = f"https://www.zhipin.com{candidate.url}"
+                        detail_url = candidate.url
                         try:
                             if guard is not None: guard.reserve("detail_page", daily_limit=detail_limit)
                         except PlatformSafetyStop as exc:
@@ -750,7 +751,7 @@ class BossCollector:
         if not isinstance(raw, dict):
             return None
         raw = _decode_fields(raw)
-        url = str(raw.get("url") or "").strip()
+        url = resolve_boss_job_url(raw.get("url"))
         if not url:
             return None
         return JobCandidate(

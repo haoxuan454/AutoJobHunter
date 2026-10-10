@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Bar, BarChart, CartesianGrid, Cell, Legend, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+import { Bar, BarChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { CircleHelp } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { JobDirectionPie } from '@/components/analytics/JobDirectionPie'
+import type { JobDirectionActivity } from '@/lib/jobDirectionActivity'
 
 type Count = { status?: string; platform?: string; sender_type?: string; count: number }
 type DailyTrend = { day: string; deliveries: number; replied_conversations: number; outgoing_messages: number; incoming_messages: number }
@@ -18,6 +20,7 @@ type Analytics = {
   by_platform: Count[]
   daily_trend: DailyTrend[]
   job_directions: JobDirection[]
+  job_direction_activity?: JobDirectionActivity[]
   platform_metrics: PlatformMetric[]
   hr_question_keywords: Keyword[]
 }
@@ -29,7 +32,6 @@ const STATUS_NAMES: Record<string, string> = {
   replied: 'HR 已回复', closed: '已关闭', failed: '失败',
 }
 const ROLE_NAMES: Record<string, string> = { user: '我方消息', hr: 'HR 消息', ai: 'AI 草稿', system: '平台/系统提示', unknown: '发送方未识别' }
-const COLORS = ['#f97316', '#2563eb', '#10b981', '#64748b', '#8b5cf6', '#ec4899']
 const labelForPlatform = (value: string) => PLATFORM_NAMES[value] || value || '未知平台'
 
 export default function AnalyticsPage() {
@@ -87,8 +89,14 @@ export default function AnalyticsPage() {
       </div>
 
       <div className="grid gap-4 xl:grid-cols-2">
-        <ChartCard title="岗位方向会话分布" help="扇区大小和标注百分比表示各岗位方向在全部已关联会话中的占比，不是 HR 回复率。悬停可查看完整岗位名称、会话数和该方向的 HR 回复率；样本少时比例仅供参考。">
-          {directionChart.length ? <ResponsiveContainer width="100%" height={320}><PieChart><Pie data={directionChart} dataKey="conversations" nameKey="name" cx="42%" cy="50%" outerRadius={105} labelLine={false} label={({ percent }) => `${Math.round((percent || 0) * 100)}%`}>{directionChart.map((entry, index) => <Cell key={`${entry.name}-${index}`} fill={COLORS[index % COLORS.length]} />)}</Pie><Tooltip formatter={(value: number, _name: string, item: any) => [`${value} 个会话 · HR 回复率 ${item.payload.reply_rate}%`, item.payload.name]} /><Legend layout="vertical" verticalAlign="middle" align="right" width={190} formatter={(value: string) => value.length > 14 ? `${value.slice(0, 14)}…` : value} /></PieChart></ResponsiveContainer> : <Empty />}
+        <ChartCard title="岗位方向会话分布" help="按双方有效消息总数选出聊天最频繁的前 50 个岗位方向，不计平台提示、草稿或空消息。扇区和图例百分比是这 50 项中的会话占比，不是全部岗位占比或 HR 回复率。图例可滚动，悬停扇区可查看完整岗位名和真实消息数。旧版后端暂按 HR 消息数展示最多 30 项，更新后自动恢复前 50 项统计。">
+          <JobDirectionPie
+            rows={data.job_direction_activity ?? data.job_directions.map(row => ({
+              ...row,
+              message_count: row.hr_messages,
+            }))}
+            legacyFallback={data.job_direction_activity === undefined}
+          />
         </ChartCard>
         <ChartCard title="岗位方向回复率排行" help="将同类数据改为可比较的岗位方向回复率排行；每条显示会话样本和回复率。它回答的是‘哪些岗位方向目前更常收到 HR 回复’，不是 AI 评分效果，也不代表未来保证。">
           {directionChart.length ? <ResponsiveContainer width="100%" height={320}><BarChart data={[...directionChart].sort((a, b) => b.reply_rate - a.reply_rate || b.conversations - a.conversations).slice(0, 10)} layout="vertical" margin={{ left: 12, right: 20 }}><CartesianGrid strokeDasharray="3 3" /><XAxis type="number" domain={[0, 100]} unit="%" /><YAxis type="category" dataKey="name" width={130} tickFormatter={value => String(value).length > 10 ? `${String(value).slice(0, 10)}…` : value} /><Tooltip formatter={(value: number, _name: string, item: any) => [`${value}% · ${item.payload.replied_conversations}/${item.payload.conversations} 个会话`, item.payload.name]} /><Bar dataKey="reply_rate" name="HR 回复率" fill="#10b981" radius={[0, 6, 6, 0]} /></BarChart></ResponsiveContainer> : <Empty />}
@@ -105,7 +113,7 @@ export default function AnalyticsPage() {
 }
 
 function ChartCard({ title, help, children }: { title: string; help: string; children: React.ReactNode }) {
-  return <Card><CardHeader><div className="flex items-center gap-2"><CardTitle>{title}</CardTitle><span className="group relative inline-flex" tabIndex={0}><CircleHelp className="h-4 w-4 cursor-help text-muted" aria-label={`${title}分析说明`} /><span role="tooltip" className="pointer-events-none absolute left-0 top-6 z-20 hidden w-72 rounded-xl border border-card-border bg-white p-3 text-xs font-normal leading-5 text-slate-700 shadow-xl group-hover:block group-focus-within:block">{help}</span></span></div></CardHeader><CardContent>{children}</CardContent></Card>
+  return <Card className="min-w-0"><CardHeader><div className="flex items-center gap-2"><CardTitle>{title}</CardTitle><span className="group relative inline-flex" tabIndex={0}><CircleHelp className="h-4 w-4 cursor-help text-muted" aria-label={`${title}分析说明`} /><span role="tooltip" className="pointer-events-none absolute left-0 top-6 z-20 hidden w-72 rounded-xl border border-card-border bg-white p-3 text-xs font-normal leading-5 text-slate-700 shadow-xl group-hover:block group-focus-within:block">{help}</span></span></div></CardHeader><CardContent>{children}</CardContent></Card>
 }
 
 function Empty() {

@@ -1,4 +1,5 @@
 import { Search, Bot, MessageSquare, CheckCircle, Send, Eye } from 'lucide-react'
+import { APP_NAME } from '@/lib/branding'
 
 const steps = [
   { icon: Search, label: '采集', desc: '搜索岗位' },
@@ -12,7 +13,7 @@ const steps = [
 export function PipelineFlow() {
   return (
     <div className="rounded-2xl border border-card-border bg-[#FFFCFA] p-6">
-      <h3 className="text-sm font-black text-foreground mb-4">BossHunter 自动求职流程</h3>
+      <h3 className="text-sm font-black text-foreground mb-4">{APP_NAME} 自动求职流程</h3>
       <div className="grid grid-cols-3 gap-x-3 gap-y-5 lg:grid-cols-6">
         {steps.map((step, i) => (
           <div key={step.label} className="relative min-w-0">

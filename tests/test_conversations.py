@@ -96,6 +96,28 @@ class ConversationRepositoryTests(unittest.TestCase):
         self.assertEqual(conversation["unread_count"], 0)
         self.assertEqual(conversation["has_unread"], 0)
 
+    def test_recent_sort_uses_absolute_message_time_across_offsets_not_ingestion_order(self):
+        self.repo.upsert_conversation({"id": "conv-2", "platform": "zhilian", "job_id": "job-2"})
+        self.repo.append_messages("conv-1", [IncomingMessage("hr", "最近消息", "2026-10-10T12:00:00+08:00", "latest")])
+        self.repo.append_messages("conv-2", [IncomingMessage("hr", "较早消息晚同步", "2026-10-10T03:00:00+00:00", "older")])
+        self.repo.mark_sync_success("conv-2", "2099-01-01T00:00:00+00:00")
+        self.assertEqual([item["id"] for item in self.repo.list_conversations()], ["conv-1", "conv-2"])
+
+    def test_backfilling_old_messages_preserves_latest_chat_preview_and_position(self):
+        self.repo.upsert_conversation({"id": "conv-2", "platform": "zhilian", "job_id": "job-2"})
+        self.repo.append_messages("conv-1", [IncomingMessage("hr", "最近消息", "2026-10-10T12:00:00+08:00", "latest")])
+        self.repo.append_messages("conv-2", [IncomingMessage("hr", "较早", "2026-10-10T11:00:00+08:00", "older")])
+        self.repo.append_messages("conv-1", [IncomingMessage("hr", "补历史", "2026-10-09T11:00:00+08:00", "history")])
+        listed = self.repo.list_conversations()
+        self.assertEqual([item["id"] for item in listed], ["conv-1", "conv-2"])
+        self.assertEqual(listed[0]["last_message_preview"], "最近消息")
+
+    def test_frequency_orders_the_whole_list_before_recency_tiebreak(self):
+        self.repo.upsert_conversation({"id": "conv-2", "platform": "zhilian", "job_id": "job-2"})
+        self.repo.append_messages("conv-1", [IncomingMessage("hr", "最近", "2026-10-10T12:00:00+08:00", "latest")])
+        self.repo.append_messages("conv-2", [IncomingMessage("hr", "历史一", "2026-10-09T12:00:00+08:00", "old-1"), IncomingMessage("hr", "历史二", "2026-10-09T12:01:00+08:00", "old-2")])
+        self.assertEqual([item["id"] for item in self.repo.list_conversations(sort="frequency")], ["conv-2", "conv-1"])
+
     def test_empty_hr_message_is_rejected_without_setting_unread(self):
         with self.assertRaises(ValueError):
             self.repo.append_messages("conv-1", [IncomingMessage("hr", "   ", platform_message_id="empty-1")])

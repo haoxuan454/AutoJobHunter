@@ -397,6 +397,7 @@ class BossCollectorCollectionTests(TestCase):
         self.assertEqual(candidate.title, "Python 开发")
         self.assertEqual(candidate.company, "测试公司")
         self.assertEqual(candidate.source_job_id, "xyz789")
+        self.assertEqual(candidate.url, "https://www.zhipin.com/job_detail/xyz789.html")
         self.assertEqual(candidate.city, "北京")
 
     def test_list_candidate_rejects_missing_url(self):

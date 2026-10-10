@@ -307,7 +307,8 @@ class _SharedProcessor:
             self.progress.filtered += 1
             self.event(message="公司命中过滤规则")
             return False
-        self.matched_job_ids.append(candidate.storage_id)
+        # A list candidate is not yet a persisted job. Platform prefilters or
+        # detail-page parsing may discard it before save() is called.
         self.event()
         return True
 
@@ -333,6 +334,7 @@ class _SharedProcessor:
             self.new_job_ids.append(candidate.storage_id)
         else:
             self.progress.duplicate += 1
+        self.matched_job_ids.append(candidate.storage_id)
         self.event(phase="saving")
         if self.stop_event is not None and self.stop_event.is_set():
             return False

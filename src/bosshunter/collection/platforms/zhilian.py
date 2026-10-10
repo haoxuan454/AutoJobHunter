@@ -393,10 +393,26 @@ JS_EXTRACT_LIST = """
     };
   });
   const hasListRegion = Boolean(document.querySelector('.positionlist__list, [class*="positionlist"], .job-list-panel, .joblist-box, .job-list, [class*="job-list"]'));
-  const strongLoginWallText = /登录查看更多|登录查看全部|立即登录/.test(text);
   const loginWallText = /请先登录|请登录|登录后(?:查看|继续|获取)|登录失效|账号登录|扫码登录/.test(text);
-  const loginDialog = Boolean(document.querySelector('[role="dialog"], .login-dialog, [class*="login-modal"], [class*="login-dialog"]'));
-  const loginRequired = strongLoginWallText || (loginWallText && (!searchInput || loginDialog || !items.length));
+  const visible = (node) => {
+    if (!node) return false;
+    const rect = node.getBoundingClientRect();
+    const style = window.getComputedStyle(node);
+    return rect.width > 0 && rect.height > 0
+      && style.display !== 'none'
+      && style.visibility !== 'hidden'
+      && style.opacity !== '0';
+  };
+  const loggedInMarker = /退出登录|我的消息|消息\s*\d+|个人中心|编辑期望/.test(text);
+  const loginDialog = Array.from(document.querySelectorAll(
+    '[role="dialog"], .login-dialog, [class*="login-modal"], [class*="login-dialog"]'
+  )).some((node) => visible(node) && /请先登录|请登录|账号登录|扫码登录|立即登录|验证码登录|登录注册|登录\/注册|手机号/.test(node.textContent || ''));
+  const visibleLoginControl = Array.from(document.querySelectorAll('button, a, [role="button"]'))
+    .some((node) => visible(node) && /登录查看更多|登录查看全部|立即登录|请先登录|扫码登录/.test(node.textContent || ''));
+  const loginPath = /(?:^|\/)(?:passport|login)(?:\/|$)/i.test(window.location.pathname);
+  const loginRequired = loginDialog || (!loggedInMarker && (
+    visibleLoginControl || (!searchInput && !items.length && loginWallText) || loginPath
+  ));
   const status = blockedMatch ? 'blocked' : loginRequired ? 'login_required' : items.length ? 'ready' : hasListRegion ? 'empty' : 'selector_changed';
   return JSON.stringify({status, blocked_code: blockedMatch ? blockedMatch[0] : '', items, has_search_input: Boolean(searchInput)});
 })()
@@ -423,7 +439,15 @@ JS_EXTRACT_DETAIL = """
   const loginPage = /(?:^|\\/)(?:passport|login)(?:\\/|$)/i.test(window.location.pathname);
   const loginDialog = Array.from(document.querySelectorAll(
     '[role="dialog"], .login-dialog, [class*="login-modal"], [class*="login-dialog"]'
-  )).some((node) => loginTextPattern.test(node.textContent || ''));
+  )).some((node) => {
+    const rect = node.getBoundingClientRect();
+    const style = window.getComputedStyle(node);
+    return rect.width > 0 && rect.height > 0
+      && style.display !== 'none'
+      && style.visibility !== 'hidden'
+      && style.opacity !== '0'
+      && loginTextPattern.test(node.textContent || '');
+  });
   const loginRequired = loginPage || loginDialog || (
     loginTextPattern.test(pageText) && !title && !company && !jdText
   );

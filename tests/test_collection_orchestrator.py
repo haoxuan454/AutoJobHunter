@@ -464,6 +464,24 @@ class NormalizeCollectionOptionsTests(TestCase):
 class SharedProcessorTests(TestCase):
     """_SharedProcessor inspect/save 逻辑。"""
 
+    def test_platform_prefilter_never_leaks_unsaved_candidate_into_scoring_scope(self):
+        class PrefilteringCollector:
+            def collect(self, request, hooks):
+                discarded = _candidate("boss", "discarded")
+                assert hooks.on_list_candidate(discarded)
+                hooks.on_event(message="匿名公司岗位", increment_filtered=True)
+                saved = _candidate("boss", "saved")
+                assert hooks.on_list_candidate(saved)
+                hooks.on_candidate(saved)
+                return PlatformCollectionResult("boss", "completed", "search_exhausted", "完成")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = CollectorRegistry({"boss": PrefilteringCollector})
+            result = CollectionOrchestrator({}, db_path=Path(tmp) / "test.db", registry=registry).run(_options())
+            self.assertEqual(result["matched_job_ids"], ["saved"])
+            self.assertEqual(result["collected_job_ids"], ["saved"])
+            self.assertEqual(result["platforms"]["boss"]["filtered"], 1)
+
     def test_inspect_deduplicates_existing_job(self):
         events = []
         with tempfile.TemporaryDirectory() as tmp:

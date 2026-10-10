@@ -85,19 +85,27 @@ def build_conversation_analytics(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'"
     ).fetchone() is not None
     if has_jobs:
-        job_directions = _rows(conn, f"""SELECT
+        direction_query = f"""SELECT
             COALESCE(NULLIF(TRIM(j.title), ''), '未关联岗位') AS label,
             COUNT(DISTINCT c.id) AS conversations,
             COUNT(DISTINCT CASE WHEN m.sender_type = 'hr' THEN c.id END) AS replied_conversations,
             COUNT(CASE WHEN m.sender_type = 'hr' THEN 1 END) AS hr_messages,
+            COUNT(CASE WHEN m.sender_type IN ('hr', 'user')
+                AND TRIM(COALESCE(m.content, '')) <> '' THEN 1 END) AS message_count,
             ROUND(100.0 * COUNT(DISTINCT CASE WHEN m.sender_type = 'hr' THEN c.id END)
                 / NULLIF(COUNT(DISTINCT c.id), 0), 1) AS reply_rate
             FROM conv_conversations c LEFT JOIN jobs j ON j.id = c.job_id
             LEFT JOIN conv_messages m ON m.conversation_id = c.id
             WHERE {VISIBLE}
-            GROUP BY label ORDER BY reply_rate DESC, conversations DESC, label LIMIT 30""", parameters)
+            GROUP BY label"""
+        job_directions = _rows(conn, direction_query +
+            " ORDER BY reply_rate DESC, conversations DESC, label LIMIT 30", parameters)
+        job_direction_activity = _rows(conn, direction_query +
+            " HAVING message_count > 0 ORDER BY message_count DESC, hr_messages DESC,"
+            " conversations DESC, label LIMIT 50", parameters)
     else:
         job_directions = []
+        job_direction_activity = []
 
     hr_question_keywords = _rows(conn, f"""SELECT m.content, COUNT(*) AS count
         FROM conv_messages m JOIN conv_conversations c ON c.id = m.conversation_id
@@ -133,5 +141,6 @@ def build_conversation_analytics(
         "platform_metrics": platform_metrics,
         "daily_trend": daily_trend,
         "job_directions": job_directions,
+        "job_direction_activity": job_direction_activity,
         "hr_question_keywords": hr_question_keywords,
     }

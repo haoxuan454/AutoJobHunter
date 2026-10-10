@@ -20,6 +20,7 @@ from bosshunter.browser import (
     wait_for_load,
 )
 from bosshunter.browser.platform_targets import target_belongs_to_platform
+from bosshunter.boss_urls import resolve_boss_job_url
 from bosshunter.db import (
     get_db, get_jobs_ready_to_send, update_job_status, update_job_last_error,
     add_history, add_risk_event, count_daily_delivery_usage, set_platform_safety_lock,
@@ -967,6 +968,15 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
             "message_id": result.message_id,
         }, result.target_id
 
+    job_url = resolve_boss_job_url(job.get("url"))
+    if not job_url:
+        return {
+            "success": False,
+            "error": "invalid_job_url",
+            "history_detail": "BOSS 岗位地址无效，未打开页面或发送消息",
+            "skip_backoff": True,
+        }, None
+    job = {**job, "url": job_url}
     stop_event = throttle_config.get("_workbench_stop_event")
     existing_target_ids = {
         str(target.get("targetId") or "")

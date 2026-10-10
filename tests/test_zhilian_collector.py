@@ -197,6 +197,18 @@ class ZhilianFixtureTests(TestCase):
         self.assertIn("loginDialog", JS_EXTRACT_DETAIL)
         self.assertIn("loginPage", JS_EXTRACT_DETAIL)
 
+    def test_live_list_script_uses_visible_login_wall_evidence(self):
+        self.assertIn("getBoundingClientRect", JS_EXTRACT_LIST)
+        self.assertIn("window.getComputedStyle", JS_EXTRACT_LIST)
+        self.assertIn("loggedInMarker", JS_EXTRACT_LIST)
+        self.assertIn("visibleLoginControl", JS_EXTRACT_LIST)
+        self.assertIn("loginDialog", JS_EXTRACT_LIST)
+        self.assertIn("loginRequired", JS_EXTRACT_LIST)
+
+    def test_live_detail_script_ignores_hidden_login_dialogs(self):
+        self.assertIn("getBoundingClientRect", JS_EXTRACT_DETAIL)
+        self.assertIn("window.getComputedStyle", JS_EXTRACT_DETAIL)
+
     def test_source_job_id_ignores_detail_query_parameters(self):
         self.assertEqual(
             _source_job_id(

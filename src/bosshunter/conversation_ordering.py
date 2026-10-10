@@ -60,3 +60,19 @@ def message_order_key(row: Mapping[str, Any]) -> tuple[int, int, float, str, int
 def latest_message(rows: list[Mapping[str, Any]]) -> Mapping[str, Any] | None:
     return max(rows, key=message_order_key, default=None)
 
+
+def conversation_activity_key(
+    conversation: Mapping[str, Any], latest: Mapping[str, Any] | None,
+) -> tuple[float, int, str]:
+    """Sort all cards by actual latest chat time, never by synchronization time.
+
+    Without an absolute platform timestamp, the message's first local arrival
+    is the best available evidence. Backfilled older messages must not outrank
+    a newer chat simply because their global SQLite ID is larger.
+    """
+    message = latest or {}
+    moment = (parse_message_datetime(message.get("message_time"))
+              or parse_message_datetime(message.get("created_at"))
+              or parse_message_datetime(conversation.get("created_at")))
+    return (moment.timestamp() if moment else float("-inf"),
+            int(message.get("id") or 0), str(conversation.get("id") or ""))

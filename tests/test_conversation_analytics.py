@@ -19,6 +19,7 @@ class ConversationAnalyticsTests(unittest.TestCase):
         self.assertEqual(data["conversations_total"], 0)
         self.assertEqual(data["messages_total"], 0)
         self.assertEqual(data["job_directions"], [])
+        self.assertEqual(data["job_direction_activity"], [])
         self.assertEqual(data["hr_question_keywords"], [])
 
     def test_analytics_excludes_unlinked_sync_rows_and_sorts_hr_quotes(self):
@@ -67,6 +68,10 @@ class ConversationAnalyticsTests(unittest.TestCase):
         self.assertEqual(directions[java_label]["conversations"], 1)
         self.assertEqual(directions[java_label]["replied_conversations"], 1)
         self.assertEqual(directions[java_label]["reply_rate"], 100)
+        activity = data["job_direction_activity"]
+        self.assertEqual(activity[0]["label"], python_label)
+        self.assertEqual(activity[0]["message_count"], 4)
+        self.assertEqual(activity[1]["message_count"], 1)
         trend = {row["day"]: row for row in data["daily_trend"]}
         self.assertEqual(trend["2026-09-26"]["deliveries"], 1)
         self.assertEqual(trend["2026-09-27"]["deliveries"], 2)
@@ -82,6 +87,48 @@ class ConversationAnalyticsTests(unittest.TestCase):
         injection_like_user = build_conversation_analytics(self.conn, "default' OR 1=1 --")
         self.assertEqual(injection_like_user["conversations_total"], 0)
         self.assertEqual(injection_like_user["messages_total"], 0)
+        self.assertEqual(injection_like_user["job_direction_activity"], [])
+
+    def test_activity_top_50_counts_actual_messages_not_reply_rate_or_system_events(self):
+        self.conn.execute("CREATE TABLE jobs (id TEXT PRIMARY KEY, title TEXT)")
+        for index in range(55):
+            job_id = f"job-{index}"
+            self.conn.execute("INSERT INTO jobs VALUES (?, ?)", (job_id, f"方向-{index:02d}"))
+            self.repo.upsert_conversation({"id": job_id, "platform": "boss", "job_id": job_id})
+            # All rows have the same reply rate; activity must determine the top 50.
+            self.repo.append_messages(job_id, [
+                IncomingMessage("hr", "您好", platform_message_id=f"hr-{index}"),
+                *[IncomingMessage("user", "您好", platform_message_id=f"user-{index}-{n}", is_sent=True)
+                  for n in range(index)],
+            ])
+        self.repo.append_messages("job-0", [
+            IncomingMessage("system", "平台提示", platform_message_id=f"sys-{n}") for n in range(60)
+        ])
+        # Simulate corrupt legacy state directly: the public repository correctly rejects blanks.
+        self.conn.execute("UPDATE conv_messages SET content = '  ' WHERE platform_message_id = 'hr-0'")
+        self.conn.commit()
+
+        data = build_conversation_analytics(self.conn)
+        rows = data["job_direction_activity"]
+        self.assertEqual(len(rows), 50)
+        self.assertEqual(rows[0]["label"], "方向-54")
+        self.assertEqual(rows[0]["message_count"], 55)
+        self.assertEqual(rows[-1]["label"], "方向-05")
+        self.assertNotIn("方向-00", [row["label"] for row in rows])
+        self.assertEqual(len(data["job_directions"]), 30)  # Existing reply chart contract unchanged.
+
+    def test_activity_ties_are_stable_and_zero_activity_is_omitted(self):
+        self.conn.execute("CREATE TABLE jobs (id TEXT PRIMARY KEY, title TEXT)")
+        self.conn.executemany("INSERT INTO jobs VALUES (?, ?)", [("a", "A"), ("b", "B"), ("empty", "Empty")])
+        for job_id in ("b", "a", "empty"):
+            self.repo.upsert_conversation({"id": job_id, "platform": "zhilian", "job_id": job_id})
+        for job_id in ("b", "a"):
+            self.repo.append_messages(job_id, [IncomingMessage("hr", "您好", platform_message_id=job_id)])
+        self.conn.commit()
+        first = build_conversation_analytics(self.conn)["job_direction_activity"]
+        second = build_conversation_analytics(self.conn)["job_direction_activity"]
+        self.assertEqual([row["label"] for row in first], ["A", "B"])
+        self.assertEqual(first, second)
 
 
 if __name__ == "__main__":

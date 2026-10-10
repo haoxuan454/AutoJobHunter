@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 from urllib.parse import parse_qs, urlsplit
 
-from bosshunter.conversation_ordering import latest_message, message_order_key
+from bosshunter.conversation_ordering import conversation_activity_key, latest_message, message_order_key
 
 
 CONVERSATION_STATUSES = {
@@ -699,6 +699,7 @@ class ConversationRepository:
             (user_id,),
         ).fetchall()
         result = []
+        activity_keys = {}
         for row in rows:
             item = dict(row)
             messages = [dict(message) for message in self.conn.execute(
@@ -707,7 +708,14 @@ class ConversationRepository:
             latest = latest_message(messages)
             item["last_message_preview"] = latest.get("content") if latest else None
             item["latest_message_sender"] = latest.get("sender_type") if latest else None
+            activity_keys[item["id"]] = conversation_activity_key(item, latest)
             result.append(_decorate_external_urls(item))
+        # Complete ordering precedes any UI pagination. Insertion IDs and sync
+        # timestamps are not evidence of when an HR actually sent a message.
+        if sort == "recent":
+            result.sort(key=lambda item: activity_keys[item["id"]], reverse=True)
+        elif sort == "frequency":
+            result.sort(key=lambda item: (int(item["round_count"] or 0), activity_keys[item["id"]]), reverse=True)
         return result
 
     def update_status(self, conversation_id: str, status: str, reason: str = "") -> dict[str, Any]:

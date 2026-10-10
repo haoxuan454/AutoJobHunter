@@ -12,6 +12,7 @@ import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Save, RotateCcw, ChevronDown, ChevronRight, Loader2, UserRound, Search, BrainCircuit, ShieldAlert, Activity, Repeat2, Mail } from 'lucide-react'
 import { useState, useEffect, useRef } from 'react'
 import { PLATFORM_LABELS, PLATFORM_SHORT_LABELS } from '@/lib/platforms'
+import { APP_NAME } from '@/lib/branding'
 
 const AI_SERVICES = {
   anthropic: {
@@ -154,7 +155,7 @@ export default function ConfigPage() {
         message: check ? `${check.message}：${check.detail}` : (data.messages?.[0] || 'AI 接口未返回检测结果'),
       })
     } catch {
-      setAiTest({ testing: false, ok: false, message: '无法连接本地检测接口，请确认 BossHunter 后端正在运行。' })
+      setAiTest({ testing: false, ok: false, message: `无法连接本地检测接口，请确认 ${APP_NAME} 后端正在运行。` })
     }
   }
 
@@ -536,7 +537,7 @@ export default function ConfigPage() {
                 ))}
               </Select>
               <p className="mt-1 text-xs text-muted">
-                BossHunter 会自动配置协议和服务地址；也可安全复用环境变量 {
+                {APP_NAME} 会自动配置协议和服务地址；也可安全复用环境变量 {
                   AI_SERVICES[(config.ai?.service || (config.ai?.provider === 'openai_compatible' ? 'custom' : 'anthropic')) as AiService].keyEnv
                 }，不会在前端显示其内容。
               </p>

@@ -501,7 +501,10 @@ class DashboardPageTests(unittest.TestCase):
 
     def test_dashboard_filters_today_jobs_and_clears_hidden_selection(self):
         self.assertIn("filteredTodayJobs", self.source)
-        self.assertIn("setSelected(filteredTodayJobs.map(job => job.id))", self.source)
+        # The shared backlog panel now owns select-all; it must receive only
+        # the filtered collection and the original selection callback.
+        self.assertIn("items={filteredTodayJobs}", self.source)
+        self.assertIn("onSelectionChange={setSelected}", self.source)
         self.assertIn("visibleJobIds.has(id)", self.source)
         self.assertIn("没有符合当前条件的岗位", self.source)
 
@@ -633,7 +636,7 @@ class DashboardPageTests(unittest.TestCase):
         self.assertNotIn("blockedFullTask", self.source)
         self.assertNotIn("send-errors-blocked-full-flow", self.source)
         self.assertNotIn("全流程卡在打招呼环节", self.source)
-        self.assertIn("放弃已失效岗位", self.source)
+        self.assertIn("可以重试，或安全移入回收站", self.source)
         self.assertIn("放弃全部", self.source)
         self.assertIn("sendReadyGreetings(workbench.send_errors.map(job => job.id))", self.source)
         self.assertNotIn("confirmDeliver(workbench.send_errors.map(job => job.id))", self.source)
@@ -761,7 +764,8 @@ class SidebarTests(unittest.TestCase):
     def test_sidebar_star_link_places_github_icon_left_and_centers_star_label(self):
         # Act / Assert
         self.assertIn("relative flex items-center", self.source)
-        self.assertIn('aria-label="BossHunter GitHub"', self.source)
+        self.assertIn('aria-label={`${APP_NAME} GitHub`}', self.source)
+        self.assertIn('PROJECT_GITHUB_URL', self.source)
         self.assertIn("md:absolute md:left-3", self.source)
         self.assertIn("mx-auto hidden items-center justify-center gap-2 md:flex", self.source)
         self.assertIn("text-xl", self.source)

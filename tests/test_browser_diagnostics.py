@@ -12,6 +12,16 @@ class BrowserDiagnosticsTests(unittest.TestCase):
         self.assertIn("登录查看更多", ZHILIAN_PAGE_STATE_SCRIPT)
         self.assertIn("立即登录", ZHILIAN_PAGE_STATE_SCRIPT)
 
+    def test_zhilian_login_wall_requires_visible_structural_evidence(self):
+        from bosshunter.browser.diagnostics import ZHILIAN_PAGE_STATE_SCRIPT
+
+        self.assertIn("getBoundingClientRect", ZHILIAN_PAGE_STATE_SCRIPT)
+        self.assertIn("window.getComputedStyle", ZHILIAN_PAGE_STATE_SCRIPT)
+        self.assertIn("loggedInMarker", ZHILIAN_PAGE_STATE_SCRIPT)
+        self.assertIn("visibleLoginControl", ZHILIAN_PAGE_STATE_SCRIPT)
+        self.assertIn("loginDialog", ZHILIAN_PAGE_STATE_SCRIPT)
+        self.assertIn("loginRequired", ZHILIAN_PAGE_STATE_SCRIPT)
+
     @patch("bosshunter.browser.diagnostics.httpx.get")
     def test_browser_identity_detects_edge_from_older_runtime_health(self, http_get):
         from bosshunter.browser.diagnostics import _browser_identity

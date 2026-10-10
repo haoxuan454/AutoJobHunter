@@ -15,16 +15,33 @@ from bosshunter.browser.runtime import check_node_available, ensure_runtime, get
 ZHILIAN_PAGE_STATE_SCRIPT = """
 (() => {
   const text = document.body ? document.body.innerText : '';
-  const searchInput = document.querySelector(
+  const visible = (node) => {
+    if (!node) return false;
+    const rect = node.getBoundingClientRect();
+    const style = window.getComputedStyle(node);
+    return rect.width > 0 && rect.height > 0
+      && style.display !== 'none'
+      && style.visibility !== 'hidden'
+      && style.opacity !== '0';
+  };
+  const searchInput = Array.from(document.querySelectorAll(
     'input.query-sug__input, input.search-wrapper__input, input[placeholder="输入职位、公司等搜索"], input[placeholder*="职位、公司"]'
-  );
+  )).find(visible);
   if (/验证码|滑块|访问频繁|频率限制|账号异常|拒绝访问/.test(text)) {
     return JSON.stringify({status: 'blocked', message: '智联页面受到验证码、频率限制或账号异常拦截'});
   }
-  const strongLoginWallText = /登录查看更多|登录查看全部|立即登录/.test(text);
   const loginWallText = /请先登录|请登录|登录后(?:查看|继续|获取)|登录失效|账号登录|扫码登录/.test(text);
-  const loginDialog = Boolean(document.querySelector('[role="dialog"], .login-dialog, [class*="login-modal"], [class*="login-dialog"]'));
-  if (strongLoginWallText || (loginWallText && (!searchInput || loginDialog))) {
+  const loggedInMarker = /退出登录|我的消息|消息\s*\d+|个人中心|编辑期望/.test(text);
+  const loginDialog = Array.from(document.querySelectorAll(
+    '[role="dialog"], .login-dialog, [class*="login-modal"], [class*="login-dialog"]'
+  )).some((node) => visible(node) && /请先登录|请登录|账号登录|扫码登录|立即登录|验证码登录|登录注册|登录\/注册|手机号/.test(node.textContent || ''));
+  const visibleLoginControl = Array.from(document.querySelectorAll('button, a, [role="button"]'))
+    .some((node) => visible(node) && /登录查看更多|登录查看全部|立即登录|请先登录|扫码登录/.test(node.textContent || ''));
+  const loginPath = /(?:^|\/)(?:passport|login)(?:\/|$)/i.test(window.location.pathname);
+  const loginRequired = loginDialog || (!loggedInMarker && (
+    visibleLoginControl || (!searchInput && loginWallText) || loginPath
+  ));
+  if (loginRequired) {
     return JSON.stringify({status: 'login_required', message: '智联页面要求登录'});
   }
   if (searchInput) {

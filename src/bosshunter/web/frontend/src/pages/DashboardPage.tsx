@@ -10,6 +10,7 @@ import { TrendChart } from '@/components/dashboard/TrendChart'
 import { TopCompanies } from '@/components/dashboard/TopCompanies'
 import { PipelineFlow } from '@/components/dashboard/PipelineFlow'
 import { RecentActivity } from '@/components/dashboard/RecentActivity'
+import { BacklogPanel } from '@/components/dashboard/BacklogPanel'
 import type { ActivityData, TopCompany } from '@/hooks/useDashboard'
 import { JobFilterBar } from '@/components/jobs/JobFilterBar'
 import { parseHistoryDetail } from '@/lib/historyDetail'
@@ -24,6 +25,7 @@ import {
 import { getActionLabel, getStatusLabel } from '@/lib/status'
 import { describeGreetTaskOutcome, greetPauseReasonLabel } from '@/lib/greetTask'
 import { cn } from '@/lib/utils'
+import { APP_NAME } from '@/lib/branding'
 import {
   AlertTriangle,
   BriefcaseBusiness,
@@ -78,6 +80,17 @@ export async function submitDeliveryWithConfirmations(ids: string[], directSend 
     payload = retried.payload
   }
   if (!response.ok) throw new Error(payload.error || '投递失败')
+  return payload
+}
+
+export async function softDeleteWorkbenchJobs(ids: string[]) {
+  const response = await fetch('/api/jobs/soft-delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ job_ids: ids, confirmed: true, reason: '用户从工作台积压面板移入回收站' }),
+  })
+  const payload = await response.json().catch(() => ({}))
+  if (!response.ok) throw new Error(payload.error || '移入回收站失败')
   return payload
 }
 
@@ -304,7 +317,7 @@ async function parsePreflightResponse(res: Response) {
     return {
       ok: false,
       messages: [message],
-      checks: [{ id: 'preflight_api', title: '启动检查', status: 'error', message, detail: '请重启 BossHunter 后重试。' }] as PreflightCheck[],
+      checks: [{ id: 'preflight_api', title: '启动检查', status: 'error', message, detail: `请重启 ${APP_NAME} 后重试。` }] as PreflightCheck[],
     }
   }
   const messages = Array.isArray(data.messages) ? [...new Set(data.messages.map(String).filter(Boolean))] : []
@@ -411,6 +424,10 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
     stopTask,
   } = useDashboard(view)
   const [selected, setSelected] = useState<string[]>([])
+  const [selectedSendErrorIds, setSelectedSendErrorIds] = useState<string[]>([])
+  const [selectedPendingGreetingIds, setSelectedPendingGreetingIds] = useState<string[]>([])
+  const [archivingBacklog, setArchivingBacklog] = useState(false)
+  const archivingBacklogRef = useRef(false)
   const [notice, setNotice] = useState('')
 
   // Dashboard visualization state
@@ -593,7 +610,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
       await runPreflight(preflightMode)
       setNotice('')
     } catch {
-      setNotice('重新检查失败，请确认 BossHunter 后端仍在运行。')
+      setNotice(`重新检查失败，请确认 ${APP_NAME} 后端仍在运行。`)
     } finally {
       setModePending(null)
     }
@@ -607,7 +624,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
       const ok = await runPreflight('auto_full')
       setNotice(ok ? '自动全流程预检通过，可以开始任务。' : '')
     } catch {
-      setNotice('预检失败，请确认 BossHunter 后端仍在运行。')
+      setNotice(`预检失败，请确认 ${APP_NAME} 后端仍在运行。`)
     } finally {
       setPreflightRunning(false)
     }
@@ -696,6 +713,26 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
       setNotice(`已放弃 ${count} 个岗位。`)
     } catch (err) {
       setNotice(err instanceof Error ? err.message : '放弃失败')
+    }
+  }
+
+  const archiveWorkbenchJobs = async (ids: string[]) => {
+    if (archivingBacklogRef.current || !ids.length || !window.confirm(`确认将 ${ids.length} 个积压岗位移入回收站吗？不会从数据库永久删除，可在回收站恢复。`)) return
+    archivingBacklogRef.current = true
+    setArchivingBacklog(true)
+    try {
+      const result = await softDeleteWorkbenchJobs(ids)
+      const removed = new Set(ids)
+      setSelected(previous => previous.filter(id => !removed.has(id)))
+      setSelectedSendErrorIds(previous => previous.filter(id => !removed.has(id)))
+      setSelectedPendingGreetingIds(previous => previous.filter(id => !removed.has(id)))
+      await refresh()
+      setNotice(`已将 ${result.affected_count ?? 0} 个积压岗位移入回收站。`)
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '移入回收站失败')
+    } finally {
+      archivingBacklogRef.current = false
+      setArchivingBacklog(false)
     }
   }
 
@@ -1103,52 +1140,66 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
       </section>
 
       {workbench.send_errors.length > 0 && (
-        <section className="rounded-3xl border border-red-100 bg-red-50 p-5">
-          <div className="mb-4 flex flex-wrap items-center justify-between gap-4">
-            <div>
-              <h3 className="text-lg font-black text-danger">发送失败待处理</h3>
-              <p className="mt-1 text-xs text-danger/80">这些岗位已生成招呼语，但没有成功发送。你可以重试，或放弃已失效岗位。</p>
-            </div>
-            <div className="flex flex-wrap gap-2">
+        <BacklogPanel
+          title="发送失败待处理"
+          description="这些岗位已生成招呼语，但没有成功发送。可以重试，或安全移入回收站。"
+          items={workbench.send_errors}
+          getId={job => job.id}
+          selectedIds={selectedSendErrorIds}
+          onSelectionChange={setSelectedSendErrorIds}
+          onDeleteSelected={ids => void archiveWorkbenchJobs(ids)}
+          deleting={archivingBacklog}
+          className="rounded-3xl border border-red-100 bg-red-50 p-5"
+          ariaLabel="发送失败待处理积压"
+          actions={
+            <>
               <Button size="sm" disabled={workbench.send_errors.some(job => sendingGreetingIds.has(job.id))} onClick={() => sendReadyGreetings(workbench.send_errors.map(job => job.id))}>
                 {workbench.send_errors.some(job => sendingGreetingIds.has(job.id)) ? '正在重新发送...' : `重新发送全部 ${workbench.send_errors.length} 个`}
               </Button>
               <Button variant="secondary" size="sm" onClick={() => rejectSelectedJobs(workbench.send_errors.map(job => job.id))}>放弃全部</Button>
-            </div>
-          </div>
-          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-            {workbench.send_errors.map(job => (
-              <div key={job.id} className="rounded-2xl border border-red-100 bg-white p-4">
-                <div className="flex items-start justify-between gap-3">
+            </>
+          }
+          renderItem={(job, selectedJob, onToggle, onDelete) => (
+            <div className="rounded-2xl border border-red-100 bg-white p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex min-w-0 items-start gap-2">
+                  <input type="checkbox" checked={selectedJob} onChange={onToggle} aria-label={`选择${job.company} ${job.title}`} className="mt-1 h-4 w-4 shrink-0 accent-primary" />
                   <div>
                     <div className="font-black">{job.company}｜{job.title}</div>
                     <div className="mt-1 text-xs text-danger">最近失败原因：{job.last_error || '发送失败，等待重试'}</div>
                   </div>
-                  <span className="rounded-full bg-red-50 px-2 py-1 text-[11px] font-black text-danger">发送失败</span>
                 </div>
-                <p className="mt-3 line-clamp-2 text-sm leading-6 text-muted">{job.greeting || '招呼语已生成，等待重新发送。'}</p>
-                <div className="mt-3 flex gap-2">
-                  <Button size="sm" disabled={sendingGreetingIds.has(job.id)} onClick={() => sendReadyGreetings([job.id])}>
-                    {sendingGreetingIds.has(job.id) ? '正在重新发送...' : '重新发送'}
-                  </Button>
-                  <Button variant="secondary" size="sm" onClick={() => rejectSelectedJobs([job.id])}>放弃</Button>
-                  <Button variant="secondary" size="sm" onClick={() => openJobDetail(job)}><Eye className="mr-2 h-4 w-4" />查看详情</Button>
-                  <Button variant="secondary" size="sm" disabled={!job.url} onClick={() => window.open(job.url, '_blank', 'noopener,noreferrer')}><ExternalLink className="mr-2 h-4 w-4" />跳转岗位链接</Button>
-                </div>
+                <span className="shrink-0 rounded-full bg-red-50 px-2 py-1 text-[11px] font-black text-danger">发送失败</span>
               </div>
-            ))}
-          </div>
-        </section>
+              <p className="mt-3 line-clamp-2 text-sm leading-6 text-muted">{job.greeting || '招呼语已生成，等待重新发送。'}</p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button size="sm" disabled={sendingGreetingIds.has(job.id)} onClick={() => sendReadyGreetings([job.id])}>
+                  {sendingGreetingIds.has(job.id) ? '正在重新发送...' : '重新发送'}
+                </Button>
+                <Button variant="secondary" size="sm" onClick={() => rejectSelectedJobs([job.id])}>放弃</Button>
+                <Button variant="secondary" size="sm" onClick={() => openJobDetail(job)}><Eye className="mr-2 h-4 w-4" />查看详情</Button>
+                <Button variant="secondary" size="sm" disabled={!job.url} onClick={() => window.open(job.url, '_blank', 'noopener,noreferrer')}><ExternalLink className="mr-2 h-4 w-4" />跳转岗位链接</Button>
+                <Button variant="secondary" size="sm" onClick={onDelete}><Trash2 className="mr-2 h-4 w-4" />删除积压</Button>
+              </div>
+            </div>
+          )}
+        />
       )}
 
       {pendingGreetingJobs.length > 0 && (
-        <section className="rounded-3xl border border-primary/20 bg-[#FFF0E5] p-5">
-          <div className="mb-4 flex flex-wrap items-center justify-between gap-4">
-            <div>
-              <h3 className="text-lg font-black">待发送招呼语</h3>
-              <p className="mt-1 text-xs text-muted">先预览原文与优化建议。人工确认后的版本会锁定，不再被后台生成覆盖。</p>
-            </div>
-            <div className="flex flex-wrap gap-2">
+        <BacklogPanel
+          title="待发送招呼语"
+          description="先预览原文与优化建议。人工确认后的版本会锁定；积压可安全移入回收站。"
+          items={pendingGreetingJobs}
+          getId={job => job.id}
+          selectedIds={selectedPendingGreetingIds}
+          onSelectionChange={setSelectedPendingGreetingIds}
+          onDeleteSelected={ids => void archiveWorkbenchJobs(ids)}
+          deleting={archivingBacklog}
+          className="rounded-3xl border border-primary/20 bg-[#FFF0E5] p-5"
+          ariaLabel="待发送招呼语积压"
+          actions={
+            <>
               {pendingGreetingReviewCount > 0 && (
                 <span className="rounded-full bg-amber-100 px-3 py-2 text-xs font-black text-amber-700">
                   {pendingGreetingReviewCount} 个待选择
@@ -1162,41 +1213,56 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
                 发送已确认 {reviewedGreetingJobs.length} 个
               </Button>
               <Button variant="secondary" size="sm" onClick={() => rejectSelectedJobs(pendingGreetingJobs.map(job => job.id))}>放弃全部</Button>
-            </div>
-          </div>
-          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-            {pendingGreetingJobs.map(job => (
-              <GreetingReviewCard
-                key={job.id}
-                job={job}
-                busy={sendingGreetingIds.has(job.id) || Boolean(activeTask && ['greet', 'deliver', 'full', 'auto_full', 'monitor'].includes(activeTask.mode))}
-                onBusyChange={onGreetingBusyChange}
-                onSelect={(selection, greeting) => selectGreeting(job, selection, greeting)}
-                onSend={() => sendReadyGreetings([job.id])}
-                onReject={() => rejectSelectedJobs([job.id])}
-                onDetail={() => openJobDetail(job)}
-              />
-            ))}
-          </div>
-        </section>
+            </>
+          }
+          renderItem={(job, selectedJob, onToggle, onDelete) => (
+            <GreetingReviewCard
+              job={job}
+              selected={selectedJob}
+              onToggle={onToggle}
+              onDelete={onDelete}
+              busy={sendingGreetingIds.has(job.id) || Boolean(activeTask && ['greet', 'deliver', 'full', 'auto_full', 'monitor'].includes(activeTask.mode))}
+              onBusyChange={onGreetingBusyChange}
+              onSelect={(selection, greeting) => selectGreeting(job, selection, greeting)}
+              onSend={() => sendReadyGreetings([job.id])}
+              onReject={() => rejectSelectedJobs([job.id])}
+              onDetail={() => openJobDetail(job)}
+            />
+          )}
+        />
       )}
 
-      <section className="rounded-2xl border border-card-border bg-white p-4">
-        <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h3 className="text-lg font-black">今日待确认</h3>
-            <p className="mt-0.5 text-xs text-muted">选中岗位，确认后投递。</p>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <Button variant="secondary" size="sm" disabled={!filteredTodayJobs.length} onClick={() => setSelected(filteredTodayJobs.map(job => job.id))}>全选</Button>
-            <Button variant="secondary" size="sm" disabled={!selected.length} onClick={() => setSelected([])}>清空</Button>
+      <BacklogPanel
+        title="今日待确认"
+        description="选中岗位，确认后投递；列表固定高度，更多岗位请在面板内滚动查看。"
+        items={filteredTodayJobs}
+        getId={job => job.id}
+        selectedIds={selected}
+        onSelectionChange={setSelected}
+        onDeleteSelected={ids => void archiveWorkbenchJobs(ids)}
+        deleting={archivingBacklog}
+        ariaLabel="今日待确认岗位积压"
+        emptyMessage={todayJobs.length ? '没有符合当前条件的岗位，请调整筛选条件。' : '当前没有积压项目。'}
+        actions={
+          <>
             <Button variant="secondary" size="sm" disabled={generatingGreetings || greetTaskRunning || !actionableSelected.length} onClick={() => generateGreetings(actionableSelected)}>
               {generatingGreetings || greetTaskRunning ? '生成中...' : `生成打招呼用语 ${actionableSelected.length} 个`}
             </Button>
             <Button variant="secondary" size="sm" disabled={!actionableSelected.length} onClick={() => rejectSelectedJobs(actionableSelected)}>放弃已选 {actionableSelected.length} 个</Button>
             <Button size="sm" disabled={!actionableSelected.length} onClick={() => confirmDeliver(actionableSelected)}>一键投递已选 {actionableSelected.length} 个</Button>
-          </div>
-        </div>
+          </>
+        }
+        renderItem={(job, selectedJob, onToggle, onDelete) => (
+          <JobActionCard
+            job={job}
+            selected={selectedJob}
+            onToggle={onToggle}
+            onDetail={() => openJobDetail(job)}
+            onReject={() => rejectSelectedJobs([job.id])}
+            onDelete={onDelete}
+          />
+        )}
+      >
         <details className="group mb-3 rounded-xl border border-card-border bg-[#FFFCFA]">
           <summary className="flex cursor-pointer list-none flex-wrap items-center justify-between gap-2 px-3 py-2 text-xs [&::-webkit-details-marker]:hidden">
             <span className="flex items-center gap-2 font-bold">
@@ -1220,28 +1286,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
             />
           </div>
         </details>
-        {filteredTodayJobs.length ? (
-          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-            {filteredTodayJobs.map(job => (
-              <JobActionCard
-                key={job.id}
-                job={job}
-                selected={selected.includes(job.id)}
-                onToggle={() => toggleJob(job.id)}
-                onDetail={() => openJobDetail(job)}
-                onReject={() => rejectSelectedJobs([job.id])}
-              />
-            ))}
-          </div>
-        ) : todayJobs.length ? (
-          <div className="rounded-2xl border border-dashed border-card-border bg-[#FFFCFA] p-5 text-center text-sm text-muted">
-            <p>没有符合当前条件的岗位</p>
-            <Button className="mt-3" variant="secondary" size="sm" onClick={() => setTodayFilters({ ...EMPTY_JOB_FILTERS })}>重置筛选</Button>
-          </div>
-        ) : (
-          <p className="py-2 text-xs text-muted">今天暂时没有待确认岗位。</p>
-        )}
-      </section>
+      </BacklogPanel>
 
       {selectedJob && <JobDetailModal job={selectedJob} onClose={() => setSelectedJob(null)} onChanged={() => void refresh()} />}
       <CollectJobsDialog
@@ -1283,6 +1328,9 @@ function CollectionProgressPanel({ progress }: { progress: CollectionProgress })
 
 function GreetingReviewCard({
   job,
+  selected = false,
+  onToggle,
+  onDelete,
   busy = false,
   onBusyChange,
   onSelect,
@@ -1291,6 +1339,9 @@ function GreetingReviewCard({
   onDetail,
 }: {
   job: Job
+  selected?: boolean
+  onToggle?: () => void
+  onDelete?: () => void
   busy?: boolean
   onBusyChange?: (id: string, busy: boolean) => void
   onSelect: (selection: 'original' | 'optimized' | 'edited', greeting?: string) => Promise<void>
@@ -1335,11 +1386,14 @@ function GreetingReviewCard({
   return (
     <div className={`rounded-2xl border bg-white p-4 ${needsSelection ? 'border-amber-200' : 'border-primary/20'}`}>
       <div className="flex items-start justify-between gap-3">
-        <div>
-          <div className="font-black">{job.company}｜{job.title}</div>
-          <div className="mt-1 text-xs text-muted">发送前确认最终使用的表达</div>
+        <div className="flex min-w-0 items-start gap-2">
+          <input type="checkbox" checked={selected} onChange={onToggle} aria-label={`选择${job.company} ${job.title}`} className="mt-1 h-4 w-4 shrink-0 accent-primary" />
+          <div className="min-w-0">
+            <div className="font-black">{job.company}｜{job.title}</div>
+            <div className="mt-1 text-xs text-muted">发送前确认最终使用的表达</div>
+          </div>
         </div>
-        <span className={`rounded-full px-2 py-1 text-[11px] font-black ${needsSelection ? 'bg-amber-100 text-amber-700' : 'bg-emerald-50 text-emerald-700'}`}>
+        <span className={`shrink-0 rounded-full px-2 py-1 text-[11px] font-black ${needsSelection ? 'bg-amber-100 text-amber-700' : 'bg-emerald-50 text-emerald-700'}`}>
           {selectionLabel}
         </span>
       </div>
@@ -1416,12 +1470,13 @@ function GreetingReviewCard({
         </Button>
         <Button variant="secondary" size="sm" onClick={onDetail}><Eye className="mr-2 h-4 w-4" />查看详情</Button>
         <Button variant="secondary" size="sm" disabled={saving || busy} onClick={onReject}>放弃</Button>
+        {onDelete && <Button variant="secondary" size="sm" onClick={onDelete}><Trash2 className="mr-2 h-4 w-4" />删除积压</Button>}
       </div>
     </div>
   )
 }
 
-function JobActionCard({ job, selected, onToggle, onDetail, onReject }: { job: Job; selected: boolean; onToggle: () => void; onDetail: () => void; onReject: () => void }) {
+function JobActionCard({ job, selected, onToggle, onDetail, onReject, onDelete }: { job: Job; selected: boolean; onToggle: () => void; onDetail: () => void; onReject: () => void; onDelete?: () => void }) {
   return (
     <div className={`rounded-2xl border p-4 ${selected ? 'border-primary bg-[#FFFCFA]' : 'border-card-border bg-[#FFFCFA]'}`}>
       <div className="flex items-start justify-between gap-3">
@@ -1436,6 +1491,7 @@ function JobActionCard({ job, selected, onToggle, onDetail, onReject }: { job: J
         <Button variant="secondary" size="sm" onClick={onDetail}><Eye className="mr-2 h-4 w-4" />查看详情</Button>
         <Button variant="secondary" size="sm" disabled={!job.url} onClick={() => window.open(job.url, '_blank', 'noopener,noreferrer')}><ExternalLink className="mr-2 h-4 w-4" />跳转岗位链接</Button>
         <Button variant="secondary" size="sm" onClick={onReject}><XCircle className="mr-2 h-4 w-4" />放弃岗位</Button>
+        {onDelete && <Button variant="secondary" size="sm" onClick={onDelete}><Trash2 className="mr-2 h-4 w-4" />删除积压</Button>}
       </div>
     </div>
   )

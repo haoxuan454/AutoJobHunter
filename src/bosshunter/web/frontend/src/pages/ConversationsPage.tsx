@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
   ArrowUpDown,
@@ -12,6 +12,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { formatConversationTime } from '@/lib/conversationDisplay'
+import { ConversationPagination } from '@/components/conversations/ConversationPagination'
 
 type SortMode = 'recent' | 'frequency' | 'created'
 
@@ -104,13 +105,23 @@ export default function ConversationsPage() {
   const [notice, setNotice] = useState('')
   const [syncing, setSyncing] = useState(false)
   const [syncingId, setSyncingId] = useState('')
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(12)
+  const loadSequence = useRef(0)
+  const totalPages = Math.max(1, Math.ceil(items.length / pageSize))
+  const currentPage = Math.min(page, totalPages)
+  // The API orders ALL conversations; slice only after that global ordering.
+  const visibleItems = items.slice((currentPage - 1) * pageSize, currentPage * pageSize)
 
-  const load = async () => {
+  const load = useCallback(async (resetPage = false) => {
+    const sequence = ++loadSequence.current
     const response = await fetch(`/api/conversations?sort=${sort}`)
     const data = await response.json().catch(() => ({}))
+    if (sequence !== loadSequence.current) return
     if (!response.ok) throw new Error(data.error || '会话加载失败')
     setItems(data.conversations || [])
-  }
+    if (resetPage) setPage(1)
+  }, [sort])
 
   const sync = async () => {
     setSyncing(true)
@@ -135,7 +146,7 @@ export default function ConversationsPage() {
         })
         .join('；')
       setNotice(`${failed ? '同步部分完成' : '同步完成'}：${summary || '没有本地会话返回结果'}`)
-      await load()
+      await load(true)
     } catch (error) {
       setNotice(error instanceof Error ? error.message : '会话同步失败')
     } finally {
@@ -153,7 +164,7 @@ export default function ConversationsPage() {
         ? (data.history_complete ? '，已到达平台可读取的历史边界' : '，平台未确认历史边界，当前展示已加载消息')
         : ''
       setNotice(`${displayHrName(item.hr_name)}：${syncStatusLabel(data.status)}，平台读取 ${data.platform_message_count || 0} 条，本地共 ${data.message_count || 0} 条${historyNote}`)
-      await load()
+      await load(true)
     } catch (error) {
       setNotice(error instanceof Error ? error.message : '当前会话同步失败')
     } finally {
@@ -183,8 +194,11 @@ export default function ConversationsPage() {
   }
 
   useEffect(() => {
-    void load().catch(error => setNotice(error instanceof Error ? error.message : '会话加载失败'))
-  }, [sort])
+    void load(true).catch(error => setNotice(error instanceof Error ? error.message : '会话加载失败'))
+    return () => { loadSequence.current += 1 }
+  }, [load])
+
+  useEffect(() => { setPage(currentPage) }, [currentPage])
 
   const remove = async (item: Conversation) => {
     if (!window.confirm(`确定删除“${displayHrName(item.hr_name)}”的本地会话吗？\n\n只删除本地数据库内容，不会删除招聘平台上的聊天记录。`)) return
@@ -213,7 +227,7 @@ export default function ConversationsPage() {
         <div className="flex flex-wrap items-center gap-2">
           <label className="flex items-center gap-2 text-sm text-muted">
             <ArrowUpDown className="h-4 w-4" />
-            <select value={sort} onChange={event => setSort(event.target.value as SortMode)} className="rounded-xl border border-card-border bg-white px-3 py-2 font-normal">
+            <select aria-label="会话排序规则" disabled={syncing || Boolean(syncingId)} value={sort} onChange={event => { setPage(1); setSort(event.target.value as SortMode) }} className="rounded-xl border border-card-border bg-white px-3 py-2 font-normal">
               {Object.entries(SORT_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
             </select>
           </label>
@@ -225,7 +239,7 @@ export default function ConversationsPage() {
       </div>
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-        {items.map(item => {
+        {visibleItems.map(item => {
           const platform = item.platform || 'unknown'
           const platformLabel = PLATFORM_LABELS[platform] || platform
           const platformClass = PLATFORM_STYLES[platform] || 'border-card-border bg-white text-muted'
@@ -304,6 +318,7 @@ export default function ConversationsPage() {
           )
         })}
       </div>
+      {items.length > 0 && <ConversationPagination page={currentPage} pageSize={pageSize} total={items.length} onPageChange={setPage} onPageSizeChange={size => { setPageSize(size); setPage(1) }} />}
       {!items.length && <Card><CardContent className="p-8 text-center text-muted">暂无已确认投递的 HR 会话</CardContent></Card>}
       {notice && <p className="text-sm text-primary">{notice}</p>}
     </div>
