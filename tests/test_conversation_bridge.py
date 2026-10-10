@@ -1,7 +1,7 @@
 import sqlite3
 import unittest
 
-from bosshunter.conversation_bridge import reconcile_verified_deliveries, sync_extracted_messages
+from bosshunter.conversation_bridge import record_verified_delivery, reconcile_verified_deliveries, sync_extracted_messages
 
 
 class ConversationBridgeTests(unittest.TestCase):
@@ -13,6 +13,15 @@ class ConversationBridgeTests(unittest.TestCase):
 
     def tearDown(self):
         self.conn.close()
+
+    def test_platform_default_event_never_fabricates_configured_greeting(self):
+        result = record_verified_delivery(
+            self.conn, job=self.job, platform="zhilian", greeting="并非平台原文",
+            delivery_kind="platform_default_greeting",
+        )
+        row = self.conn.execute("SELECT sender_type, content FROM conv_messages").fetchone()
+        self.assertEqual(tuple(row), ("system", "平台默认招呼已确认"))
+        self.assertEqual(len(result["inserted"]), 1)
 
     def test_snapshot_is_incremental_and_idempotent(self):
         messages = [{"sender": "hr", "text": "请介绍一下 Python 项目", "message_id": "m1"}]
@@ -40,6 +49,36 @@ class ConversationBridgeTests(unittest.TestCase):
         self.assertEqual(tuple(rows[0]), (stable_id, "user", 1, "Tuesday 21:00"))
         self.assertEqual(migrated["inserted"], [])
         self.assertEqual(repeated["inserted"], [])
+
+    def test_boss_native_id_adopts_legacy_and_preserves_repeated_authored_messages(self):
+        first = sync_extracted_messages(self.conn, job=self.job, conversation=self.conversation,
+            messages=[{"sender": "hr", "text": "请介绍经验"}])
+        snapshot = [
+            {"sender": "hr", "text": "请介绍经验", "message_id": "native-1"},
+            {"sender": "hr", "text": "请介绍经验", "message_id": "native-2"},
+        ]
+        migrated = sync_extracted_messages(self.conn, job=self.job, conversation=self.conversation,
+                                           messages=snapshot)
+        repeated = sync_extracted_messages(self.conn, job=self.job, conversation=self.conversation,
+                                           messages=snapshot)
+        self.assertEqual(len(first["inserted"]), 1)
+        self.assertEqual([m["platform_message_id"] for m in migrated["inserted"]], ["native-2"])
+        self.assertEqual(repeated["inserted"], [])
+        rows = self.conn.execute("SELECT platform_message_id FROM conv_messages ORDER BY id").fetchall()
+        self.assertEqual([r[0] for r in rows], ["native-1", "native-2"])
+
+    def test_boss_legacy_adoption_never_crosses_sender_or_conversation(self):
+        sync_extracted_messages(self.conn, job=self.job, conversation=self.conversation,
+                                messages=[{"sender": "me", "text": "相同内容"}])
+        result = sync_extracted_messages(self.conn, job=self.job, conversation=self.conversation,
+                    messages=[{"sender": "hr", "text": "相同内容", "message_id": "hr-native"}])
+        self.assertEqual(len(result["inserted"]), 1)
+        other = {**self.job, "id": "job-2"}
+        result2 = sync_extracted_messages(self.conn, job=other, conversation=self.conversation,
+                    messages=[{"sender": "me", "text": "相同内容", "message_id": "user-native"}])
+        self.assertEqual(len(result2["inserted"]), 1)
+        old = self.conn.execute("SELECT platform_message_id FROM conv_messages WHERE id = 1").fetchone()
+        self.assertIsNone(old[0])
 
     def test_zhilian_legacy_id_migration_requires_same_sender_and_text(self):
         old_id = "dom-0--same text"

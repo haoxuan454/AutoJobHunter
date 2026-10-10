@@ -89,6 +89,7 @@ def run_monitor_cycle(
     stop_event: Event | None = None,
     max_conversations: int | None = None,
     log: Callable[[str], None] | None = None,
+    pending_replies: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Run one low-frequency, serial automatic reply cycle.
 
@@ -122,6 +123,7 @@ def run_monitor_cycle(
     result["delivery_scope"] = normalized_scope
     allowed_scope = scope_keys(normalized_scope)
     event = stop_event or Event()
+    pending = pending_replies if pending_replies is not None else {}
     ordered = sorted(
         (dict(item) for item in conversations if isinstance(item, dict)),
         key=_activity_sort_key,
@@ -178,6 +180,14 @@ def run_monitor_cycle(
         new_hr = [item for item in inserted if _sender_type(item) == "hr"]
         result["new_hr_messages"] += len(new_hr)
         messages = [item for item in (synced.get("messages") or []) if isinstance(item, dict)]
+        if new_hr:
+            pending[conversation_id] = new_hr
+        reply_triggers = pending.get(conversation_id) or []
+        authored = [item for item in messages if _sender_type(item) in {"hr", "user", "ai"}]
+        if authored and _sender_type(authored[-1]) in {"user", "ai"}:
+            # A manual/platform reply already answered the pending question.
+            pending.pop(conversation_id, None)
+            reply_triggers = []
         _detail(
             result,
             conversation_id,
@@ -186,12 +196,12 @@ def run_monitor_cycle(
             inserted=len(inserted),
             new_hr_messages=len(new_hr),
         )
-        if not new_hr:
+        if not reply_triggers:
             continue
         handoff: dict[str, Any] | None = None
         if handle_new_hr_message is not None:
             try:
-                for message in new_hr:
+                for message in reply_triggers:
                     decision = handle_new_hr_message(conversation, message)
                     if isinstance(decision, dict) and decision.get("matched") is True:
                         handoff = decision
@@ -207,6 +217,7 @@ def run_monitor_cycle(
                 )
                 continue
         if handoff is not None:
+            pending.pop(conversation_id, None)
             result["handed_off"] += 1
             _detail(
                 result,
@@ -246,6 +257,15 @@ def run_monitor_cycle(
             _detail(result, conversation_id, platform, "send_error", error=str(exc))
             result["stop_reason"] = "send_exception"
             break
+        if isinstance(send_result, dict) and send_result.get("status") == "skipped":
+            if send_result.get("reason") == "already_replied":
+                pending.pop(conversation_id, None)
+            result["skipped"] += 1
+            _detail(result, conversation_id, platform, "skipped", reason=str(send_result.get("reason") or "state_changed"))
+            if event.is_set():
+                result["stop_reason"] = "user_stopped"
+                break
+            continue
         safe = _safe_send(send_result)
         if not safe:
             result["failed"] += 1
@@ -254,6 +274,7 @@ def run_monitor_cycle(
             result["stop_reason"] = f"send_{send_status}"
             break
         result["replied"] += 1
+        pending.pop(conversation_id, None)
         _detail(result, conversation_id, platform, "replied")
 
     return result

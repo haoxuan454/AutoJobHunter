@@ -248,6 +248,41 @@ class JobSelectionTests(unittest.TestCase):
         redirect.assert_called_once_with("target-1", click_result)
         foreground_submit.assert_not_called()
 
+    def test_unreadable_preset_can_select_platform_redirect_but_not_confirm_send(self):
+        click_result = {"redirectUrl": "/web/geek/chat?jobId=first-contact"}
+        with patch("bosshunter.executor.sender._detect_greet_popup", return_value={"success": True}), \
+             patch("bosshunter.executor.sender._is_preset_greeting_popup", return_value=True), \
+             patch("bosshunter.executor.sender._confirm_preset_greeting", return_value={
+                 "success": False, "error": "platform_default_greeting_unreadable",
+             }), \
+             patch("bosshunter.executor.sender._navigate_to_chat_redirect", return_value=True) as redirect:
+            result = _handle_greet_popup("target-1", "您好", click_result)
+
+        self.assertEqual(result["action"], "startchat_redirected")
+        self.assertNotIn("verified", result)
+        redirect.assert_called_once_with("target-1", click_result)
+
+    def test_unreadable_preset_without_chat_redirect_remains_failed(self):
+        failure = {"success": False, "error": "platform_default_greeting_unreadable"}
+        with patch("bosshunter.executor.sender._detect_greet_popup", return_value={"success": True}), \
+             patch("bosshunter.executor.sender._is_preset_greeting_popup", return_value=True), \
+             patch("bosshunter.executor.sender._confirm_preset_greeting", return_value=failure), \
+             patch("bosshunter.executor.sender._navigate_to_chat_redirect", return_value=False):
+            result = _handle_greet_popup("target-1", "您好", {"redirectUrl": ""})
+
+        self.assertEqual(result, failure)
+
+    def test_known_preset_mismatch_never_redirects_or_claims_delivery(self):
+        failure = {"success": False, "error": "platform_default_greeting_mismatch"}
+        with patch("bosshunter.executor.sender._detect_greet_popup", return_value={"success": True}), \
+             patch("bosshunter.executor.sender._is_preset_greeting_popup", return_value=True), \
+             patch("bosshunter.executor.sender._confirm_preset_greeting", return_value=failure), \
+             patch("bosshunter.executor.sender._navigate_to_chat_redirect") as redirect:
+            result = _handle_greet_popup("target-1", "您好", {"redirectUrl": "/web/geek/chat"})
+
+        self.assertEqual(result, failure)
+        redirect.assert_not_called()
+
     def test_send_greeting_reports_unavailable_job_page_before_clicking_chat(self):
         job = {
             "id": "gone",

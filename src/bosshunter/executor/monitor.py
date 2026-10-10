@@ -2,6 +2,7 @@
 
 import time
 import json
+import math
 from pathlib import Path
 
 from rich.console import Console
@@ -82,7 +83,9 @@ def get_effective_monitor_interval_minutes(
         interval = float(raw_interval)
     except (TypeError, ValueError):
         interval = 30.0
-    return max(interval * get_boss_operation_interval_multiplier(config), 1.0)
+    if not math.isfinite(interval):
+        interval = 30.0
+    return max(interval, 1.0)
 
 
 # JS: Extract chat list with full message context
@@ -257,7 +260,8 @@ JS_EXTRACT_CONVERSATION = r"""
 
     function collectVisibleText(root) {
         const parts = [];
-        const textEl = root.querySelector(TEXT_SELECTORS);
+        // The outer .text includes delivery/read markers on current BOSS DOM.
+        const textEl = root.querySelector('.text-content') || root.querySelector(TEXT_SELECTORS);
         if (textEl) pushUnique(parts, visibleText(textEl));
 
         const cards = root.querySelectorAll(CARD_SELECTORS);
@@ -297,14 +301,26 @@ JS_EXTRACT_CONVERSATION = r"""
         return 'unknown';
     }
 
-    const msgs = document.querySelectorAll(MESSAGE_SELECTORS);
+    const scope = document.querySelector('.chat-record') || document;
+    // .chat-message is also the list wrapper. Only leaf message nodes count;
+    // equal text in two distinct messages must not be collapsed here.
+    const msgs = [...scope.querySelectorAll(MESSAGE_SELECTORS)]
+        .filter(msg => !msg.querySelector(MESSAGE_SELECTORS));
     const results = [];
     msgs.forEach(msg => {
         const text = collectVisibleText(msg);
         if (text) {
+            const data = msg.__vue__?.$props?.message;
+            const nativeId = msg.getAttribute('data-mid') || data?.mid || data?.id || null;
+            const rawTime = Number(data?.time || data?.createdAt || data?.createTime);
+            const epoch = rawTime > 1e12 ? rawTime : rawTime * 1000;
+            const messageTime = Number.isFinite(epoch) && epoch > 0 && epoch < 8640000000000000
+                ? new Date(epoch).toISOString() : null;
             results.push({
                 sender: senderOf(msg, text),
                 text: text.substring(0, 500),
+                message_id: nativeId ? String(nativeId) : null,
+                message_time: messageTime,
                 kind: isResumeRequestCard(text) ? 'resume_request_card' : 'message'
             });
         }

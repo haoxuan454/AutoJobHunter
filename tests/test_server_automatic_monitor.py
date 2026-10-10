@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from unittest.mock import ANY, patch
+import pytest
 
 import bosshunter.web.server as server
 from bosshunter.automation.monitor import automatic_full_run_config
@@ -19,6 +20,15 @@ class _FakeConversationRepository:
         self.cards = cards
         self.messages = messages
         self.appended = []
+
+    def get_conversation(self, conversation_id):
+        return next((dict(card) for card in self.cards if card['id'] == conversation_id), None)
+
+    def claim_send_attempt(self, **kwargs):
+        return {**kwargs, 'status': 'pending'}, True
+
+    def update_send_attempt(self, **kwargs):
+        return kwargs
 
     def list_conversations(self, *, sort='recent'):
         assert sort == 'recent'
@@ -42,6 +52,14 @@ def _card(conversation_id, platform, *, monitoring=True):
         'automatic_monitoring_enabled': monitoring,
         'external_conversation_id': f'external-{conversation_id}',
     }
+
+
+@pytest.fixture(autouse=True)
+def _local_dispatch_timing_and_risk():
+    # No platform requests or real-minute waits in the server harness.
+    with (patch('bosshunter.automation.reply_dispatch.random.uniform', return_value=0),
+          patch.object(server, 'get_active_platform_safety_lock', return_value=None)):
+        yield
 
 
 def _row(card, target_id):
@@ -78,6 +96,7 @@ def test_server_monitor_reads_each_platform_once_and_replies_in_isolated_context
         return ([{'target_id': f'{platform}-target', 'url': f'https://{platform}.test/im'}], [_row(card, f'{platform}-target')])
 
     def sync_target(_conn, *, platform, target, row, base_dir, config):
+        assert config['_automatic_snapshot_guard'] is True
         synced_cards.append(row['local_conversation_id'])
         return {
             'status': 'synced',
@@ -102,6 +121,8 @@ def test_server_monitor_reads_each_platform_once_and_replies_in_isolated_context
         patch.object(server, '_send_message_in_chat', side_effect=lambda target, text: sent.append((target, text)) or True),
         patch.object(server, 'evaluate', return_value=json.dumps([{'sender': 'me', 'text': 'reply'}])),
         patch.object(server, '_fill_and_send_zhilian_message', return_value={'success': True, 'verified': True}),
+        patch.object(server, 'send_boss_reply', side_effect=lambda target, row, text, **kwargs: sent.append((target, text)) or {'success': True, 'verified': True}),
+        patch.object(server, 'send_zhilian_reply', return_value={'success': True, 'verified': True}),
     ):
         result = server._run_auto_conversation_monitor_cycle(task, {
             'monitor': {
@@ -141,6 +162,7 @@ def test_server_monitor_stops_on_unverified_boss_send_and_does_not_persist_ai_me
         patch('bosshunter.executor.monitor._generate_auto_reply', return_value='safe reply'),
         patch.object(server, '_send_message_in_chat', return_value=True),
         patch.object(server, 'evaluate', return_value=json.dumps([])),
+        patch.object(server, 'send_boss_reply', return_value={'success': False, 'verified': False, 'action_started': False}),
     ):
         result = server._run_auto_conversation_monitor_cycle(task, {
             'monitor': {

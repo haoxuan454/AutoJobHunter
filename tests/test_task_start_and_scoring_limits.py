@@ -208,11 +208,29 @@ def test_concurrent_runner_starts_only_persist_winning_settings(tmp_path):
 def test_expired_start_does_not_persist_settings(monkeypatch):
     monkeypatch.setattr(tasks, "_deadline_from_config", lambda *_: datetime.now() - timedelta(seconds=1))
     persist, execute = Mock(), Mock()
-    runner = WorkbenchTaskRunner({"full": execute})
-    task = runner.start("full", {}, before_start=persist)
+    runner = WorkbenchTaskRunner({"auto_full": execute})
+    task = runner.start("auto_full", {}, before_start=persist)
     assert task["status"] == "stopped"
     persist.assert_not_called()
     execute.assert_not_called()
+
+
+@pytest.mark.parametrize("field", ["score_threshold", "interval_min", "interval_max"])
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", True])
+def test_auto_full_rejects_nonfinite_settings_before_admission(runtime, monkeypatch, field, value):
+    _, runner, ai = runtime
+    saved = server.CONFIG_PATH.read_bytes()
+    preflight = Mock(return_value=[])
+    monkeypatch.setattr(server, "_preflight_messages", preflight)
+    options = collection_options()
+    options["auto_settings"] = {field: value}
+    status, payload = request("/api/workbench/task", {"mode": "auto_full", "options": options})
+    assert status == 400, payload
+    assert "有效数字" in payload["error"]
+    preflight.assert_not_called()
+    assert runner.status()["tasks"] == []
+    assert server.CONFIG_PATH.read_bytes() == saved
+    ai.assert_not_called()
 
 
 @pytest.mark.parametrize("scope", ["pending", "all_scored"])

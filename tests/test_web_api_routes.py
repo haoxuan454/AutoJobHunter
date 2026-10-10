@@ -8,7 +8,7 @@ from socketserver import ThreadingMixIn
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 from wsgiref.simple_server import WSGIServer
 from zipfile import ZipFile
 
@@ -517,9 +517,9 @@ class WebApiRouteTests(unittest.TestCase):
 
         status, _, body = self._request("/api/agent/tasks", "POST", {"mode": "send", "confirm": True})
         self.assertTrue(status.startswith("403"), body)
-        self.assertIn("不能单独跳过确认发送", json.loads(body)["error"])
+        self.assertIn("只能启动 collect、monitor 或 auto_full", json.loads(body)["error"])
 
-    def test_agent_task_starts_full_workflow_with_existing_confirmation_gate(self):
+    def test_agent_task_starts_explicit_auto_full_with_safe_delivery_policy(self):
         with tempfile.TemporaryDirectory() as tmp:
             base_dir = Path(tmp)
             resume_path = base_dir / "resume.md"
@@ -534,19 +534,19 @@ class WebApiRouteTests(unittest.TestCase):
                 encoding="utf-8",
             )
             server.set_base_dir(base_dir)
-            task = {"id": "agent-full-task", "mode": "full", "status": "running"}
+            task = {"id": "agent-auto-full-task", "mode": "auto_full", "status": "running"}
             with (
                 patch.object(server, "collect_preflight_checks", return_value=[]),
                 patch.object(server, "_preflight_messages", return_value=[]),
                 patch.object(server.task_runner, "start", return_value=task) as start,
             ):
-                status, _, body = self._request("/api/agent/tasks", "POST", {"mode": "full", "confirm": True})
+                status, _, body = self._request("/api/agent/tasks", "POST", {"mode": "auto_full", "confirm": True})
 
         payload = json.loads(body)
         self.assertTrue(status.startswith("200"), body)
         self.assertEqual(payload["task"], task)
-        self.assertIn("人工确认", payload["policy"]["delivery"])
-        self.assertEqual(start.call_args.args[0], "full")
+        self.assertIn("安全队列自动投递", payload["policy"]["delivery"])
+        self.assertEqual(start.call_args.args[0], "auto_full")
         self.assertTrue(start.call_args.args[1]["_collection_options"]["auto_score"])
         self.assertTrue(start.call_args.args[1]["_agent_workflow"])
 
@@ -786,7 +786,7 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertTrue(json.loads(body)["ok"])
         self.assertEqual(collect.call_args.args[0], "rescore")
 
-    def test_web_api_workbench_preflight_full_requires_ai_key(self):
+    def test_web_api_workbench_preflight_auto_full_requires_ai_key(self):
         # Arrange
         with tempfile.TemporaryDirectory() as tmp:
             base_dir = Path(tmp)
@@ -821,7 +821,7 @@ class WebApiRouteTests(unittest.TestCase):
                 patch.dict("os.environ", {}, clear=True),
                 patch("bosshunter.web.preflight.run_browser_diagnostics", return_value=browser_ready),
             ):
-                status, headers, body = self._request("/api/workbench/preflight?mode=full")
+                status, headers, body = self._request("/api/workbench/preflight?mode=auto_full")
 
         # Assert
         self.assertTrue(status.startswith("200"))
@@ -1240,50 +1240,14 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertEqual(payload["funnel_today"]["发送"], 1)
         self.assertEqual(len(payload["pending_confirmation"]), 1)
 
-    def test_web_api_full_task_stays_running_while_waiting_for_frontend_confirmation(self):
-        # Arrange
-        confirmation_reached = False
-
-        def fake_collect(task, config):
-            nonlocal confirmation_reached
-            confirmation_reached = True
-
-        runner = WorkbenchTaskRunner()
-        runner._executors["full"] = lambda task, config: server._execute_full(task, config)
-
-        # Act
-        with tempfile.TemporaryDirectory() as tmp:
-            base_dir = Path(tmp)
-            db = get_db(base_dir / "data" / "bosshunter.db")
-            try:
-                insert_job(db, _job("ready-job"))
-                update_job_score(db, "ready-job", 82, "good match")
-                update_job_status(db, "ready-job", "ready")
-            finally:
-                db.close()
-            server.set_base_dir(base_dir)
-
-            with patch.object(server, "_execute_collect", side_effect=fake_collect):
-                task = runner.start("full", {})
-                for _ in range(20):
-                    status = runner.status()
-                    active = status["active"]
-                    if active and "等待前端确认投递" in active["logs"]:
-                        break
-                    time.sleep(0.01)
-                time.sleep(0.05)
-                status = runner.status()
-                active = status["active"]
-                if active:
-                    runner._tasks[task["id"]].stop_requested.set()
-                    runner.wait(timeout=1)
-
-        # Assert
-        self.assertTrue(confirmation_reached)
-        self.assertIsNotNone(active)
-        self.assertEqual(active["id"], task["id"])
-        self.assertEqual(active["status"], "running")
-        self.assertIn("等待前端确认投递", active["logs"])
+    def test_legacy_full_runner_cannot_create_a_confirmation_waiting_task(self):
+        # Even an injected legacy executor must not reopen the removed entry.
+        executor = Mock()
+        runner = WorkbenchTaskRunner({"full": executor})
+        with self.assertRaisesRegex(ValueError, "Unsupported workbench mode: full"):
+            runner.start("full", {})
+        executor.assert_not_called()
+        self.assertIsNone(runner.status()["active"])
 
     def test_task_stop_keeps_active_slot_until_executor_really_returns(self):
         # Arrange
@@ -1389,33 +1353,15 @@ class WebApiRouteTests(unittest.TestCase):
 
         self.assertEqual(deadline, datetime(2026, 7, 28, 17, 30))
 
-    def test_web_api_full_task_completes_when_no_jobs_need_confirmation(self):
-        # Arrange
-        calls = []
+    def test_legacy_full_api_returns_replacement_without_starting_a_task(self):
+        with patch.object(server.task_runner, "start") as start:
+            status, _, body = self._request("/api/workbench/task", "POST", {"mode": "full"})
+        self.assertTrue(status.startswith("410"), body)
+        self.assertEqual(json.loads(body)["code"], "legacy_full_mode_disabled")
+        self.assertEqual(json.loads(body)["replacement_mode"], "auto_full")
+        start.assert_not_called()
 
-        def fake_collect(task, config):
-            calls.append("collect")
-
-        runner = WorkbenchTaskRunner()
-        runner._executors["full"] = lambda task, config: server._execute_full(task, config)
-
-        # Act
-        with tempfile.TemporaryDirectory() as tmp:
-            server.set_base_dir(Path(tmp))
-            with patch.object(server, "_execute_collect", side_effect=fake_collect):
-                task = runner.start("full", {})
-                runner.wait(timeout=1)
-                status = runner.status()
-                last_task = status["last_task"]
-
-        # Assert
-        self.assertEqual(calls, ["collect"])
-        self.assertIsNone(status["active"])
-        self.assertEqual(last_task["id"], task["id"])
-        self.assertEqual(last_task["status"], "completed")
-        self.assertIn("没有待确认岗位，流程结束", last_task["logs"])
-
-    def test_web_api_deliver_hands_selected_jobs_to_waiting_full_task(self):
+    def test_manual_delivery_does_not_reactivate_legacy_full_confirmation(self):
         # Arrange
         confirmation_event = Event()
         full_task = WorkbenchTask(id="full-task", mode="full", label="运行全流程")
@@ -1466,10 +1412,9 @@ class WebApiRouteTests(unittest.TestCase):
                 ).decode("utf-8")
 
         # Assert
-        self.assertTrue(status_headers["status"].startswith("200"), response_body)
-        self.assertTrue(confirmation_event.is_set())
-        self.assertEqual(full_task.context["confirmed_job_ids"], ["ready-job"])
-        self.assertEqual(json.loads(response_body)["id"], "full-task")
+        self.assertTrue(status_headers["status"].startswith("409"), response_body)
+        self.assertFalse(confirmation_event.is_set())
+        self.assertNotIn("confirmed_job_ids", full_task.context)
 
     def test_web_api_deliver_batch_continues_send_when_some_greetings_fail(self):
         task = WorkbenchTask(id="deliver-partial", mode="full", label="运行全流程")
@@ -1916,7 +1861,7 @@ class WebApiRouteTests(unittest.TestCase):
         ])
         self.assertFalse(overwritten)
 
-    def test_web_api_deliver_queues_confirmation_before_full_task_event_exists(self):
+    def test_manual_delivery_cannot_queue_confirmation_into_legacy_full_task(self):
         full_task = WorkbenchTask(id="full-before-event", mode="full", label="运行全流程")
         runner = WorkbenchTaskRunner()
         runner._tasks[full_task.id] = full_task
@@ -1947,11 +1892,10 @@ class WebApiRouteTests(unittest.TestCase):
             finally:
                 verify_db.close()
 
-        self.assertTrue(status.startswith("200"), body)
-        self.assertEqual(json.loads(body)["id"], "full-before-event")
-        self.assertEqual(full_task.context["confirmed_job_ids"], ["ready-job"])
-        self.assertTrue(full_task.context["delivery_requested"])
-        self.assertEqual(job_status, "approved")
+        self.assertTrue(status.startswith("409"), body)
+        self.assertNotIn("confirmed_job_ids", full_task.context)
+        self.assertNotIn("delivery_requested", full_task.context)
+        self.assertEqual(job_status, "ready")
 
     def test_web_api_deliver_queues_jobs_while_full_task_is_monitoring(self):
         # Arrange
@@ -2111,7 +2055,7 @@ class WebApiRouteTests(unittest.TestCase):
             ["approved-a", "approved-b"],
         )
 
-    def test_web_api_deliver_ignores_stale_stopped_full_task_waiting_context(self):
+    def test_manual_delivery_keeps_stopped_and_active_legacy_context_unchanged(self):
         # Arrange
         stale_event = Event()
         stale_task = WorkbenchTask(id="stale-full-task", mode="full", label="运行全流程", status="stopped")
@@ -2169,12 +2113,11 @@ class WebApiRouteTests(unittest.TestCase):
                 ).decode("utf-8")
 
         # Assert
-        self.assertTrue(status_headers["status"].startswith("200"), response_body)
+        self.assertTrue(status_headers["status"].startswith("409"), response_body)
         self.assertFalse(stale_event.is_set())
-        self.assertTrue(active_event.is_set())
+        self.assertFalse(active_event.is_set())
         self.assertNotIn("confirmed_job_ids", stale_task.context)
-        self.assertEqual(active_task.context["confirmed_job_ids"], ["ready-job"])
-        self.assertEqual(json.loads(response_body)["id"], "active-full-task")
+        self.assertNotIn("confirmed_job_ids", active_task.context)
 
     def test_web_api_deliver_conflict_does_not_change_job_or_history(self):
         active_task = WorkbenchTask(id="active-delivery", mode="deliver", label="确认投递")
@@ -2215,58 +2158,14 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertEqual(job_status, "ready")
         self.assertEqual(approved_history, 0)
 
-    def test_web_api_full_task_continues_delivery_and_monitoring_after_confirmation(self):
-        # Arrange
-        calls = []
-
-        def fake_collect(task, config):
-            calls.append("collect")
-
-        def fake_deliver(task, config):
-            calls.append((
-                "deliver",
-                config.get("_workbench_job_ids"),
-                config.get("throttle", {}).get("daily_limit"),
-            ))
-
-        def fake_monitor(task, config, **kwargs):
-            calls.append("monitor")
-
-        runner = WorkbenchTaskRunner()
-        runner._executors["full"] = lambda task, config: server._execute_full(task, config)
-
-        # Act
-        with tempfile.TemporaryDirectory() as tmp:
-            base_dir = Path(tmp)
-            db = get_db(base_dir / "data" / "bosshunter.db")
-            try:
-                insert_job(db, _job("ready-a"))
-                update_job_score(db, "ready-a", 88, "good match")
-                update_job_status(db, "ready-a", "ready")
-            finally:
-                db.close()
-            server.set_base_dir(base_dir)
-
-            with patch.object(server, "_execute_collect", side_effect=fake_collect), \
-                 patch.object(server, "_execute_deliver", side_effect=fake_deliver), \
-                 patch.object(server, "_execute_monitor", side_effect=fake_monitor), \
-                 patch.object(server, "load_config", return_value={"throttle": {"daily_limit": 40}}):
-                task = runner.start("full", {})
-                for _ in range(50):
-                    running_task = runner._tasks[task["id"]]
-                    confirmation_event = running_task.context.get("confirmation_event")
-                    if isinstance(confirmation_event, Event):
-                        running_task.context["confirmed_job_ids"] = ["ready-a", "ready-b"]
-                        confirmation_event.set()
-                        break
-                    time.sleep(0.01)
-                runner.wait(timeout=1)
-
-        # Assert
-        self.assertEqual(
-            calls,
-            ["collect", ("deliver", ["ready-a", "ready-b"], 40), "monitor"],
-        )
+    def test_legacy_full_start_never_persists_settings_or_runs_delivery(self):
+        executor, persist = Mock(), Mock()
+        runner = WorkbenchTaskRunner({"full": executor})
+        with self.assertRaisesRegex(ValueError, "Unsupported workbench mode: full"):
+            runner.start("full", {}, before_start=persist)
+        executor.assert_not_called()
+        persist.assert_not_called()
+        self.assertIsNone(runner.status()["active"])
 
     def test_full_task_consumes_confirmation_queued_before_event_creation(self):
         calls = []
@@ -4078,10 +3977,10 @@ class WebApiRouteTests(unittest.TestCase):
                 status, _, body = self._request("/api/workbench/task", "POST", payload)
                 self.assertTrue(status.startswith("400"), body)
                 start.assert_not_called()
-            status, _, body = self._request("/api/workbench/task", "POST", {**payload, "mode": "full"})
+            status, _, body = self._request("/api/workbench/task", "POST", {**payload, "mode": "auto_full"})
             self.assertTrue(status.startswith("400"), body)
 
-    def test_full_task_receives_global_boss_collection_options(self):
+    def test_auto_full_task_receives_global_boss_collection_options(self):
         config = {
             "search": {"keywords": ["旧关键词"], "cities": ["北京"]},
             "profile": {"target_cities": ["北京"]},
@@ -4094,7 +3993,7 @@ class WebApiRouteTests(unittest.TestCase):
         with patch.object(server, "load_config", return_value=config), patch.object(server, "_preflight_messages", return_value=[]), patch.object(
             server, "_write_config"
         ), patch.object(server.task_runner, "start", return_value={"id": "full-global-config"}) as start:
-            status, _, body = self._request("/api/workbench/task", method="POST", json_body={"mode": "full"})
+            status, _, body = self._request("/api/workbench/task", method="POST", json_body={"mode": "auto_full"})
 
         self.assertTrue(status.startswith("200"), body)
         task_config = start.call_args.args[1]
@@ -4210,7 +4109,7 @@ class WebApiRouteTests(unittest.TestCase):
                 self.assertTrue(status.startswith("400"), body)
                 start.assert_not_called()
 
-    def test_full_task_rejects_collection_only_platform_from_saved_config(self):
+    def test_auto_full_task_rejects_collection_only_platform_from_saved_config(self):
         config = {
             "search": {"keywords": ["人力"], "cities": ["深圳"]},
             "profile": {"resume_path": "C:/resume.md"},
@@ -4224,13 +4123,13 @@ class WebApiRouteTests(unittest.TestCase):
         with patch.object(server, "load_config", return_value=config), patch.object(server, "_preflight_messages", return_value=[]), patch.object(
             server.task_runner, "start", return_value={"id": "full-with-zhilian"}
         ) as start:
-            status, _, body = self._request("/api/workbench/task", method="POST", json_body={"mode": "full"})
+            status, _, body = self._request("/api/workbench/task", method="POST", json_body={"mode": "auto_full"})
 
         self.assertTrue(status.startswith("400"), body)
-        self.assertEqual(json.loads(body)["collection_only_platforms"], ["51job"])
+        self.assertEqual(json.loads(body)["unsupported_platforms"], ["51job"])
         start.assert_not_called()
 
-    def test_full_task_rejects_collection_only_platform_from_dialog(self):
+    def test_auto_full_task_rejects_collection_only_platform_from_dialog(self):
         config = {
             "profile": {"resume_path": "C:/resume.md"},
             "ai": {"api_key": "test-key"},
@@ -4260,11 +4159,11 @@ class WebApiRouteTests(unittest.TestCase):
             status, _, body = self._request(
                 "/api/workbench/task",
                 method="POST",
-                json_body={"mode": "full", "options": options},
+                json_body={"mode": "auto_full", "options": options},
             )
 
         self.assertTrue(status.startswith("400"), body)
-        self.assertEqual(json.loads(body)["collection_only_platforms"], ["51job"])
+        self.assertEqual(json.loads(body)["unsupported_platforms"], ["51job"])
         start.assert_not_called()
         write_config.assert_not_called()
 

@@ -167,7 +167,7 @@ class BrowserPreflightTests(unittest.TestCase):
 
 	@patch("bosshunter.web.preflight.check_ai_connection")
 	@patch("bosshunter.web.preflight.check_browser_connection")
-	def test_full_flow_uses_only_explicit_full_flow_platform_order(self, browser_check, ai_check):
+	def test_auto_full_flow_uses_only_explicit_platform_order(self, browser_check, ai_check):
 		ai_check.return_value = []
 		browser_check.return_value = []
 		config = {
@@ -178,7 +178,7 @@ class BrowserPreflightTests(unittest.TestCase):
 			},
 		}
 
-		checks = collect_preflight_checks("full", config)
+		checks = collect_preflight_checks("auto_full", config, {"platform_order": ["boss"]})
 
 		platform_check = next(check for check in checks if check["id"] == "full_flow_platform")
 		self.assertEqual(platform_check["status"], "pass")

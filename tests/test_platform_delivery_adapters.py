@@ -6,6 +6,106 @@ from bosshunter.platform_delivery.zhilian import ZhilianDeliveryAdapter
 
 
 class PlatformDeliveryAdapterTests(unittest.TestCase):
+    def test_automatic_existing_branch_never_sends_custom_greeting(self):
+        from unittest.mock import DEFAULT
+        names = ("_find_existing_zhilian_conversation", "_zhilian_im_targets",
+                 "_open_zhilian_job", "inspect_page", "_wait_for_entry_state",
+                 "_click_zhilian_selector", "_modal_state", "_wait_for_conversation",
+                 "_post_start_state", "_select_zhilian_conversation_target",
+                 "_fill_and_send_zhilian_message", "close_tab")
+        with patch.multiple("bosshunter.platform_delivery.zhilian", **{name: DEFAULT for name in names}) as mocks, \
+             patch("bosshunter.platform_delivery.zhilian.time.sleep"):
+            mocks["_find_existing_zhilian_conversation"].return_value = {"matched": False}
+            mocks["_zhilian_im_targets"].return_value = []
+            mocks["_open_zhilian_job"].return_value = ("target", None)
+            mocks["inspect_page"].return_value = {"login_required": False}
+            mocks["_wait_for_entry_state"].return_value = {"mode": "existing_conversation"}
+            mocks["_click_zhilian_selector"].return_value = {"success": True}
+            mocks["_modal_state"].return_value = {"confirmation": True}
+            mocks["_select_zhilian_conversation_target"].return_value = {
+                "target_id": "target", "active": {"messages": [{"sender": "me", "text": "旧招呼"}]},
+            }
+            result = ZhilianDeliveryAdapter().start_conversation(
+                {}, DeliveryContext(metadata={"greeting": "不可补发", "automatic_full_run": True}),
+            )
+        self.assertFalse(result.verified)
+        self.assertEqual(result.error, "automatic_default_greeting_not_verified")
+        mocks["_fill_and_send_zhilian_message"].assert_not_called()
+
+    def test_automatic_application_confirmation_reuses_observed_default_without_send(self):
+        from unittest.mock import DEFAULT
+        names = ("_find_existing_zhilian_conversation", "_zhilian_im_targets",
+                 "_open_zhilian_job", "inspect_page", "_wait_for_entry_state",
+                 "_click_zhilian_application_entry", "_application_transition_state",
+                 "_click_zhilian_selector", "_modal_state", "_wait_for_conversation",
+                 "_post_start_state", "_select_zhilian_conversation_target",
+                 "_fill_and_send_zhilian_message", "close_tab")
+        with patch.multiple("bosshunter.platform_delivery.zhilian", **{name: DEFAULT for name in names}) as mocks, \
+             patch("bosshunter.platform_delivery.zhilian.time.sleep"):
+            mocks["_find_existing_zhilian_conversation"].return_value = {"matched": False}
+            mocks["_zhilian_im_targets"].return_value = []
+            mocks["_open_zhilian_job"].return_value = ("target", None)
+            mocks["inspect_page"].return_value = {"login_required": False}
+            mocks["_wait_for_entry_state"].return_value = {"mode": "application_required"}
+            mocks["_click_zhilian_application_entry"].return_value = {"success": True}
+            mocks["_application_transition_state"].return_value = {
+                "status": "conversation_entry", "entry_state": {"mode": "existing_conversation"},
+            }
+            mocks["_click_zhilian_selector"].return_value = {"success": True}
+            mocks["_modal_state"].side_effect = [{"confirmation": False}, {"confirmation": True}]
+            active = {"messages": [{"sender": "me", "text": "平台默认原文"}], "hr_name": "目标 HR"}
+            mocks["_select_zhilian_conversation_target"].return_value = {"target_id": "target", "active": active}
+            result = ZhilianDeliveryAdapter().start_conversation(
+                {}, DeliveryContext(metadata={"automatic_full_run": True}),
+            )
+        self.assertTrue(result.verified)
+        self.assertEqual(result.delivery_kind, "platform_default_greeting")
+        self.assertEqual(result.metadata["observed_messages"], active["messages"])
+        mocks["_fill_and_send_zhilian_message"].assert_not_called()
+
+    def test_zhilian_coordinate_miss_has_one_unique_dom_fallback(self):
+        import json
+        from bosshunter.platform_delivery import zhilian
+
+        row = {"signature": "target|company|job|preview|today", "hr_name": "target", "company": "company", "title": "job"}
+        wrong = {"success": True, "hr_name": "other", "company": "company", "title": "job", "messages": []}
+        correct = {**wrong, "hr_name": "target", "session_id": "target-session"}
+        selected = False
+
+        def evaluate(_target, script, **_kwargs):
+            nonlocal selected
+            if "const performClick = true;" in script:
+                selected = True
+            return json.dumps({"success": True, "x": 10, "y": 20})
+
+        with patch.object(zhilian, "evaluate", side_effect=evaluate) as evaluate_mock, \
+             patch.object(zhilian, "click_at", return_value=True) as click, \
+             patch.object(zhilian, "_active_zhilian_conversation_snapshot", side_effect=lambda _: correct if selected else wrong), \
+             patch.object(zhilian, "_load_zhilian_chat_history", return_value={**correct, "history_complete": True}), \
+             patch.object(zhilian.time, "sleep"):
+            result = zhilian._open_zhilian_conversation_row("tab", row, timeout=0.001)
+        self.assertEqual(result["status"], "matched_chat_loaded")
+        self.assertEqual(result["hr_name"], "target")
+        self.assertEqual(evaluate_mock.call_count, 2)
+        click.assert_called_once()
+
+    def test_zhilian_fallback_does_not_accept_a_reordered_ambiguous_row(self):
+        import json
+        from bosshunter.platform_delivery import zhilian
+
+        row = {"signature": "target|company|job|preview|today", "hr_name": "target", "company": "company", "title": "job"}
+        with patch.object(zhilian, "evaluate", side_effect=[
+            json.dumps({"success": True, "x": 10, "y": 20}),
+            json.dumps({"success": False, "status": "row_ambiguous", "count": 2}),
+        ]) as evaluate_mock, patch.object(zhilian, "click_at", return_value=True), \
+             patch.object(zhilian, "_active_zhilian_conversation_snapshot", return_value={"success": True, "hr_name": "other", "company": "company", "title": "job"}), \
+             patch.object(zhilian, "_load_zhilian_chat_history") as history, patch.object(zhilian.time, "sleep"):
+            result = zhilian._open_zhilian_conversation_row("tab", row, timeout=0.001)
+        self.assertEqual(result["status"], "row_ambiguous")
+        self.assertFalse(result["success"])
+        self.assertEqual(evaluate_mock.call_count, 2)
+        history.assert_not_called()
+
     def test_zhilian_sync_locator_scrolls_unique_target_without_index_fallback(self):
         import json
         from bosshunter.platform_delivery import zhilian

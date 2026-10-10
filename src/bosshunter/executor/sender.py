@@ -446,7 +446,16 @@ def _handle_greet_popup(target_id: str, greeting: str, click_result: dict | None
             "skip_backoff": True,
         }
     if _is_preset_greeting_popup(state):
-        return _confirm_preset_greeting(target_id, greeting)
+        confirmed = _confirm_preset_greeting(target_id, greeting)
+        if (confirmed.get("error") == "platform_default_greeting_unreadable"
+                and click_result and _navigate_to_chat_redirect(target_id, click_result)):
+            # BOSS can auto-send its account preset while a stale greet popup
+            # remains on the job page. Navigating the platform-provided chat
+            # destination is selection, NOT send confirmation. The caller
+            # must still verify the job identity, composer and configured text.
+            return {"success": True, "action": "startchat_redirected",
+                    "preset_verification": "unreadable"}
+        return confirmed
     if state.get("kind") == "startchat_dialog":
         if click_result and _navigate_to_chat_redirect(target_id, click_result):
             return {"success": True, "action": "startchat_redirected"}
@@ -923,7 +932,8 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
     if str(job.get("source_platform") or "boss").strip().lower() == "zhilian":
         result = get_delivery_adapter("zhilian").start_conversation(
             job,
-            DeliveryContext(metadata={"workbench": True, "greeting": greeting}),
+            DeliveryContext(metadata={"workbench": True, "greeting": greeting,
+                                      "automatic_full_run": bool(throttle_config.get("_automatic_full_run"))}),
         )
         # Reusing an existing conversation is reconciliation information, not
         # proof that this run sent a message. Keep the automatic flow fail-closed
@@ -1263,6 +1273,7 @@ def send_greetings(config: dict, force: bool = False, db_path=None) -> int:
     """
     db = get_db(db_path)
     throttle_config = dict(config.get("throttle", {}))
+    throttle_config["_automatic_full_run"] = bool(config.get("_automatic_full_run"))
     stop_event = config.get("_workbench_stop_event")
     workbench_job_ids = {str(job_id) for job_id in config.get("_workbench_job_ids", [])}
     send_report = {

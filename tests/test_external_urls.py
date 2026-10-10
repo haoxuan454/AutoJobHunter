@@ -34,6 +34,16 @@ class ExternalUrlTests(unittest.TestCase):
         url = "https://i.zhaopin.com/im?sessionId=session-123&refcode=4019"
         self.assertEqual(normalize_platform_external_url("zhilian", url, kind="conversation"), url)
 
+    def test_boss_generic_inbox_variants_are_not_specific_hr_links(self):
+        for suffix in ("", "/", "?refcode=4019", "?uid=", "#chat"):
+            with self.subTest(suffix=suffix):
+                self.assertIsNone(normalize_platform_external_url(
+                    "boss", "https://www.zhipin.com/web/geek/chat" + suffix, kind="conversation"))
+
+    def test_boss_thread_identifier_is_preserved(self):
+        url = "https://www.zhipin.com/web/geek/chat?conversationId=thread-1"
+        self.assertEqual(normalize_platform_external_url("boss", url, kind="conversation"), url)
+
     def test_unknown_platform_cannot_whitelist_arbitrary_https_urls(self):
         self.assertIsNone(
             normalize_platform_external_url("unknown", "https://attacker.example/chat", kind="conversation")

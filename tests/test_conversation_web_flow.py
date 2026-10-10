@@ -18,6 +18,24 @@ class ConversationWebFlowTests(unittest.TestCase):
         server.set_base_dir(self._old_base)
         self._tmp.cleanup()
 
+    def test_boss_identity_score_normalizes_raw_job_hr_activity_suffix(self):
+        local = {
+            "id": "boss:delivery:one", "platform": "boss",
+            "hr_name": "冯女士", "job_hr_name": "冯女士\n在线",
+            "job_company": "软通动力", "job_title": "python数据分析",
+        }
+        row = {"hr_name": "冯女士", "company": "软通动力", "title": None}
+        self.assertEqual(server._conversation_identity_score(local, row), 40)
+
+    def test_boss_identity_score_does_not_fuzzy_match_different_recruiter(self):
+        local = {
+            "id": "boss:delivery:one", "platform": "boss",
+            "hr_name": "冯女士", "job_hr_name": "冯女士\n在线",
+            "job_company": "软通动力", "job_title": "python数据分析",
+        }
+        row = {"hr_name": "冯先生", "company": "软通动力", "title": None}
+        self.assertEqual(server._conversation_identity_score(local, row), 0)
+
     def request(self, path, method="GET", body=None, multipart=None):
         status = {}
 

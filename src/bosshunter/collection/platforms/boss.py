@@ -220,8 +220,14 @@ JS_EXTRACT_DETAIL = """
     const bossCard = document.querySelector('.job-boss-info');
     const bossInfo = document.querySelector('.job-boss-info .boss-info-attr')
         || document.querySelector('.boss-info-attr');
-    info.hr_name = bossCard?.querySelector('.name')?.textContent?.trim()
-        || document.querySelector('.boss-info-attr .name')?.textContent?.trim() || '';
+    const nameNode = bossCard?.querySelector('.name')
+        || document.querySelector('.boss-info-attr .name');
+    // Activity badges live inside `.name`; they are not part of the identity.
+    const nameCopy = nameNode?.cloneNode(true);
+    nameCopy?.querySelectorAll('.boss-active-time, .active-time, [class*="active"]').forEach(node => node.remove());
+    const ownName = nameNode ? Array.from(nameNode.childNodes)
+        .filter(node => node.nodeType === Node.TEXT_NODE).map(node => node.textContent).join('').trim() : '';
+    info.hr_name = ownName || nameCopy?.textContent?.trim() || '';
     info.hr_title = bossCard?.querySelector('.title')?.textContent?.trim()
         || bossInfo?.querySelector('.title')?.textContent?.trim() || '';
     if (!info.hr_title && bossInfo) {

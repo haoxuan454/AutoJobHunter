@@ -280,7 +280,10 @@ def record_verified_delivery(
     })
     content = str(greeting or "").strip()
     sender_type = "user"
-    if delivery_kind == "platform_default_greeting" and not content:
+    if delivery_kind == "platform_default_greeting":
+        # The caller's configured greeting is not what Zhilian sent. Preserve
+        # an explicit event, then let the verified platform snapshot provide
+        # the actual outgoing text; never manufacture a user message here.
         sender_type = "system"
         content = "平台默认招呼已确认"
     if content:
@@ -502,6 +505,10 @@ def sync_extracted_messages(
         ))
     if platform == "zhilian":
         _migrate_zhilian_legacy_message_ids(conn, conversation_id, messages)
+    elif platform == "boss":
+        from bosshunter.platform_delivery.boss_snapshot import adopt_legacy_message_ids
+
+        adopt_legacy_message_ids(conn, conversation_id, messages)
     inserted = repo.append_messages(conversation_id, incoming)
     duplicates_removed = 0
     if platform == "zhilian" and history_complete is True:

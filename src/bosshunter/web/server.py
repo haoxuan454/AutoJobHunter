@@ -786,6 +786,16 @@ def _execute_auto_full(task: WorkbenchTask, config: dict) -> None:
 		task.context["automatic_monitoring"] = False
 		write_log("本轮没有可进入持续监测的已验证投递，会话监测未启动")
 def _execute_auto_conversation_monitor(task: WorkbenchTask, config: dict) -> None:
+    from bosshunter.automation.chat_pages import AutomaticChatPages
+
+    pages = AutomaticChatPages(task.stop_requested)
+    try:
+        _execute_auto_conversation_monitor_loop(task, {**config, "_automatic_chat_pages": pages})
+    finally:
+        pages.close()
+
+
+def _execute_auto_conversation_monitor_loop(task: WorkbenchTask, config: dict) -> None:
     """Run the opt-in, low-frequency monitor owned by ``auto_full``."""
     from bosshunter.executor.monitor import get_effective_monitor_interval_minutes
 
@@ -870,6 +880,9 @@ def _run_auto_conversation_monitor_cycle(task: WorkbenchTask, config: dict) -> d
         for platform in ("boss", "zhilian"):
             if any(str(card.get("platform") or "").lower() == platform for card in eligible):
                 try:
+                    pages = config.get("_automatic_chat_pages")
+                    if pages is not None:
+                        pages.ensure(platform)
                     rows_by_platform[platform] = _opened_platform_rows(platform)
                 except Exception as exc:
                     rows_by_platform[platform] = ([], [])
@@ -938,7 +951,7 @@ def _run_auto_conversation_monitor_cycle(task: WorkbenchTask, config: dict) -> d
                     "local_conversation_id": card_id,
                 },
                 base_dir=BASE_DIR,
-                config=config,
+                config={**config, "_automatic_snapshot_guard": True},
             )
             nested = result.get("synced") if isinstance(result.get("synced"), dict) else {}
             persisted = nested.get("conversation") if isinstance(nested.get("conversation"), dict) else {}
@@ -950,6 +963,8 @@ def _run_auto_conversation_monitor_cycle(task: WorkbenchTask, config: dict) -> d
                 "target_id": target["target_id"],
                 "conversation_id": local_id,
                 "conversation_url": str(persisted.get("conversation_url") or card.get("conversation_url") or ""),
+                "row": dict(row),
+                "platform_messages": result.get("platform_messages"),
             }
 
         def handle_new_hr_message(card: dict, message: dict[str, Any]) -> dict[str, Any]:
@@ -997,50 +1012,40 @@ def _run_auto_conversation_monitor_cycle(task: WorkbenchTask, config: dict) -> d
             return _generate_auto_reply(context, job, config)
 
         def send_reply(card: dict, reply: str, synced: dict) -> dict[str, Any]:
+            from bosshunter.automation.reply_dispatch import dispatch_automatic_reply
+            from bosshunter.automation.snapshot_guard import guarded_chat_opener
+
             platform = str(card.get("platform") or "").lower()
             target_id = str(synced.get("target_id") or "")
-            verified = False
-            if platform == "boss":
-                action_started = bool(_send_message_in_chat(target_id, reply))
-                observed: list = []
-                if action_started:
-                    try:
-                        parsed = _parse_browser_json(evaluate(target_id, JS_EXTRACT_CONVERSATION, timeout=10))
-                        observed = parsed if isinstance(parsed, list) else []
-                    except Exception:
-                        observed = []
-                    expected = " ".join(reply.split())
-                    verified = any(
-                        str(item.get("sender") or "").lower() in {"me", "user"}
-                        and " ".join(str(item.get("text") or item.get("content") or "").split()) == expected
-                        for item in observed if isinstance(item, dict)
+            row = dict(synced.get("row") or {})
+
+            def verified_send(fresh: dict, text: str) -> dict:
+                # Reuse the manual adapters: reopen the exact row and require a
+                # NEW outgoing DOM message, not an old identical greeting.
+                if platform == "boss":
+                    return send_boss_reply(
+                        target_id, row, text, open_chat=guarded_chat_opener(
+                            synced.get("platform_messages"), open_chat=_open_boss_conversation_row,
+                            read_messages=lambda tid, opened: _parse_browser_json(
+                                evaluate(tid, JS_EXTRACT_CONVERSATION, timeout=10))),
+                        read_snapshot=lambda tid, expected: evaluate(tid, boss_reply_snapshot_expression(expected), timeout=10),
+                        send=_send_message_in_chat,
                     )
-                result = {
-                    "success": verified,
-                    "verified": verified,
-                    "status": "sent" if verified else "send_not_verified",
-                    "error": "BOSS DOM did not confirm the automatic reply" if not verified else "",
-                }
-            elif platform == "zhilian":
-                raw = _fill_and_send_zhilian_message(target_id, reply)
-                result = raw if isinstance(raw, dict) else {"success": bool(raw), "verified": bool(raw)}
-                verified = bool(result.get("success") and result.get("verified"))
-                result.setdefault("status", "sent" if verified else "send_not_verified")
-            else:
-                return {"success": False, "verified": False, "status": "unsupported_platform"}
-            if verified:
-                conversation_id = str(synced.get("conversation_id") or card.get("id") or "")
-                repo.append_messages(conversation_id, [IncomingMessage(
-                    sender_type="ai",
-                    content=reply,
-                    message_time=None,
-                    platform_message_id=f"auto-reply:{uuid4().hex}",
-                    source_url=str(synced.get("conversation_url") or card.get("conversation_url") or ""),
-                    raw_payload={"source": "automatic_conversation_monitor", "platform": platform},
-                    is_ai_generated=True,
-                    is_sent=True,
-                )])
-            return result
+                row.setdefault("expected_company", str(fresh.get("job_company") or ""))
+                row.setdefault("expected_title", str(fresh.get("job_title") or ""))
+                return send_zhilian_reply(
+                    target_id, row, text, open_chat=guarded_chat_opener(
+                        synced.get("platform_messages"), open_chat=_open_zhilian_conversation_row,
+                        read_messages=lambda tid, opened: opened.get("messages")),
+                    read_snapshot=lambda tid, expected: evaluate(tid, zhilian_reply_snapshot_expression(expected), timeout=10),
+                    send=_fill_and_send_zhilian_message,
+                )
+
+            return dispatch_automatic_reply(
+                repo, card, reply, synced, config=config, stop_event=task.stop_requested,
+                send=verified_send,
+                risk_locked=lambda: bool(get_active_platform_safety_lock(conn)),
+            )
 
         return run_monitor_cycle(
             eligible,
@@ -1054,6 +1059,7 @@ def _run_auto_conversation_monitor_cycle(task: WorkbenchTask, config: dict) -> d
             delivery_scope=delivery_scope,
             stop_event=task.stop_requested,
             log=lambda message: _log(task, message),
+            pending_replies=task.context.setdefault("automatic_pending_replies", {}),
         )
     finally:
         conn.close()
@@ -2329,10 +2335,20 @@ def api_workbench_task_start():
 			collection_options["auto_score"] = True
 			auto_settings = options.get("auto_settings") if isinstance(options, dict) and isinstance(options.get("auto_settings"), dict) else {}
 			try:
-				threshold = max(0.0, min(float(auto_settings.get("score_threshold", base_config.get("scoring", {}).get("threshold", 60))), 100.0))
-				interval_min = max(0.0, float(auto_settings.get("interval_min", base_config.get("throttle", {}).get("interval_min", 60))))
-				interval_max = max(interval_min, float(auto_settings.get("interval_max", base_config.get("throttle", {}).get("interval_max", 180))))
-			except (TypeError, ValueError):
+				raw_numbers = (
+					auto_settings.get("score_threshold", base_config.get("scoring", {}).get("threshold", 60)),
+					auto_settings.get("interval_min", base_config.get("throttle", {}).get("interval_min", 60)),
+					auto_settings.get("interval_max", base_config.get("throttle", {}).get("interval_max", 180)),
+				)
+				if any(isinstance(value, bool) for value in raw_numbers):
+					raise ValueError("boolean is not an automatic setting")
+				numbers = tuple(float(value) for value in raw_numbers)
+				if not all(math.isfinite(value) for value in numbers):
+					raise ValueError("automatic settings must be finite")
+				threshold = max(0.0, min(numbers[0], 100.0))
+				interval_min = max(0.0, numbers[1])
+				interval_max = max(interval_min, numbers[2])
+			except (TypeError, ValueError, OverflowError):
 				return _json_response({"error": "自动流程评分阈值和等待时间必须是有效数字"}, 400)
 			max_deliveries_value = auto_settings.get("max_deliveries_per_platform", 3)
 			try:
@@ -3962,6 +3978,7 @@ def _sync_platform_target(conn, *, platform: str, target: dict, row: dict, base_
         "status": status,
         "message_count": persisted_message_count,
         "platform_message_count": len(messages),
+        "platform_messages": messages if config.get("_automatic_snapshot_guard") else None,
         "message_readable": bool(messages),
         "history_complete": bool(active.get("history_complete")) if platform == "zhilian" else None,
         "history_label": str(active.get("history_label") or "") if platform == "zhilian" else "",
@@ -3979,7 +3996,11 @@ def _conversation_identity_score(local: dict, row: dict) -> int:
     if external and local_external and external == local_external:
         return 100
     compact = lambda value: "".join(str(value or "").split()).casefold()
-    local_hr = compact(local.get("hr_name"))
+    from bosshunter.collection.recruiter_identity import normalize_boss_recruiter_name
+
+    local_hr = compact(normalize_boss_recruiter_name(
+        local.get("hr_name") or local.get("job_hr_name")
+    ))
     row_hr = compact(row.get("hr_name") or row.get("name"))
     local_company = compact(local.get("job_company") or local.get("company_id"))
     row_company = compact(row.get("company") or row.get("company_role"))
@@ -4157,52 +4178,12 @@ def _zhilian_reply_identity_score(local: dict, row: dict) -> int:
 
 def _open_boss_conversation_row(target_id: str, row: dict[str, Any], *, timeout: float = 5.0) -> dict[str, Any]:
     """Select one already-rendered BOSS chat row without navigating the tab."""
-    external_id = str(row.get("conversation_id") or row.get("contact_id") or "").strip()
-    hr_name = str(row.get("hr_name") or row.get("name") or "").strip()
-    company = str(row.get("company") or row.get("company_role") or "").strip()
-    if not external_id and not hr_name:
-        return {"status": "row_identity_missing", "opened": False}
-    script = f"""
-    (() => {{
-      const normalize = value => (value || '').replace(/\\s+/g, ' ').trim();
-      const wantedId = {json.dumps(external_id, ensure_ascii=False)};
-      const wantedName = normalize({json.dumps(hr_name, ensure_ascii=False)});
-      const wantedCompany = normalize({json.dumps(company, ensure_ascii=False)});
-      const rows = [...document.querySelectorAll('li[role=listitem]')];
-      const getId = item => item.getAttribute('data-id') || item.getAttribute('data-conversation-id') || item.getAttribute('data-uid') || '';
-      const getName = item => normalize(item.querySelector('.name-text')?.innerText || '');
-      const getCompany = item => normalize(item.querySelector('.name-box span:nth-child(2)')?.innerText || '');
-      let matches = wantedId ? rows.filter(item => getId(item) === wantedId) : [];
-      if (!matches.length) matches = rows.filter(item => getName(item) === wantedName && (!wantedCompany || getCompany(item) === wantedCompany));
-      if (!matches.length) return JSON.stringify({{success:false,status:'row_not_found'}});
-      if (matches.length !== 1) return JSON.stringify({{success:false,status:'row_ambiguous',count:matches.length}});
-       const item = matches[0];
-       const selectedFriend = item.querySelector('.friend-content.selected');
-       const rect = item.getBoundingClientRect();
-       return JSON.stringify({{success:true,active:item.getAttribute('aria-selected') === 'true' || item.classList.contains('active') || item.classList.contains('selected') || !!selectedFriend,x:rect.left + rect.width / 2,y:rect.top + rect.height / 2}});
-    }})()
-    """
-    located = _parse_browser_json(evaluate(target_id, script, timeout=10))
-    if not isinstance(located, dict):
-        return {"status": "row_not_found", "opened": False}
-    if not located.get("success"):
-        return {"status": str(located.get("status") or "row_not_found"), "opened": False}
-    if not located.get("active"):
-        if not click_at(target_id, f"{located.get('x')},{located.get('y')}"):
-            return {"status": "row_click_failed", "opened": False}
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            rows = _parse_browser_json(evaluate(target_id, JS_EXTRACT_CHAT_LIST, timeout=10))
-            if isinstance(rows, list):
-                active = next((item for item in rows if item.get("active") and (
-                    (external_id and str(item.get("conversation_id") or item.get("contact_id") or "") == external_id)
-                    or (not external_id and str(item.get("hr_name") or item.get("name") or "").strip() == hr_name)
-                )), None)
-                if active:
-                    return {"status": "matched_chat_loaded", "opened": True, "row": active}
-            time.sleep(0.25)
-        return {"status": "chat_open_not_verified", "opened": False}
-    return {"status": "matched_chat_loaded", "opened": True, "row": row}
+    from bosshunter.platform_delivery.boss_chat_selection import select_boss_chat_row
+
+    return select_boss_chat_row(
+        target_id, row, evaluate=evaluate, click_at=click_at,
+        list_script=JS_EXTRACT_CHAT_LIST, timeout=timeout,
+    )
 
 
 def _opened_platform_rows(platform: str) -> tuple[list[dict], list[dict]]:

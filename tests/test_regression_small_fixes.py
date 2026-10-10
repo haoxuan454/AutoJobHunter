@@ -71,8 +71,9 @@ class VersionMetadataTests(unittest.TestCase):
         self.assertEqual(lock["version"], version)
         self.assertEqual(lock["packages"][""]["version"], version)
         self.assertIn(f"v{version} · 本地控制台", sidebar_source)
-        self.assertIn(f"BossHunter v{version}</h1>", readme)
-        self.assertIn(f"version-v{version}-", readme)
+        self.assertTrue(readme.startswith("# AutoJobHunter\n"))
+        self.assertIn(f"当前软件版本：**v{version}**", readme)
+        self.assertIn("https://github.com/haoxuan454/AutoJobHunter", readme)
         self.assertIn(f"## v{version}\n", changelog)
         self.assertNotIn("v1.1.0", sidebar_source)
 

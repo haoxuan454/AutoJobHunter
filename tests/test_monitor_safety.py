@@ -29,7 +29,7 @@ def _job(job_id: str, hr_name: str | None = None) -> dict:
 
 
 class MonitorThrottleTests(unittest.TestCase):
-    def test_boss_operation_multiplier_applies_to_monitor_cycle_wait(self):
+    def test_boss_operation_multiplier_does_not_change_monitor_cycle_wait(self):
         from bosshunter.executor import monitor
 
         config = {
@@ -38,7 +38,24 @@ class MonitorThrottleTests(unittest.TestCase):
         }
 
         self.assertEqual(monitor.get_boss_operation_interval_multiplier(config), 1.5)
-        self.assertEqual(monitor.get_effective_monitor_interval_minutes(config), 45)
+        self.assertEqual(monitor.get_effective_monitor_interval_minutes(config), 30)
+
+    def test_monitor_interval_handles_invalid_values_without_unbounded_waits(self):
+        from bosshunter.executor import monitor
+
+        for value in (None, "invalid", float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    monitor.get_effective_monitor_interval_minutes({"monitor": {"interval": value}}),
+                    30,
+                )
+        for value, expected in ((0, 1), (-5, 1), ("12.5", 12.5)):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    monitor.get_effective_monitor_interval_minutes({"monitor": {"interval": value}}),
+                    expected,
+                )
+        self.assertEqual(monitor.get_effective_monitor_interval_minutes({}, 4), 4)
 
     def test_boss_operation_multiplier_applies_to_monitor_page_requests(self):
         from bosshunter.executor import monitor

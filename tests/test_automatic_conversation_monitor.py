@@ -5,6 +5,37 @@ from threading import Event
 from bosshunter.automation.monitor import run_monitor_cycle
 
 
+def test_failed_generation_is_retried_without_a_second_new_hr_message():
+    card = _conversation('retry', 'boss', activity='2026-10-10T01:00:00+00:00')
+    message = {'id': 123, 'sender_type': 'hr', 'content': '普通问题'}
+    pending = {}
+    sent = []
+    common = dict(conversations=[card], delivery_scope=_scope(('boss', 'job-1')),
+                  auto_reply_enabled=True, pending_replies=pending,
+                  send_reply=lambda c, text, sync: sent.append(text) or {'success': True, 'verified': True})
+    result = run_monitor_cycle(**common,
+        sync_one=lambda c: {'status': 'synced', 'inserted': [message], 'messages': [message]},
+        generate_reply=lambda c, m: None)
+    assert result['failed'] == 1 and pending['retry'] == [message]
+    result = run_monitor_cycle(**common,
+        sync_one=lambda c: {'status': 'synced', 'inserted': [], 'messages': [message]},
+        generate_reply=lambda c, m: '您好')
+    assert result['replied'] == 1 and result['new_hr_messages'] == 0
+    assert pending == {} and sent == ['您好']
+
+
+def test_manual_response_clears_pending_auto_reply():
+    card = _conversation('manual', 'boss', activity='2026-10-10T01:00:00+00:00')
+    hr = {'id': 1, 'sender_type': 'hr', 'content': '问题'}
+    pending = {'manual': [hr]}
+    generated = []
+    result = run_monitor_cycle([card], delivery_scope=_scope(('boss', 'job-1')),
+        auto_reply_enabled=True, pending_replies=pending,
+        sync_one=lambda c: {'status': 'synced', 'inserted': [], 'messages': [hr, {'sender_type': 'user', 'content': '已处理'}]},
+        generate_reply=lambda c, m: generated.append(True), send_reply=lambda *a: True)
+    assert result['replied'] == 0 and pending == {} and generated == []
+
+
 def _conversation(
     conversation_id: str,
     platform: str,

@@ -883,6 +883,8 @@ def _open_zhilian_conversation_row(
       const visibleBottom = Math.min(panel.getBoundingClientRect().bottom, window.innerHeight);
       if (rect.bottom <= visibleTop || rect.top >= visibleBottom || rect.width <= 0 || rect.height <= 0)
         return JSON.stringify({{success:false, status:'row_not_visible'}});
+      const performClick = false;
+      if (performClick) row.click();
       return JSON.stringify({{success:true, x:rect.left + rect.width / 2, y:rect.top + rect.height / 2,
         signature:make(row), session_id:wantedSession, scroll_top:panel.scrollTop}});
     }})()
@@ -941,7 +943,23 @@ def _open_zhilian_conversation_row(
         return {"status": "click_failed", "opened": False}
     deadline = time.time() + timeout
     last: dict[str, Any] = {"status": "chat_not_loaded", "opened": True}
-    while time.time() < deadline:
+    used_dom_fallback = False
+    while True:
+        if time.time() >= deadline:
+            # A successful CDP click is not proof that the sidebar selected
+            # this HR. Re-resolve the same unique identity before ONE DOM
+            # fallback. This selects a row only; it never sends a message.
+            if used_dom_fallback or last.get("status") == "history_identity_mismatch":
+                return {**last, "success": False}
+            fallback = parse_result(evaluate(
+                target_id,
+                locate_script.replace("const performClick = false;", "const performClick = true;"),
+                timeout=10,
+            ))
+            if not fallback.get("success"):
+                return {"status": str(fallback.get("status") or "row_click_failed"), "success": False, "opened": True}
+            used_dom_fallback = True
+            deadline = time.time() + timeout
         active = _active_zhilian_conversation_snapshot(target_id)
         if active.get("success"):
             active_row = {
@@ -1491,7 +1509,11 @@ class ZhilianDeliveryAdapter:
             entry_state = _wait_for_entry_state(target_id)
             mode = entry_state.get("mode")
             application_modal_ready = False
+            initial_mode = mode
+            confirmation_before_application = {}
             if mode == "application_required":
+                if context.metadata.get("automatic_full_run"):
+                    confirmation_before_application = _modal_state(target_id)
                 application = _click_zhilian_application_entry(target_id, entry_state)
                 if not application.get("success"):
                     close_tab(target_id)
@@ -1557,6 +1579,13 @@ class ZhilianDeliveryAdapter:
 
             time.sleep(0.5)
             if mode == "existing_conversation":
+                # Keep the authoritative job-page confirmation before selecting
+                # the inbox. Automatic initial contact must not fall through to
+                # the manual custom-message branch or send a second greeting.
+                default_confirmation = (
+                    _modal_state(target_id)
+                    if context.metadata.get("automatic_full_run") else {}
+                )
                 verification = _wait_for_conversation(target_id)
                 time.sleep(0.8)
                 stable_verification = _post_start_state(target_id)
@@ -1576,6 +1605,27 @@ class ZhilianDeliveryAdapter:
                 if selected_target_id != target_id:
                     close_tab(target_id)
                     target_id = selected_target_id
+                if context.metadata.get("automatic_full_run"):
+                    active = selected.get("active") or {}
+                    messages = active.get("messages") or []
+                    observed = [item for item in messages
+                                if item.get("sender") == "me" and str(item.get("text") or "").strip()]
+                    if not (initial_mode == "application_required"
+                            and confirmation_before_application.get("confirmation") is False
+                            and default_confirmation.get("confirmation") and observed):
+                        return DeliveryResult(
+                            False, platform=self.platform,
+                            error="automatic_default_greeting_not_verified",
+                            history_detail="自动流程未确认智联平台默认招呼的发送证据，未补发自定义内容。",
+                            target_id=target_id,
+                        )
+                    return DeliveryResult(
+                        True, True, self.platform,
+                        history_detail="智联默认招呼确认与对应会话原文均已读取；未额外发送。",
+                        target_id=target_id, delivery_kind="platform_default_greeting",
+                        metadata={"platform_confirmed": True, "conversation_reconciled": True,
+                                  "conversation": active, "observed_messages": messages},
+                    )
                 greeting = str(context.metadata.get("greeting") or "").strip()
                 if not greeting:
                     close_tab(target_id)

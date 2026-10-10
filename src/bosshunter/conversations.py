@@ -78,6 +78,14 @@ def normalize_platform_external_url(platform: str, url: Any, *, kind: str) -> st
         elif platform_name == "boss":
             if "chat" not in path.split("/") and "chat" not in parsed.fragment.lower().split("/"):
                 return None
+            # A generic inbox can differ from the open tab by query or trailing
+            # slash yet still not identify an HR. Do not expose it as a thread.
+            if path.rstrip("/") == "/web/geek/chat":
+                thread_keys = {"uid", "bossid", "encryptbossid", "friendid",
+                               "conversationid", "sessionid"}
+                if not any(key.lower() in thread_keys and any(str(v).strip() for v in values)
+                           for key, values in query.items()):
+                    return None
         elif platform_name == "liepin":
             if not any(segment in {"im", "message", "communicate", "chat"} for segment in path.split("/")):
                 return None
@@ -864,6 +872,7 @@ class ConversationRepository:
         idempotency_key: str,
         message_hash: str,
         platform: str,
+        replace_unsent_hash: bool = False,
     ) -> tuple[dict[str, Any], bool]:
         """Atomically claim a reply key before touching a platform.
 
@@ -872,6 +881,11 @@ class ConversationRepository:
         This method makes the state transition itself the gate: only the
         request that inserts a new row or changes a previous ``not_sent`` row
         to ``pending`` receives ``claimed=True``.
+
+        Automatic drafts may change after a freshness guard cancels a send.
+        Opt-in replacement is restricted to ``not_sent`` within this same
+        transaction; pending, unknown and sent attempts stay immutable. Manual
+        callers retain the original content-conflict behavior by default.
         """
         try:
             self.conn.execute("BEGIN IMMEDIATE")
@@ -901,7 +915,9 @@ class ConversationRepository:
                 return self.get_send_attempt(user_id, conversation_id, idempotency_key) or {}, True
 
             current = dict(row)
-            if current.get("message_hash") != message_hash:
+            if current.get("message_hash") != message_hash and not (
+                replace_unsent_hash and current.get("status") == "not_sent"
+            ):
                 self.conn.rollback()
                 return self.get_send_attempt(user_id, conversation_id, idempotency_key) or current, False
             if current.get("status") == "not_sent":
@@ -917,10 +933,10 @@ class ConversationRepository:
                     return dict(unresolved), False
                 cursor = self.conn.execute(
                     """UPDATE conv_send_attempts
-                       SET status = 'pending', updated_at = ?
+                       SET status = 'pending', updated_at = ?, message_hash = ?
                        WHERE user_id = ? AND conversation_id = ? AND idempotency_key = ?
                          AND status = 'not_sent'""",
-                    (utc_now(), user_id, conversation_id, idempotency_key),
+                    (utc_now(), message_hash, user_id, conversation_id, idempotency_key),
                 )
                 claimed = cursor.rowcount == 1
                 self.conn.commit()
